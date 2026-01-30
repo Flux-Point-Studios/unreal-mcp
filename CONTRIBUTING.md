@@ -134,7 +134,6 @@ Plugins/
 
 ## Questions?
 
-- Open a [Discussion](../../discussions) for questions
-- Open an [Issue](../../issues) for bugs or feature requests
+- Open an [Issue](../../issues) for bugs, feature requests, or questions
 
-Thank you for contributing! 🎮
+Thank you for contributing!

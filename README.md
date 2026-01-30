@@ -5,7 +5,6 @@
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-TypeScript-blue)](https://github.com/modelcontextprotocol/sdk)
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.0--5.7-orange)](https://www.unrealengine.com/)
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-Published-green)](https://registry.modelcontextprotocol.io/)
-[![Discussions](https://img.shields.io/badge/Discussions-Join-brightgreen?logo=github)](https://github.com/Flux-Point-Studios/unreal-mcp/discussions)
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control Unreal Engine through a native C++ Automation Bridge plugin. Built with TypeScript, C++, and Rust (WebAssembly).
 
@@ -295,8 +294,7 @@ npm run test:all    # Run all tests
 
 | Resource | Description |
 |----------|-------------|
-| [Discussions](https://github.com/Flux-Point-Studios/unreal-mcp/discussions) | Ask questions, share ideas, get help |
-| [Issues](https://github.com/Flux-Point-Studios/unreal-mcp/issues) | Report bugs and request features |
+| [Issues](https://github.com/Flux-Point-Studios/unreal-mcp/issues) | Report bugs, request features, ask questions |
 
 ---
 
