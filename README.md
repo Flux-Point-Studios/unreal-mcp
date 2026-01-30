@@ -5,8 +5,7 @@
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-TypeScript-blue)](https://github.com/modelcontextprotocol/sdk)
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.0--5.7-orange)](https://www.unrealengine.com/)
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-Published-green)](https://registry.modelcontextprotocol.io/)
-[![Project Board](https://img.shields.io/badge/Project-Roadmap-blueviolet?logo=github)](https://github.com/users/ChiR24/projects/3)
-[![Discussions](https://img.shields.io/badge/Discussions-Join-brightgreen?logo=github)](https://github.com/ChiR24/Unreal_mcp/discussions)
+[![Discussions](https://img.shields.io/badge/Discussions-Join-brightgreen?logo=github)](https://github.com/Flux-Point-Studios/unreal-mcp/discussions)
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control Unreal Engine through a native C++ Automation Bridge plugin. Built with TypeScript, C++, and Rust (WebAssembly).
 
@@ -41,7 +40,7 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 | **Sequencer** | Cinematics, timeline control, camera animations, keyframes |
 | **Graph Editing** | Blueprint, Niagara, Material, and Behavior Tree graph manipulation |
 | **Audio** | Sound cues, audio components, sound mixes, ambient sounds |
-| **System** | Console commands, UBT, tests, logs, project settings, CVars |
+| **System** | Console commands, UBT, tests, logs, project settings, CVars, Python scripting |
 
 ### Architecture
 
@@ -53,6 +52,9 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 - **Asset Caching** — 10-second TTL for improved performance
 - **Metrics Rate Limiting** — Per-IP rate limiting (60 req/min) on Prometheus endpoint
 - **Centralized Configuration** — Unified class aliases and type definitions
+- **Python Script Execution** — Run Python scripts within Unreal Editor context
+- **Standardized Error Codes** — Consistent error handling across all tools
+- **Headless Mode Support** — Launch editor without UI for CI/CD pipelines
 
 ---
 
@@ -72,8 +74,8 @@ npx unreal-engine-mcp-server
 
 **Option B: Clone & Build**
 ```bash
-git clone https://github.com/ChiR24/Unreal_mcp.git
-cd Unreal_mcp
+git clone https://github.com/Flux-Point-Studios/unreal-mcp.git
+cd unreal-mcp
 npm install
 npm run build
 node dist/cli.js
@@ -81,11 +83,11 @@ node dist/cli.js
 
 ### Step 2: Install Unreal Plugin
 
-The MCP Automation Bridge plugin is included at `Unreal_mcp/plugins/McpAutomationBridge`.
+The MCP Automation Bridge plugin is included at `unreal-mcp/plugins/McpAutomationBridge`.
 
 **Method 1: Copy Folder**
 ```
-Copy:  Unreal_mcp/plugins/McpAutomationBridge/
+Copy:  unreal-mcp/plugins/McpAutomationBridge/
 To:    YourUnrealProject/Plugins/McpAutomationBridge/
 ```
 Regenerate project files after copying.
@@ -123,7 +125,7 @@ Add to your Claude Desktop / Cursor config file:
   "mcpServers": {
     "unreal-engine": {
       "command": "node",
-      "args": ["path/to/Unreal_mcp/dist/cli.js"],
+      "args": ["path/to/unreal-mcp/dist/cli.js"],
       "env": {
         "UE_PROJECT_PATH": "C:/Path/To/YourProject",
         "MCP_AUTOMATION_PORT": "8091"
@@ -187,7 +189,7 @@ ASSET_LIST_TTL_MS=10000
 | `manage_effect` | Niagara, Particles, Debug Shapes, Niagara authoring, GPU sim |
 | `manage_blueprint` | Create, SCS, Graph Editing, Node manipulation |
 | `build_environment` | Landscape, Foliage, Procedural |
-| `system_control` | UBT, Tests, Logs, Project Settings, CVars |
+| `system_control` | UBT, Tests, Logs, Project Settings, CVars, Python execution |
 | `manage_sequence` | Sequencer / Cinematics, **list_track_types** |
 | `inspect` | Object Introspection |
 | `manage_audio` | Audio Assets, Components, Sound Cues, MetaSounds, Attenuation |
@@ -210,6 +212,8 @@ ASSET_LIST_TTL_MS=10000
 | `manage_level_structure` | Level creation, sublevels, World Partition, data layers, HLOD |
 | `manage_volumes` | Trigger volumes, blocking, physics, audio, navigation volumes |
 | `manage_navigation` | NavMesh settings, nav modifiers, nav links, smart links, pathfinding |
+| `manage_splines` | Spline actors, spline meshes, mesh scattering, road/river/fence templates |
+| `manage_pipeline` | Dynamic tool category management, context reduction |
 
 ### Supported Asset Types
 
@@ -291,9 +295,8 @@ npm run test:all    # Run all tests
 
 | Resource | Description |
 |----------|-------------|
-| [Project Roadmap](https://github.com/users/ChiR24/projects/3) | Track development progress across 47 phases |
-| [Discussions](https://github.com/ChiR24/Unreal_mcp/discussions) | Ask questions, share ideas, get help |
-| [Issues](https://github.com/ChiR24/Unreal_mcp/issues) | Report bugs and request features |
+| [Discussions](https://github.com/Flux-Point-Studios/unreal-mcp/discussions) | Ask questions, share ideas, get help |
+| [Issues](https://github.com/Flux-Point-Studios/unreal-mcp/issues) | Report bugs and request features |
 
 ---
 
