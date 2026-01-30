@@ -167,10 +167,10 @@ export const PROFILES: Record<string, DeterminismProfile> = {
  */
 export class DeterminismManager {
     private currentProfile: DeterminismProfile | null = null;
-    private _projectConfigPath: string;
 
-    constructor(projectPath: string) {
-        this._projectConfigPath = projectPath;
+    constructor(_projectPath: string) {
+        // Project path reserved for future config file operations
+        void _projectPath;
     }
 
     /**

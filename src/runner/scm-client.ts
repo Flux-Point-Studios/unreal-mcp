@@ -125,8 +125,9 @@ export class GitClient extends SCMClient {
         const commitHash = hashResult.stdout.trim();
 
         // Optionally merge back to main
+        const branchName = attempt.branch ?? '';
         await this.exec('git', ['checkout', this.mainBranch]);
-        const mergeResult = await this.exec('git', ['merge', attempt.branch!, '--no-ff', '-m', `Merge ${attempt.branch}`]);
+        const mergeResult = await this.exec('git', ['merge', branchName, '--no-ff', '-m', `Merge ${branchName}`]);
 
         if (mergeResult.exitCode !== 0) {
             // Abort merge and return
@@ -139,7 +140,7 @@ export class GitClient extends SCMClient {
         }
 
         // Delete attempt branch
-        await this.exec('git', ['branch', '-d', attempt.branch!]);
+        await this.exec('git', ['branch', '-d', branchName]);
 
         return {
             success: true,
@@ -180,7 +181,7 @@ export class GitClient extends SCMClient {
     }
 
     async getRecentCommits(count: number = 10): Promise<{ hash: string; message: string; date: string }[]> {
-        const result = await this.exec('git', ['log', `--format=%H|%s|%ci`, `-${count}`]);
+        const result = await this.exec('git', ['log', '--format=%H|%s|%ci', `-${count}`]);
 
         return result.stdout.trim().split('\n')
             .filter(line => line.trim())

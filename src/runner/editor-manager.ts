@@ -114,7 +114,7 @@ export class EditorInstanceManager extends EventEmitter {
         });
 
         this.process.on('error', (err) => {
-            console.error(`[EditorManager] Process error:`, err);
+            console.error('[EditorManager] Process error:', err);
             this.emit('crashed', null, null);
         });
 

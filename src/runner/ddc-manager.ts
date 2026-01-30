@@ -113,15 +113,15 @@ export class DDCManager {
                 shell: true
             });
 
-            let stdout = '';
-            let stderr = '';
+            let _stdout = '';
+            let _stderr = '';
 
             proc.stdout?.on('data', (data) => {
-                stdout += data.toString();
+                _stdout += data.toString();
             });
 
             proc.stderr?.on('data', (data) => {
-                stderr += data.toString();
+                _stderr += data.toString();
             });
 
             const timeout = setTimeout(() => {

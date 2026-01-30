@@ -379,7 +379,7 @@ export async function triageCrash(crashDir: string): Promise<CrashReport> {
  */
 export function formatCrashReport(report: CrashReport): string {
     const lines: string[] = [
-        `=== CRASH TRIAGE REPORT ===`,
+        '=== CRASH TRIAGE REPORT ===',
         `Type: ${report.type}`,
         `Timestamp: ${report.timestamp || 'Unknown'}`,
         ''

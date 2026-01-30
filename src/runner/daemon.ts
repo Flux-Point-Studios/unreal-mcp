@@ -380,7 +380,7 @@ export class MCPRunnerDaemon {
 
             // Commit SCM changes
             await this.scmClient.commitAttempt(scmAttempt, result.summary);
-            console.log(`[Daemon] SCM changes committed`);
+            console.log('[Daemon] SCM changes committed');
 
             this.workflowsSucceeded++;
             this.currentWorkflowId = undefined;
@@ -398,11 +398,11 @@ export class MCPRunnerDaemon {
 
             // Attempt rollback if configured
             if (workflow.rollbackOnFailure && this.currentScmAttempt) {
-                console.log(`[Daemon] Attempting rollback...`);
+                console.log('[Daemon] Attempting rollback...');
                 try {
                     // Use revertAttempt with the stored attempt
                     await this.scmClient.revertAttempt(this.currentScmAttempt);
-                    console.log(`[Daemon] Rollback successful`);
+                    console.log('[Daemon] Rollback successful');
                 } catch (rollbackError) {
                     console.error(`[Daemon] Rollback failed: ${rollbackError}`);
                 }
@@ -592,7 +592,7 @@ export class MCPRunnerDaemon {
                 if (!visualResult.success) {
                     throw new Error(`Visual regression failed: ${visualResult.maxDifference * 100}% difference`);
                 }
-                return `Visual comparison passed`;
+                return 'Visual comparison passed';
             }
 
             case 'golden_scenario': {
@@ -606,9 +606,9 @@ export class MCPRunnerDaemon {
                     ]
                 });
                 if (!scenarioResult.success) {
-                    throw new Error(`Golden scenario failed`);
+                    throw new Error('Golden scenario failed');
                 }
-                return `Golden scenario passed`;
+                return 'Golden scenario passed';
             }
 
             case 'gauntlet': {
@@ -622,7 +622,7 @@ export class MCPRunnerDaemon {
                 if (!gauntletResult.success) {
                     throw new Error(`Gauntlet test failed: ${gauntletResult.failed} tests failed`);
                 }
-                return `Gauntlet test passed`;
+                return 'Gauntlet test passed';
             }
 
             default:

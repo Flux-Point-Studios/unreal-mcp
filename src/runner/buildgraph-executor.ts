@@ -22,12 +22,10 @@ import * as fs from 'fs/promises';
  * BuildGraph Executor - Run BuildGraph scripts via UAT
  */
 export class BuildGraphExecutor {
-    private _enginePath: string;
     private projectPath: string;
     private uatRunner: UATRunner;
 
     constructor(enginePath: string, projectPath: string) {
-        this._enginePath = enginePath;
         this.projectPath = projectPath;
         this.uatRunner = new UATRunner(enginePath, projectPath);
     }

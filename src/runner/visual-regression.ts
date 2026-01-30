@@ -120,7 +120,7 @@ export class VisualRegressionRunner {
             ...this.getDeterminismArgs()
         ];
 
-        console.log(`[VisualRegression] Comparing against baseline`);
+        console.log('[VisualRegression] Comparing against baseline');
 
         await this.spawnEditor(cmdArgs, 600000);
 
@@ -153,7 +153,7 @@ export class VisualRegressionRunner {
             artifacts: {
                 baseline: this.baselineDir,
                 current: tempDir,
-                diffImages: differences.filter(d => !d.passed).map(d => d.diffImagePath!),
+                diffImages: differences.filter(d => !d.passed && d.diffImagePath).map(d => d.diffImagePath as string),
                 report: path.join(reportDir, 'index.html')
             }
         };

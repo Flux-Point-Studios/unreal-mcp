@@ -60,13 +60,11 @@ export const TEST_TIERS: Record<TestTier, GauntletTestConfig[]> = {
  */
 export class GauntletRunner {
     private uatRunner: UATRunner;
-    private _projectPath: string;
     private defaultPlatform: string = 'Win64';
     private defaultConfiguration: string = 'Development';
 
     constructor(enginePath: string, projectPath: string) {
         this.uatRunner = new UATRunner(enginePath, projectPath);
-        this._projectPath = projectPath;
     }
 
     /**
@@ -104,7 +102,8 @@ export class GauntletRunner {
         }
 
         console.log(`[Gauntlet] Test ${config.test} FAILED after ${retryCount} attempts`);
-        return lastResult!;
+        // lastResult is guaranteed to be set after at least one iteration
+        return lastResult as GauntletResult;
     }
 
     /**
@@ -258,7 +257,7 @@ export class GauntletRunner {
 
             // For smoke tests, fail fast on any failure
             if (tier === 'smoke' && !result.success) {
-                console.log(`[Gauntlet] Smoke test failed, aborting tier`);
+                console.log('[Gauntlet] Smoke test failed, aborting tier');
                 break;
             }
         }

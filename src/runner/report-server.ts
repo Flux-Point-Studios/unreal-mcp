@@ -50,8 +50,9 @@ export class ReportServer {
             await this.handleRequest(req, res);
         });
 
+        const server = this.server;
         return new Promise((resolve, reject) => {
-            this.server!.listen(this.config.port, () => {
+            server.listen(this.config.port, () => {
                 this.isRunning = true;
                 console.log(`[ReportServer] Listening on http://localhost:${this.config.port}`);
 
@@ -62,7 +63,7 @@ export class ReportServer {
                 resolve();
             });
 
-            this.server!.on('error', (err) => {
+            server.on('error', (err) => {
                 reject(err);
             });
         });
@@ -76,8 +77,9 @@ export class ReportServer {
             return;
         }
 
+        const server = this.server;
         return new Promise((resolve) => {
-            this.server!.close(() => {
+            server.close(() => {
                 this.isRunning = false;
                 console.log('[ReportServer] Stopped');
                 resolve();
@@ -101,7 +103,7 @@ export class ReportServer {
                 await this.handleGetRun(res, runId);
             } else if (pathname.includes('/artifacts/')) {
                 const parts = pathname.split('/artifacts/');
-                const runId = parts[0].split('/').pop()!;
+                const runId = parts[0].split('/').pop() ?? '';
                 const artifactPath = parts[1];
                 await this.handleGetArtifact(res, runId, artifactPath);
             } else if (pathname === '/' || pathname === '/index.html') {

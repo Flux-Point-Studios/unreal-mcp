@@ -94,7 +94,7 @@ export class UATRunner {
                 fs.open(options.logFile, 'w').then(handle => {
                     logStream = handle;
                 }).catch(err => {
-                    console.error(`[UAT] Failed to open log file:`, err);
+                    console.error('[UAT] Failed to open log file:', err);
                 });
             }
 
@@ -144,7 +144,7 @@ export class UATRunner {
                     await logStream.close();
                 }
 
-                console.error(`[UAT] Process error:`, err);
+                console.error('[UAT] Process error:', err);
 
                 resolve({
                     success: false,

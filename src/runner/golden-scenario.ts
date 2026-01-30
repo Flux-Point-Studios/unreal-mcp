@@ -60,13 +60,13 @@ export class GoldenScenarioRunner {
         // Build Gauntlet test args
         const uatArgs = [
             `-project="${this.projectPath}"`,
-            `-platform=Win64`,
-            `-configuration=Development`,
-            `-test=FPS.Scenario.Golden`,  // Our custom Gauntlet test
+            '-platform=Win64',
+            '-configuration=Development',
+            '-test=FPS.Scenario.Golden',  // Our custom Gauntlet test
             `-map=${config.map}`,
             `-timeout=${config.duration}`,
-            `-ResumeOnCriticalFailure`,
-            `-MaxRetries=3`,
+            '-ResumeOnCriticalFailure',
+            '-MaxRetries=3',
             `-ReportExportPath="${reportDir}"`,
             '-unattended',
             '-nullrhi=0'  // Rendering ON for gameplay
