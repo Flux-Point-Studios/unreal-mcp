@@ -2,6 +2,56 @@ import { cleanObject } from '../../utils/safe-json.js';
 import { ITools } from '../../types/tool-interfaces.js';
 import type { HandlerArgs, SystemArgs } from '../../types/handler-types.js';
 import { executeAutomationRequest } from './common-handlers.js';
+import {
+  launchEditor,
+  waitForEditorReady,
+  validateProjectPath,
+  type LaunchMode
+} from '../../utils/editor-launch.js';
+import { extractOptionalNumber } from './argument-helper.js';
+
+/**
+ * Helper to normalize args and extract values with defaults.
+ * @param args The raw handler arguments
+ * @param keys Array of key definitions with optional defaults
+ * @returns Normalized params object
+ */
+function normalizeArgs(args: HandlerArgs, keys: Array<{ key: string; default?: unknown }>): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  const argsRecord = args as Record<string, unknown>;
+  for (const { key, default: defaultValue } of keys) {
+    params[key] = argsRecord[key] !== undefined ? argsRecord[key] : defaultValue;
+  }
+  return params;
+}
+
+/**
+ * Extract optional string from params object.
+ * @param params The params object
+ * @param key The key to extract
+ * @returns The string value or undefined
+ */
+function extractOptionalString(params: Record<string, unknown>, key: string): string | undefined {
+  const value = params[key];
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return value.trim();
+  }
+  return undefined;
+}
+
+/** Response factory for consistent response structure */
+const ResponseFactory = {
+  success: (data: unknown, message: string): Record<string, unknown> => ({
+    success: true,
+    message,
+    data: typeof data === 'object' && data !== null ? data : { result: data },
+  }),
+  error: (message: string, errorCode: string): Record<string, unknown> => ({
+    success: false,
+    error: errorCode,
+    message,
+  }),
+};
 
 /** Response from various operations */
 interface OperationResponse {
@@ -607,8 +657,564 @@ export async function handleSystemTools(action: string, args: HandlerArgs, tools
         action: 'set_fullscreen'
       };
     }
-    case 'read_log':
-      return cleanObject(await tools.logTools.readOutputLog(args as Record<string, unknown>));
+    case 'get_log':
+    case 'read_log': {
+      const params = normalizeArgs(args, [
+        { key: 'lines', default: 100 },
+        { key: 'filter' },
+        { key: 'severity' },
+      ]);
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'get_log',
+        lines: extractOptionalNumber(params, 'lines') ?? 100,
+        filter: extractOptionalString(params, 'filter'),
+        severity: extractOptionalString(params, 'severity'),
+      });
+
+      return ResponseFactory.success(res, 'Retrieved log entries');
+    }
+
+    case 'cook_content': {
+      // Cook content for the specified platform
+      const platform = typeof (argsTyped as Record<string, unknown>).platform === 'string'
+        ? ((argsTyped as Record<string, unknown>).platform as string).trim()
+        : 'Win64';
+      const maps = Array.isArray((argsTyped as Record<string, unknown>).maps)
+        ? (argsTyped as Record<string, unknown>).maps as string[]
+        : [];
+      const iterative = (argsTyped as Record<string, unknown>).iterative !== false;
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'cook_content',
+        platform,
+        maps,
+        iterative,
+      }, 'Automation bridge not available for cook_content', { timeoutMs: 600000 }); // 10 min timeout for cooking
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'cook_content',
+        platform,
+        maps,
+        iterative,
+      });
+    }
+
+    case 'package_project': {
+      // Package the project for distribution
+      const platform = typeof (argsTyped as Record<string, unknown>).platform === 'string'
+        ? ((argsTyped as Record<string, unknown>).platform as string).trim()
+        : 'Win64';
+      const configuration = typeof (argsTyped as Record<string, unknown>).configuration === 'string'
+        ? ((argsTyped as Record<string, unknown>).configuration as string).trim()
+        : 'Development';
+      const outputDir = typeof (argsTyped as Record<string, unknown>).outputDir === 'string'
+        ? ((argsTyped as Record<string, unknown>).outputDir as string).trim()
+        : undefined;
+      const compress = (argsTyped as Record<string, unknown>).compress !== false;
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'package_project',
+        platform,
+        configuration,
+        outputDir,
+        compress,
+      }, 'Automation bridge not available for package_project', { timeoutMs: 1800000 }); // 30 min timeout for packaging
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'package_project',
+        platform,
+        configuration,
+        outputDir,
+        compress,
+      });
+    }
+
+    // Transaction support for undo/redo grouping
+    case 'begin_transaction': {
+      const name = typeof argsTyped.name === 'string' ? argsTyped.name.trim() : '';
+      const transactionName = name || 'MCP Transaction';
+      const description = typeof (argsTyped as Record<string, unknown>).description === 'string'
+        ? ((argsTyped as Record<string, unknown>).description as string).trim()
+        : undefined;
+
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        subAction: 'begin_transaction',
+        transactionName,
+        description,
+      });
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'begin_transaction',
+        transactionName,
+      });
+    }
+
+    case 'commit_transaction':
+    case 'end_transaction': {
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        subAction: 'commit_transaction',
+      });
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'commit_transaction',
+      });
+    }
+
+    case 'rollback_transaction':
+    case 'cancel_transaction': {
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        subAction: 'rollback_transaction',
+      });
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'rollback_transaction',
+      });
+    }
+
+    case 'undo':
+    case 'undo_last': {
+      const count = typeof (argsTyped as Record<string, unknown>).count === 'number'
+        ? Math.max(1, (argsTyped as Record<string, unknown>).count as number)
+        : 1;
+
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        subAction: 'undo',
+        count,
+      });
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'undo',
+        requestedCount: count,
+      });
+    }
+
+    case 'redo': {
+      const count = typeof (argsTyped as Record<string, unknown>).count === 'number'
+        ? Math.max(1, (argsTyped as Record<string, unknown>).count as number)
+        : 1;
+
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        subAction: 'redo',
+        count,
+      });
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'redo',
+        requestedCount: count,
+      });
+    }
+
+    case 'describe_capabilities':
+    case 'get_capabilities':
+    case 'capabilities': {
+      const capabilities = {
+        server: {
+          name: 'unreal-engine-mcp-server',
+          version: '0.6.0',
+          features: [
+            'transactions',
+            'dryRun',
+            'semanticMaterialGraph',
+            'reparentMaterialInstance',
+            'structuredErrors',
+            'hotReload',
+            'liveCoding',
+            'headlessLaunch',
+            'autoLaunch',
+          ],
+        },
+        actions: {
+          manage_asset: {
+            subActions: [
+              'list', 'delete', 'rename', 'move', 'duplicate',
+              'exists', 'get_references', 'bulk_delete', 'bulk_rename',
+            ],
+            aliases: {
+              paths: ['assetPaths', 'paths'],
+              assetPath: ['assetPath', 'path'],
+            },
+          },
+          manage_material_authoring: {
+            subActions: [
+              'create_material', 'create_material_instance', 'reparent_material_instance',
+              'add_texture_sample', 'add_scalar_parameter', 'add_vector_parameter',
+              'connect_nodes', 'disconnect_nodes', 'compile_material', 'get_material_info',
+              'get_material_output_node', 'find_nodes',
+            ],
+            materialOutputPins: [
+              'BaseColor', 'Metallic', 'Specular', 'Roughness', 'Normal',
+              'EmissiveColor', 'Opacity', 'OpacityMask', 'AmbientOcclusion',
+              'SubsurfaceColor', 'WorldPositionOffset',
+            ],
+          },
+          control_editor: {
+            subActions: [
+              'begin_transaction', 'commit_transaction', 'rollback_transaction',
+              'undo', 'redo', 'screenshot', 'execute_command',
+            ],
+          },
+          system_control: {
+            subActions: [
+              'launch_editor', 'launch_headless', 'get_editor_status',
+              'hot_reload', 'live_coding', 'compile_project', 'cook_content', 'package_project',
+              'profile', 'show_fps', 'set_quality', 'screenshot', 'execute_command',
+              'set_cvar', 'get_project_settings', 'execute_python',
+            ],
+            launchModes: ['editor', 'headless', 'game', 'server', 'commandlet'],
+          },
+        },
+        errorCodes: {
+          validation: ['INVALID_ARGUMENT', 'MISSING_REQUIRED', 'INVALID_PATH'],
+          assets: ['ASSET_NOT_FOUND', 'ASSET_EXISTS', 'ASSET_IN_USE', 'DELETE_FAILED'],
+          materials: ['MATERIAL_NOT_FOUND', 'NODE_NOT_FOUND', 'CONNECTION_FAILED', 'INVALID_PARENT'],
+          system: ['BRIDGE_DISCONNECTED', 'TIMEOUT', 'VERSION_MISMATCH', 'COMPILATION_ERROR', 'ALREADY_COMPILING', 'LAUNCH_FAILED'],
+        },
+      };
+
+      return cleanObject({
+        success: true,
+        message: 'Capabilities retrieved',
+        action: 'describe_capabilities',
+        capabilities,
+      });
+    }
+
+    case 'compile_project': {
+      // Compile/build the Unreal project using IDesktopPlatform
+      const params = normalizeArgs(args, [
+        { key: 'configuration', default: 'Development' },
+        { key: 'platform', default: 'Win64' },
+        { key: 'target', default: 'Editor' },
+        { key: 'clean', default: false },
+      ]);
+
+      const configuration = extractOptionalString(params, 'configuration') ?? 'Development';
+      const platform = extractOptionalString(params, 'platform') ?? 'Win64';
+      const target = extractOptionalString(params, 'target') ?? 'Editor';
+      const clean = params.clean === true || params.clean === 'true';
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'compile_project',
+        configuration,
+        platform,
+        target,
+        clean,
+      });
+
+      return ResponseFactory.success(res, 'Project compilation initiated');
+    }
+
+    // Hot reload / Live coding support for C++ code changes
+    case 'hot_reload':
+    case 'live_coding': {
+      const params = normalizeArgs(args, [
+        { key: 'waitForCompletion', default: true },
+        { key: 'modules', default: [] },
+      ]);
+
+      const waitForCompletion = params.waitForCompletion !== false;
+      const modules = Array.isArray(params.modules) ? params.modules as string[] : [];
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'hot_reload',
+        waitForCompletion,
+        modules,
+      }) as OperationResponse;
+
+      if (res.success === false) {
+        return cleanObject({
+          success: false,
+          error: res.error ?? 'COMPILATION_ERROR',
+          message: res.message ?? 'Hot reload failed',
+          action: sysAction,
+          ...res,
+        });
+      }
+
+      return cleanObject({
+        success: true,
+        message: res.message ?? 'Hot reload completed',
+        action: sysAction,
+        ...res,
+      });
+    }
+
+    // ============================================================================
+    // EDITOR LAUNCH ACTIONS - For CI/CD automation and headless mode
+    // ============================================================================
+    case 'launch_editor':
+    case 'launch_headless': {
+      const argsRecord = args as Record<string, unknown>;
+
+      // Extract project path (required)
+      const projectPath = typeof argsRecord.projectPath === 'string' ? argsRecord.projectPath.trim() :
+        typeof argsRecord.project === 'string' ? argsRecord.project.trim() :
+        typeof argsRecord.uprojectPath === 'string' ? argsRecord.uprojectPath.trim() : '';
+
+      if (!projectPath) {
+        return {
+          success: false,
+          error: 'MISSING_REQUIRED',
+          message: 'projectPath is required',
+          action: sysAction
+        };
+      }
+
+      // Validate the project path
+      const validation = validateProjectPath(projectPath);
+      if (!validation.valid) {
+        return {
+          success: false,
+          error: 'INVALID_PATH',
+          message: validation.error || 'Invalid project path',
+          action: sysAction,
+          projectPath
+        };
+      }
+
+      // Extract optional parameters
+      const mode = (typeof argsRecord.mode === 'string' ? argsRecord.mode.trim() :
+        (sysAction === 'launch_headless' ? 'headless' : 'editor')) as LaunchMode;
+      const additionalArgs = typeof argsRecord.additionalArgs === 'string' ? argsRecord.additionalArgs.trim() :
+        typeof argsRecord.extraArgs === 'string' ? argsRecord.extraArgs.trim() :
+        typeof argsRecord.args === 'string' ? argsRecord.args.trim() : '';
+      const waitForReady = argsRecord.waitForReady !== false && argsRecord.waitForConnection !== false;
+      const timeoutMs = typeof argsRecord.timeoutMs === 'number' ? argsRecord.timeoutMs :
+        typeof argsRecord.timeout === 'number' ? argsRecord.timeout : 60000;
+      const editorPath = typeof argsRecord.editorPath === 'string' ? argsRecord.editorPath.trim() :
+        typeof argsRecord.unrealPath === 'string' ? argsRecord.unrealPath.trim() :
+        typeof argsRecord.enginePath === 'string' ? argsRecord.enginePath.trim() : undefined;
+      const commandletName = typeof argsRecord.commandletName === 'string' ? argsRecord.commandletName.trim() :
+        typeof argsRecord.commandlet === 'string' ? argsRecord.commandlet.trim() : undefined;
+      const commandletArgs = typeof argsRecord.commandletArgs === 'string' ? argsRecord.commandletArgs.trim() : undefined;
+
+      // Validate mode
+      const validModes = ['editor', 'headless', 'game', 'server', 'commandlet'];
+      if (!validModes.includes(mode)) {
+        return {
+          success: false,
+          error: 'INVALID_ARGUMENT',
+          message: `Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`,
+          action: sysAction,
+          mode
+        };
+      }
+
+      // Commandlet mode requires a commandlet name
+      if (mode === 'commandlet' && !commandletName) {
+        return {
+          success: false,
+          error: 'MISSING_REQUIRED',
+          message: 'commandletName is required when mode is "commandlet"',
+          action: sysAction,
+          mode
+        };
+      }
+
+      try {
+        // Launch the editor
+        const result = await launchEditor({
+          projectPath,
+          mode,
+          additionalArgs,
+          editorPath,
+          commandletName,
+          commandletArgs,
+          detached: true
+        });
+
+        // If requested, wait for the MCP connection to be established
+        if (waitForReady && mode !== 'commandlet') {
+          try {
+            // Use the automation bridge to check connection status
+            const bridge = tools.automationBridge;
+            if (bridge && typeof bridge.isConnected === 'function') {
+              await waitForEditorReady(
+                timeoutMs,
+                2000,
+                () => bridge.isConnected()
+              );
+            }
+          } catch (waitError) {
+            // Editor launched but connection not established
+            const errMsg = waitError instanceof Error ? waitError.message : String(waitError);
+            return cleanObject({
+              success: true,
+              warning: `Editor launched but MCP connection not established: ${errMsg}`,
+              message: 'Editor process started, but MCP connection timed out',
+              action: sysAction,
+              pid: result.pid,
+              command: result.command,
+              args: result.args,
+              mode,
+              projectPath,
+              connectionEstablished: false
+            });
+          }
+        }
+
+        return cleanObject({
+          success: true,
+          message: `Unreal Editor launched successfully in ${mode} mode`,
+          action: sysAction,
+          pid: result.pid,
+          command: result.command,
+          args: result.args,
+          mode,
+          projectPath,
+          connectionEstablished: waitForReady && mode !== 'commandlet'
+        });
+
+      } catch (launchError) {
+        const errMsg = launchError instanceof Error ? launchError.message : String(launchError);
+        return {
+          success: false,
+          error: 'LAUNCH_FAILED',
+          message: `Failed to launch editor: ${errMsg}`,
+          action: sysAction,
+          mode,
+          projectPath
+        };
+      }
+    }
+
+    case 'get_editor_status': {
+      // Return the current status of the automation bridge connection
+      const bridge = tools.automationBridge;
+      if (!bridge) {
+        return {
+          success: true,
+          message: 'Automation bridge not configured',
+          action: 'get_editor_status',
+          connected: false,
+          status: null
+        };
+      }
+
+      const isConnected = typeof bridge.isConnected === 'function' ? bridge.isConnected() : false;
+      const status = typeof bridge.getStatus === 'function' ? bridge.getStatus() : null;
+
+      return cleanObject({
+        success: true,
+        message: isConnected ? 'Editor is connected' : 'Editor is not connected',
+        action: 'get_editor_status',
+        connected: isConnected,
+        status
+      });
+    }
+
+    // ============================================================================
+    // PIE DIAGNOSTICS - Runtime state queries during Play-In-Editor
+    // ============================================================================
+    case 'get_player_state': {
+      // Get current player state during PIE (position, rotation, velocity, movement info)
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'get_player_state',
+      });
+      return ResponseFactory.success(res, 'Player state retrieved');
+    }
+
+    case 'get_pie_status': {
+      // Get PIE session status (playing, paused, time info)
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'get_pie_status',
+      });
+      return ResponseFactory.success(res, 'PIE status retrieved');
+    }
+
+    case 'inspect_actor': {
+      // Inspect actor properties at runtime during PIE
+      const params = normalizeArgs(args, [
+        { key: 'actorName' },
+        { key: 'includeComponents', default: true },
+      ]);
+
+      const actorName = extractOptionalString(params, 'actorName');
+      if (!actorName) {
+        return ResponseFactory.error('actorName is required', 'MISSING_REQUIRED');
+      }
+
+      const includeComponents = params.includeComponents !== false;
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'inspect_actor',
+        actorName,
+        includeComponents,
+      });
+
+      return ResponseFactory.success(res, 'Actor inspected');
+    }
+
+    case 'get_component_state': {
+      // Get detailed state of a specific component on an actor during runtime
+      const params = normalizeArgs(args, [
+        { key: 'actorName' },
+        { key: 'componentName' },
+      ]);
+
+      const actorName = extractOptionalString(params, 'actorName');
+      const componentName = extractOptionalString(params, 'componentName');
+
+      if (!actorName) {
+        return ResponseFactory.error('actorName is required', 'MISSING_REQUIRED');
+      }
+      if (!componentName) {
+        return ResponseFactory.error('componentName is required', 'MISSING_REQUIRED');
+      }
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'get_component_state',
+        actorName,
+        componentName,
+      });
+
+      return ResponseFactory.success(res, 'Component state retrieved');
+    }
+
+    case 'execute_python':
+    case 'run_python': {
+      const params = normalizeArgs(args, [
+        { key: 'scriptPath' },
+        { key: 'scriptContent' },
+        { key: 'args', default: [] },
+      ]);
+
+      const scriptPath = extractOptionalString(params, 'scriptPath');
+      const scriptContent = extractOptionalString(params, 'scriptContent');
+
+      if (!scriptPath && !scriptContent) {
+        return ResponseFactory.error('Either scriptPath or scriptContent is required', 'MISSING_REQUIRED');
+      }
+
+      const res = await executeAutomationRequest(tools, 'system_control', {
+        subAction: 'execute_python',
+        scriptPath,
+        scriptContent,
+        args: params.args,
+      });
+
+      const resObj = typeof res === 'object' && res !== null ? res as Record<string, unknown> : {};
+      return cleanObject({
+        ...resObj,
+        action: 'execute_python',
+      });
+    }
+
     default: {
       const res = await executeAutomationRequest(tools, 'system_control', args, 'Automation bridge not available for system control operations');
       return cleanObject(res) as Record<string, unknown>;

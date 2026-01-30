@@ -6,6 +6,35 @@
 #if WITH_EDITOR
 #include "Editor.h"
 #include "EditorAssetLibrary.h"
+#include "DesktopPlatformModule.h"
+#include "IDesktopPlatform.h"
+
+// Python Script Plugin support (optional - check availability at runtime)
+// The Python Editor Script Plugin provides the IPythonScriptPlugin interface
+#if __has_include("IPythonScriptPlugin.h")
+#include "IPythonScriptPlugin.h"
+#define MCP_HAS_PYTHON_PLUGIN 1
+#else
+// Forward declarations for fallback when header is not available
+enum class EPythonCommandExecutionMode : uint8 {
+  ExecuteFile,
+  ExecuteStatement,
+  EvaluateStatement
+};
+struct FPythonLogOutputEntry {};
+struct FPythonCommandContext {};
+// Stub interface - the real interface will be used at runtime via FModuleManager
+class IPythonScriptPlugin : public IModuleInterface {
+public:
+  virtual bool ExecPythonCommand(const TCHAR *InPythonCommand) = 0;
+  virtual bool ExecPythonCommandEx(
+      EPythonCommandExecutionMode ExecutionMode, const TCHAR *InPythonCommand,
+      FString *OutCommandResult = nullptr,
+      TArray<FPythonLogOutputEntry> *OutLogOutput = nullptr,
+      const FPythonCommandContext *Context = nullptr) = 0;
+};
+#define MCP_HAS_PYTHON_PLUGIN 0
+#endif
 
 #if __has_include("Subsystems/EditorActorSubsystem.h")
 #include "Subsystems/EditorActorSubsystem.h"
@@ -37,6 +66,13 @@
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
 #include "ProceduralMeshComponent.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/PlayerController.h"
+
+// Hot Reload / Live Coding support
+#include "Misc/HotReloadInterface.h"
+#include "Misc/App.h"
 
 #endif
 
@@ -917,6 +953,994 @@ bool UMcpAutomationBridgeSubsystem::HandleSystemControlAction(
 #else
     SendAutomationResponse(RequestingSocket, RequestId, false,
                            TEXT("validate_assets requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Execute Python script in Unreal's Python environment
+  if (LowerSub == TEXT("execute_python") || LowerSub == TEXT("run_python")) {
+#if WITH_EDITOR
+    FString ScriptPath;
+    FString ScriptContent;
+    Payload->TryGetStringField(TEXT("scriptPath"), ScriptPath);
+    Payload->TryGetStringField(TEXT("scriptContent"), ScriptContent);
+
+    // Get optional args array
+    TArray<FString> ScriptArgs;
+    const TArray<TSharedPtr<FJsonValue>> *ArgsArray = nullptr;
+    if (Payload->TryGetArrayField(TEXT("args"), ArgsArray) && ArgsArray) {
+      for (const TSharedPtr<FJsonValue> &ArgVal : *ArgsArray) {
+        if (ArgVal.IsValid() && ArgVal->Type == EJson::String) {
+          ScriptArgs.Add(ArgVal->AsString());
+        }
+      }
+    }
+
+    if (ScriptPath.IsEmpty() && ScriptContent.IsEmpty()) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("Either scriptPath or scriptContent is required"),
+                             nullptr, TEXT("MISSING_REQUIRED"));
+      return true;
+    }
+
+    // Try to get the Python script plugin
+    IPythonScriptPlugin *PythonPlugin =
+        FModuleManager::GetModulePtr<IPythonScriptPlugin>("PythonScriptPlugin");
+
+    if (!PythonPlugin) {
+      SendAutomationResponse(
+          RequestingSocket, RequestId, false,
+          TEXT("Python plugin not available. Enable the Python Editor Script "
+               "Plugin in your project settings."),
+          nullptr, TEXT("PLUGIN_NOT_FOUND"));
+      return true;
+    }
+
+    bool bSuccess = false;
+    FString Output;
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+
+    if (!ScriptPath.IsEmpty()) {
+      // Execute Python script file
+      // Normalize path - convert relative paths to absolute
+      FString NormalizedPath = ScriptPath;
+      if (!FPaths::IsRelativePath(NormalizedPath)) {
+        // Already absolute
+      } else if (NormalizedPath.StartsWith(TEXT("/Game/")) ||
+                 NormalizedPath.StartsWith(TEXT("/Engine/"))) {
+        // Content path - convert to filesystem path
+        FString FilePath;
+        if (FPackageName::TryConvertLongPackageNameToFilename(NormalizedPath,
+                                                               FilePath)) {
+          NormalizedPath = FilePath;
+        }
+      } else {
+        // Relative to project root
+        NormalizedPath = FPaths::ProjectDir() / NormalizedPath;
+      }
+
+      FPaths::NormalizeFilename(NormalizedPath);
+
+      if (!FPaths::FileExists(NormalizedPath)) {
+        SendAutomationResponse(
+            RequestingSocket, RequestId, false,
+            FString::Printf(TEXT("Python script file not found: %s"),
+                            *NormalizedPath),
+            nullptr, TEXT("FILE_NOT_FOUND"));
+        return true;
+      }
+
+      // Build command with arguments
+      FString Command = FString::Printf(TEXT("py \"%s\""), *NormalizedPath);
+      for (const FString &Arg : ScriptArgs) {
+        Command += FString::Printf(TEXT(" \"%s\""), *Arg);
+      }
+
+      bSuccess = PythonPlugin->ExecPythonCommand(*Command);
+      ResultObj->SetStringField(TEXT("scriptPath"), NormalizedPath);
+      ResultObj->SetStringField(TEXT("executionType"), TEXT("file"));
+    } else {
+      // Execute inline Python code
+      // Use ExecPythonCommandEx for statement execution
+      bSuccess = PythonPlugin->ExecPythonCommandEx(
+          EPythonCommandExecutionMode::ExecuteStatement, *ScriptContent);
+      ResultObj->SetStringField(TEXT("executionType"), TEXT("inline"));
+      ResultObj->SetNumberField(TEXT("contentLength"), ScriptContent.Len());
+    }
+
+    ResultObj->SetBoolField(TEXT("executed"), bSuccess);
+
+    if (bSuccess) {
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Python script executed successfully"),
+                             ResultObj, FString());
+    } else {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("Python script execution failed"), ResultObj,
+                             TEXT("EXECUTION_FAILED"));
+    }
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("execute_python requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Compile/build project using IDesktopPlatform
+  if (LowerSub == TEXT("compile_project")) {
+#if WITH_EDITOR
+    FString Configuration =
+        GetJsonStringField(Payload, TEXT("configuration"), TEXT("Development"));
+    FString Platform =
+        GetJsonStringField(Payload, TEXT("platform"), TEXT("Win64"));
+    FString Target =
+        GetJsonStringField(Payload, TEXT("target"), TEXT("Editor"));
+    bool bClean = GetJsonBoolField(Payload, TEXT("clean"), false);
+
+    // Get the desktop platform module for compilation
+    IDesktopPlatform *DesktopPlatform = FDesktopPlatformModule::Get();
+    if (!DesktopPlatform) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("IDesktopPlatform not available"), nullptr,
+                             TEXT("PLATFORM_UNAVAILABLE"));
+      return true;
+    }
+
+    // Get project paths
+    FString ProjectPath = FPaths::GetProjectFilePath();
+    FString RootDir = FPaths::RootDir();
+
+    // Build result tracking
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("projectPath"), ProjectPath);
+    ResultObj->SetStringField(TEXT("configuration"), Configuration);
+    ResultObj->SetStringField(TEXT("platform"), Platform);
+    ResultObj->SetStringField(TEXT("target"), Target);
+    ResultObj->SetBoolField(TEXT("clean"), bClean);
+
+    // If clean build requested, log it
+    if (bClean) {
+      UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+             TEXT("Clean build requested for project: %s"), *ProjectPath);
+    }
+
+    // Use FFeedbackContext for build output
+    FFeedbackContext *Warn = GWarn;
+
+    // Compile the game project
+    // Note: CompileGameProject compiles the current project's code
+    bool bSuccess =
+        DesktopPlatform->CompileGameProject(RootDir, ProjectPath, Warn);
+
+    ResultObj->SetBoolField(TEXT("compiled"), bSuccess);
+
+    if (bSuccess) {
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Project compiled successfully"), ResultObj,
+                             FString());
+    } else {
+      SendAutomationResponse(
+          RequestingSocket, RequestId, false,
+          TEXT("Project compilation failed - check Output Log for details"),
+          ResultObj, TEXT("COMPILE_FAILED"));
+    }
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("compile_project requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Cook content for packaging
+  if (LowerSub == TEXT("cook_content")) {
+#if WITH_EDITOR
+    FString Platform;
+    bool bIterative = true;
+    Payload->TryGetStringField(TEXT("platform"), Platform);
+    Payload->TryGetBoolField(TEXT("iterative"), bIterative);
+
+    if (Platform.IsEmpty()) {
+      Platform = TEXT("Win64");
+    }
+
+    // Build UAT command for cooking
+    FString UATPath = FPaths::ConvertRelativePathToFull(
+        FPaths::EngineDir() / TEXT("Build/BatchFiles/RunUAT.bat"));
+
+    FString ProjectPath = FPaths::GetProjectFilePath();
+
+    // Get optional maps array
+    TArray<FString> MapsToCook;
+    const TArray<TSharedPtr<FJsonValue>>* MapsArray = nullptr;
+    if (Payload->TryGetArrayField(TEXT("maps"), MapsArray) && MapsArray) {
+      for (const auto& MapVal : *MapsArray) {
+        if (MapVal.IsValid() && MapVal->Type == EJson::String) {
+          MapsToCook.Add(MapVal->AsString());
+        }
+      }
+    }
+
+    FString MapsArg;
+    if (MapsToCook.Num() > 0) {
+      MapsArg = TEXT(" -map=") + FString::Join(MapsToCook, TEXT("+"));
+    }
+
+    FString Args = FString::Printf(
+        TEXT("BuildCookRun -project=\"%s\" -cook -targetplatform=%s %s%s -unattended"),
+        *ProjectPath, *Platform,
+        bIterative ? TEXT("-iterativecooking") : TEXT(""),
+        *MapsArg);
+
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+           TEXT("Executing UAT cook: %s %s"), *UATPath, *Args);
+
+    // Execute and capture output
+    int32 ReturnCode = 0;
+    FString Output;
+    FString Errors;
+
+    bool bSuccess = FPlatformProcess::ExecProcess(
+        *UATPath, *Args, &ReturnCode, &Output, &Errors);
+
+    TSharedPtr<FJsonObject> CookResult = MakeShared<FJsonObject>();
+    CookResult->SetBoolField(TEXT("processStarted"), bSuccess);
+    CookResult->SetNumberField(TEXT("returnCode"), ReturnCode);
+    CookResult->SetStringField(TEXT("platform"), Platform);
+    CookResult->SetBoolField(TEXT("iterative"), bIterative);
+
+    // Truncate output if too long
+    if (Output.Len() > 8000) {
+      Output = Output.Right(8000);
+      Output = TEXT("... (truncated) ...") + Output;
+    }
+    CookResult->SetStringField(TEXT("output"), Output);
+
+    if (!Errors.IsEmpty()) {
+      CookResult->SetStringField(TEXT("errors"), Errors);
+    }
+
+    bool bCookSuccess = bSuccess && ReturnCode == 0;
+    SendAutomationResponse(RequestingSocket, RequestId, bCookSuccess,
+                           bCookSuccess ? TEXT("Content cooking completed successfully")
+                                        : TEXT("Content cooking failed"),
+                           CookResult, bCookSuccess ? FString() : TEXT("COOK_FAILED"));
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("cook_content requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Package project for distribution
+  if (LowerSub == TEXT("package_project")) {
+#if WITH_EDITOR
+    FString Platform;
+    FString Configuration;
+    FString OutputDir;
+    bool bCompress = true;
+
+    Payload->TryGetStringField(TEXT("platform"), Platform);
+    Payload->TryGetStringField(TEXT("configuration"), Configuration);
+    Payload->TryGetStringField(TEXT("outputDir"), OutputDir);
+    Payload->TryGetBoolField(TEXT("compress"), bCompress);
+
+    if (Platform.IsEmpty()) {
+      Platform = TEXT("Win64");
+    }
+    if (Configuration.IsEmpty()) {
+      Configuration = TEXT("Development");
+    }
+
+    // Build UAT command for packaging
+    FString UATPath = FPaths::ConvertRelativePathToFull(
+        FPaths::EngineDir() / TEXT("Build/BatchFiles/RunUAT.bat"));
+
+    FString ProjectPath = FPaths::GetProjectFilePath();
+
+    FString Args = FString::Printf(
+        TEXT("BuildCookRun -project=\"%s\" -cook -stage -package -targetplatform=%s -clientconfig=%s %s -unattended"),
+        *ProjectPath, *Platform, *Configuration,
+        bCompress ? TEXT("-compressed") : TEXT(""));
+
+    if (!OutputDir.IsEmpty()) {
+      Args += FString::Printf(TEXT(" -archivedirectory=\"%s\""), *OutputDir);
+    }
+
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+           TEXT("Executing UAT package: %s %s"), *UATPath, *Args);
+
+    // Execute and capture output
+    int32 ReturnCode = 0;
+    FString Output;
+    FString Errors;
+
+    bool bSuccess = FPlatformProcess::ExecProcess(
+        *UATPath, *Args, &ReturnCode, &Output, &Errors);
+
+    TSharedPtr<FJsonObject> PackageResult = MakeShared<FJsonObject>();
+    PackageResult->SetBoolField(TEXT("processStarted"), bSuccess);
+    PackageResult->SetNumberField(TEXT("returnCode"), ReturnCode);
+    PackageResult->SetStringField(TEXT("platform"), Platform);
+    PackageResult->SetStringField(TEXT("configuration"), Configuration);
+    PackageResult->SetBoolField(TEXT("compressed"), bCompress);
+
+    if (!OutputDir.IsEmpty()) {
+      PackageResult->SetStringField(TEXT("outputDir"), OutputDir);
+    }
+
+    // Truncate output if too long
+    if (Output.Len() > 8000) {
+      Output = Output.Right(8000);
+      Output = TEXT("... (truncated) ...") + Output;
+    }
+    PackageResult->SetStringField(TEXT("output"), Output);
+
+    if (!Errors.IsEmpty()) {
+      PackageResult->SetStringField(TEXT("errors"), Errors);
+    }
+
+    bool bPackageSuccess = bSuccess && ReturnCode == 0;
+    SendAutomationResponse(RequestingSocket, RequestId, bPackageSuccess,
+                           bPackageSuccess ? TEXT("Project packaged successfully")
+                                           : TEXT("Project packaging failed"),
+                           PackageResult, bPackageSuccess ? FString() : TEXT("PACKAGE_FAILED"));
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("package_project requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Hot reload / Live coding - trigger compilation of changed C++ code
+  if (LowerSub == TEXT("hot_reload") || LowerSub == TEXT("live_coding")) {
+#if WITH_EDITOR
+    bool bWaitForCompletion = GetJsonBoolField(Payload, TEXT("waitForCompletion"), true);
+
+    // Get optional modules array (not currently used but reserved for future)
+    TArray<FString> Modules;
+    const TArray<TSharedPtr<FJsonValue>>* ModulesArray = nullptr;
+    if (Payload->TryGetArrayField(TEXT("modules"), ModulesArray) && ModulesArray) {
+      for (const TSharedPtr<FJsonValue>& ModuleVal : *ModulesArray) {
+        if (ModuleVal.IsValid() && ModuleVal->Type == EJson::String) {
+          Modules.Add(ModuleVal->AsString());
+        }
+      }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("waitForCompletion"), bWaitForCompletion);
+
+    // First try Live Coding (UE5+ preferred method)
+    if (IModuleInterface* LiveCodingModule = FModuleManager::GetModulePtr<IModuleInterface>(TEXT("LiveCoding"))) {
+      // Live Coding is available - trigger via console command
+      GEngine->Exec(nullptr, TEXT("LiveCoding.Compile"));
+      ResultObj->SetStringField(TEXT("method"), TEXT("LiveCoding"));
+      ResultObj->SetBoolField(TEXT("initiated"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Live Coding compilation initiated"),
+                             ResultObj, FString());
+      return true;
+    }
+
+    // Fallback to HotReload module
+    if (!FModuleManager::Get().IsModuleLoaded(TEXT("HotReload"))) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("Neither LiveCoding nor HotReload modules are available. "
+                                  "Ensure Live Coding is enabled in Editor Preferences."),
+                             nullptr, TEXT("MODULE_NOT_FOUND"));
+      return true;
+    }
+
+    // Use the HotReload interface
+    IHotReloadInterface& HotReload = FModuleManager::GetModuleChecked<IHotReloadInterface>(TEXT("HotReload"));
+
+    // Check if already compiling
+    if (HotReload.IsCurrentlyCompiling()) {
+      ResultObj->SetBoolField(TEXT("alreadyCompiling"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("Compilation already in progress"),
+                             ResultObj, TEXT("ALREADY_COMPILING"));
+      return true;
+    }
+
+    ResultObj->SetStringField(TEXT("method"), TEXT("HotReload"));
+
+    if (bWaitForCompletion) {
+      // Synchronous hot reload
+      const bool bRecompileSucceeded = HotReload.RecompileModule(
+          FApp::GetProjectName(),
+          *GWarn,
+          ERecompileModuleFlags::ReloadAfterRecompile | ERecompileModuleFlags::FailIfGeneratedCodeChanges
+      );
+
+      ResultObj->SetBoolField(TEXT("success"), bRecompileSucceeded);
+      ResultObj->SetStringField(TEXT("message"),
+          bRecompileSucceeded ? TEXT("Hot reload successful") : TEXT("Hot reload failed"));
+
+      if (bRecompileSucceeded) {
+        SendAutomationResponse(RequestingSocket, RequestId, true,
+                               TEXT("Hot reload completed successfully"),
+                               ResultObj, FString());
+      } else {
+        SendAutomationResponse(RequestingSocket, RequestId, false,
+                               TEXT("Hot reload failed - check Output Log for details"),
+                               ResultObj, TEXT("COMPILATION_ERROR"));
+      }
+    } else {
+      // Async hot reload - just trigger and return
+      HotReload.RequestModuleCompilation(FApp::GetProjectName(), false);
+      ResultObj->SetBoolField(TEXT("initiated"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Hot reload initiated (async)"),
+                             ResultObj, FString());
+    }
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("hot_reload requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Get log entries from the editor output log
+  if (LowerSub == TEXT("get_log") || LowerSub == TEXT("read_log")) {
+#if WITH_EDITOR
+    int32 Lines = 100;
+    FString Filter;
+    FString Severity;
+
+    Payload->TryGetNumberField(TEXT("lines"), Lines);
+    Payload->TryGetStringField(TEXT("filter"), Filter);
+    Payload->TryGetStringField(TEXT("severity"), Severity);
+
+    // Clamp lines to reasonable bounds
+    Lines = FMath::Clamp(Lines, 1, 10000);
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    TArray<TSharedPtr<FJsonValue>> LogEntries;
+
+    // Read from the project log file
+    FString LogFilePath = FPaths::ProjectLogDir() / FApp::GetProjectName() + TEXT(".log");
+
+    // If the project-specific log doesn't exist, try the generic one
+    if (!FPaths::FileExists(LogFilePath)) {
+      // Find the most recent .log file in the log directory
+      TArray<FString> LogFiles;
+      IFileManager::Get().FindFiles(LogFiles, *(FPaths::ProjectLogDir() / TEXT("*.log")), true, false);
+      if (LogFiles.Num() > 0) {
+        // Sort by modification time (most recent first)
+        LogFiles.Sort([](const FString &A, const FString &B) {
+          FDateTime TimeA = IFileManager::Get().GetTimeStamp(*(FPaths::ProjectLogDir() / A));
+          FDateTime TimeB = IFileManager::Get().GetTimeStamp(*(FPaths::ProjectLogDir() / B));
+          return TimeA > TimeB;
+        });
+        LogFilePath = FPaths::ProjectLogDir() / LogFiles[0];
+      }
+    }
+
+    if (FPaths::FileExists(LogFilePath)) {
+      TArray<FString> LogLines;
+      if (FFileHelper::LoadFileToStringArray(LogLines, *LogFilePath)) {
+        // Get last N lines
+        int32 StartIndex = FMath::Max(0, LogLines.Num() - Lines);
+
+        for (int32 i = StartIndex; i < LogLines.Num(); i++) {
+          const FString &Line = LogLines[i];
+
+          // Skip empty lines
+          if (Line.IsEmpty()) {
+            continue;
+          }
+
+          // Apply text filter if specified
+          if (!Filter.IsEmpty() && !Line.Contains(Filter)) {
+            continue;
+          }
+
+          // Apply severity filter if specified
+          if (!Severity.IsEmpty()) {
+            FString LowerSeverity = Severity.ToLower();
+            bool bMatchesSeverity = false;
+
+            if (LowerSeverity == TEXT("error")) {
+              bMatchesSeverity = Line.Contains(TEXT("Error:")) || Line.Contains(TEXT("Error]"));
+            } else if (LowerSeverity == TEXT("warning")) {
+              bMatchesSeverity = Line.Contains(TEXT("Warning:")) || Line.Contains(TEXT("Warning]"));
+            } else if (LowerSeverity == TEXT("log")) {
+              bMatchesSeverity = Line.Contains(TEXT("Log")) || Line.Contains(TEXT("Display"));
+            } else if (LowerSeverity == TEXT("display")) {
+              bMatchesSeverity = Line.Contains(TEXT("Display"));
+            } else if (LowerSeverity == TEXT("verbose")) {
+              bMatchesSeverity = Line.Contains(TEXT("Verbose"));
+            }
+
+            if (!bMatchesSeverity) {
+              continue;
+            }
+          }
+
+          TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+          Entry->SetStringField(TEXT("message"), Line);
+
+          // Try to extract timestamp and category from typical UE log format
+          // Format: [2024.01.15-10.30.45:123][  0]LogCategory: Message
+          int32 BracketEnd = Line.Find(TEXT("]"), ESearchCase::IgnoreCase, ESearchDir::FromStart, 1);
+          if (BracketEnd > 0 && Line.StartsWith(TEXT("["))) {
+            FString Timestamp = Line.Mid(1, BracketEnd - 1);
+            Entry->SetStringField(TEXT("timestamp"), Timestamp);
+
+            // Find the category after the second bracket set
+            int32 SecondBracketEnd = Line.Find(TEXT("]"), ESearchCase::IgnoreCase, ESearchDir::FromStart, BracketEnd + 1);
+            if (SecondBracketEnd > BracketEnd) {
+              int32 ColonPos = Line.Find(TEXT(":"), ESearchCase::IgnoreCase, ESearchDir::FromStart, SecondBracketEnd);
+              if (ColonPos > SecondBracketEnd) {
+                FString Category = Line.Mid(SecondBracketEnd + 1, ColonPos - SecondBracketEnd - 1).TrimStartAndEnd();
+                if (!Category.IsEmpty()) {
+                  Entry->SetStringField(TEXT("category"), Category);
+                }
+              }
+            }
+          }
+
+          LogEntries.Add(MakeShareable(new FJsonValueObject(Entry)));
+        }
+
+        ResultObj->SetArrayField(TEXT("entries"), LogEntries);
+        ResultObj->SetNumberField(TEXT("count"), LogEntries.Num());
+        ResultObj->SetNumberField(TEXT("totalLines"), LogLines.Num());
+        ResultObj->SetStringField(TEXT("logFile"), LogFilePath);
+
+        SendAutomationResponse(
+            RequestingSocket, RequestId, true,
+            FString::Printf(TEXT("Retrieved %d log entries"), LogEntries.Num()),
+            ResultObj, FString());
+        return true;
+      } else {
+        SendAutomationResponse(RequestingSocket, RequestId, false,
+                               TEXT("Failed to read log file"), nullptr,
+                               TEXT("FILE_READ_ERROR"));
+        return true;
+      }
+    } else {
+      ResultObj->SetArrayField(TEXT("entries"), LogEntries);
+      ResultObj->SetNumberField(TEXT("count"), 0);
+      ResultObj->SetStringField(TEXT("message"), TEXT("No log file found"));
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("No log file found"), ResultObj, FString());
+      return true;
+    }
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("get_log requires editor build"), nullptr,
+                           TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // ============================================================================
+  // PIE Diagnostics - Runtime state queries during Play-In-Editor
+  // ============================================================================
+
+  // Get player state (position, rotation, velocity, movement info)
+  if (LowerSub == TEXT("get_player_state")) {
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+
+    // Check if PIE is active
+    UWorld *World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World || !World->IsPlayInEditor()) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("PIE not active"), nullptr,
+                             TEXT("PIE_NOT_ACTIVE"));
+      return true;
+    }
+
+    // Get the player controller
+    APlayerController *PC = World->GetFirstPlayerController();
+    if (!PC) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("No player controller"), nullptr,
+                             TEXT("NO_PLAYER"));
+      return true;
+    }
+
+    APawn *Pawn = PC->GetPawn();
+    if (Pawn) {
+      // Position
+      FVector Loc = Pawn->GetActorLocation();
+      TSharedPtr<FJsonObject> Position = MakeShared<FJsonObject>();
+      Position->SetNumberField(TEXT("x"), Loc.X);
+      Position->SetNumberField(TEXT("y"), Loc.Y);
+      Position->SetNumberField(TEXT("z"), Loc.Z);
+      ResultObj->SetObjectField(TEXT("position"), Position);
+
+      // Rotation
+      FRotator Rot = Pawn->GetActorRotation();
+      TSharedPtr<FJsonObject> Rotation = MakeShared<FJsonObject>();
+      Rotation->SetNumberField(TEXT("pitch"), Rot.Pitch);
+      Rotation->SetNumberField(TEXT("yaw"), Rot.Yaw);
+      Rotation->SetNumberField(TEXT("roll"), Rot.Roll);
+      ResultObj->SetObjectField(TEXT("rotation"), Rotation);
+
+      // Velocity
+      FVector Vel = Pawn->GetVelocity();
+      TSharedPtr<FJsonObject> Velocity = MakeShared<FJsonObject>();
+      Velocity->SetNumberField(TEXT("x"), Vel.X);
+      Velocity->SetNumberField(TEXT("y"), Vel.Y);
+      Velocity->SetNumberField(TEXT("z"), Vel.Z);
+      ResultObj->SetObjectField(TEXT("velocity"), Velocity);
+
+      // Character-specific info (movement component)
+      if (ACharacter *Character = Cast<ACharacter>(Pawn)) {
+        UCharacterMovementComponent *Movement =
+            Character->GetCharacterMovement();
+        if (Movement) {
+          ResultObj->SetBoolField(TEXT("isMovingOnGround"),
+                                  Movement->IsMovingOnGround());
+          ResultObj->SetBoolField(TEXT("isFalling"), Movement->IsFalling());
+          ResultObj->SetNumberField(TEXT("maxWalkSpeed"), Movement->MaxWalkSpeed);
+          ResultObj->SetBoolField(TEXT("isSwimming"), Movement->IsSwimming());
+          ResultObj->SetBoolField(TEXT("isFlying"), Movement->IsFlying());
+          ResultObj->SetBoolField(TEXT("isCrouching"),
+                                  Movement->IsCrouching());
+        }
+      }
+
+      // Pawn class info
+      ResultObj->SetStringField(TEXT("pawnClass"), Pawn->GetClass()->GetName());
+      ResultObj->SetStringField(TEXT("pawnPath"), Pawn->GetPathName());
+
+      // Try to get custom components (game-specific state)
+      TArray<TSharedPtr<FJsonValue>> ComponentsArray;
+      for (UActorComponent *Comp : Pawn->GetComponents()) {
+        if (!Comp)
+          continue;
+        TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
+        CompObj->SetStringField(TEXT("name"), Comp->GetName());
+        CompObj->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+        ComponentsArray.Add(MakeShared<FJsonValueObject>(CompObj));
+      }
+      ResultObj->SetArrayField(TEXT("components"), ComponentsArray);
+    } else {
+      ResultObj->SetBoolField(TEXT("hasPawn"), false);
+    }
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("Player state retrieved"), ResultObj, FString());
+    return true;
+  }
+
+  // Get PIE status (playing, paused, time info)
+  if (LowerSub == TEXT("get_pie_status")) {
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+
+    bool bIsPlaying = GEditor ? GEditor->IsPlayingSessionInEditor() : false;
+    bool bIsPaused = GEditor ? GEditor->IsPlaySessionPaused() : false;
+
+    ResultObj->SetBoolField(TEXT("isPlaying"), bIsPlaying);
+    ResultObj->SetBoolField(TEXT("isPaused"), bIsPaused);
+
+    if (bIsPlaying) {
+      UWorld *World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+      if (World && World->IsPlayInEditor()) {
+        ResultObj->SetNumberField(TEXT("timeSeconds"), World->GetTimeSeconds());
+        ResultObj->SetNumberField(TEXT("deltaSeconds"), World->GetDeltaSeconds());
+        ResultObj->SetNumberField(TEXT("realTimeSeconds"),
+                                  World->GetRealTimeSeconds());
+
+        // Additional world info
+        ResultObj->SetStringField(TEXT("worldName"), World->GetName());
+        ResultObj->SetNumberField(TEXT("playerCount"),
+                                  World->GetNumPlayerControllers());
+      }
+    }
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("PIE status"), ResultObj, FString());
+    return true;
+  }
+
+  // Inspect actor at runtime - retrieve actor properties and component info during PIE
+  if (LowerSub == TEXT("inspect_actor")) {
+#if WITH_EDITOR
+    FString ActorName;
+    bool bIncludeComponents = true;
+
+    if (!Payload->TryGetStringField(TEXT("actorName"), ActorName) || ActorName.IsEmpty()) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("inspect_actor requires actorName parameter"),
+                             nullptr, TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+    Payload->TryGetBoolField(TEXT("includeComponents"), bIncludeComponents);
+
+    // Get the appropriate world - prefer PIE world if active
+    UWorld* World = nullptr;
+    if (GEditor && GEditor->IsPlayingSessionInEditor()) {
+      World = GEditor->PlayWorld;
+    }
+    if (!World && GEditor) {
+      World = GEditor->GetEditorWorldContext().World();
+    }
+
+    if (!World) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("No world available"),
+                             nullptr, TEXT("NO_WORLD"));
+      return true;
+    }
+
+    // Find actor by name or label
+    AActor* FoundActor = nullptr;
+    for (TActorIterator<AActor> It(World); It; ++It) {
+      if (It->GetName() == ActorName || It->GetActorLabel() == ActorName) {
+        FoundActor = *It;
+        break;
+      }
+    }
+
+    if (!FoundActor) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             FString::Printf(TEXT("Actor not found: %s"), *ActorName),
+                             nullptr, TEXT("ACTOR_NOT_FOUND"));
+      return true;
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+
+    ResultObj->SetStringField(TEXT("name"), FoundActor->GetName());
+    ResultObj->SetStringField(TEXT("class"), FoundActor->GetClass()->GetName());
+    ResultObj->SetStringField(TEXT("label"), FoundActor->GetActorLabel());
+
+    // Transform
+    FVector Loc = FoundActor->GetActorLocation();
+    FRotator Rot = FoundActor->GetActorRotation();
+    FVector Scale = FoundActor->GetActorScale3D();
+
+    TSharedPtr<FJsonObject> Transform = MakeShared<FJsonObject>();
+    Transform->SetNumberField(TEXT("x"), Loc.X);
+    Transform->SetNumberField(TEXT("y"), Loc.Y);
+    Transform->SetNumberField(TEXT("z"), Loc.Z);
+    Transform->SetNumberField(TEXT("pitch"), Rot.Pitch);
+    Transform->SetNumberField(TEXT("yaw"), Rot.Yaw);
+    Transform->SetNumberField(TEXT("roll"), Rot.Roll);
+    Transform->SetNumberField(TEXT("scaleX"), Scale.X);
+    Transform->SetNumberField(TEXT("scaleY"), Scale.Y);
+    Transform->SetNumberField(TEXT("scaleZ"), Scale.Z);
+    ResultObj->SetObjectField(TEXT("transform"), Transform);
+
+    // Components
+    if (bIncludeComponents) {
+      TArray<TSharedPtr<FJsonValue>> Components;
+      for (UActorComponent* Comp : FoundActor->GetComponents()) {
+        if (!Comp) continue;
+
+        TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
+        CompObj->SetStringField(TEXT("name"), Comp->GetName());
+        CompObj->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+        CompObj->SetBoolField(TEXT("isActive"), Comp->IsActive());
+
+        // Get key properties using reflection
+        UClass* CompClass = Comp->GetClass();
+        TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+
+        for (TFieldIterator<FProperty> PropIt(CompClass); PropIt; ++PropIt) {
+          FProperty* Prop = *PropIt;
+          if (Prop->HasAnyPropertyFlags(CPF_BlueprintVisible)) {
+            FString PropName = Prop->GetName();
+
+            // Handle common property types
+            if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop)) {
+              bool Value = BoolProp->GetPropertyValue_InContainer(Comp);
+              Properties->SetBoolField(PropName, Value);
+            } else if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop)) {
+              float Value = FloatProp->GetPropertyValue_InContainer(Comp);
+              Properties->SetNumberField(PropName, Value);
+            } else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop)) {
+              double Value = DoubleProp->GetPropertyValue_InContainer(Comp);
+              Properties->SetNumberField(PropName, Value);
+            } else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop)) {
+              int32 Value = IntProp->GetPropertyValue_InContainer(Comp);
+              Properties->SetNumberField(PropName, Value);
+            } else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop)) {
+              FString Value = StrProp->GetPropertyValue_InContainer(Comp);
+              Properties->SetStringField(PropName, Value);
+            }
+          }
+        }
+
+        CompObj->SetObjectField(TEXT("properties"), Properties);
+        Components.Add(MakeShareable(new FJsonValueObject(CompObj)));
+      }
+      ResultObj->SetArrayField(TEXT("components"), Components);
+    }
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           FString::Printf(TEXT("Actor inspected: %s"), *ActorName),
+                           ResultObj, FString());
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("inspect_actor requires editor build"),
+                           nullptr, TEXT("NOT_IMPLEMENTED"));
+    return true;
+#endif
+  }
+
+  // Get component state - retrieve detailed state of a specific component during runtime
+  if (LowerSub == TEXT("get_component_state")) {
+#if WITH_EDITOR
+    FString ActorName;
+    FString ComponentName;
+
+    if (!Payload->TryGetStringField(TEXT("actorName"), ActorName) || ActorName.IsEmpty()) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("get_component_state requires actorName parameter"),
+                             nullptr, TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+    if (!Payload->TryGetStringField(TEXT("componentName"), ComponentName) || ComponentName.IsEmpty()) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("get_component_state requires componentName parameter"),
+                             nullptr, TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    // Get the appropriate world - prefer PIE world if active
+    UWorld* World = nullptr;
+    if (GEditor && GEditor->IsPlayingSessionInEditor()) {
+      World = GEditor->PlayWorld;
+    }
+    if (!World && GEditor) {
+      World = GEditor->GetEditorWorldContext().World();
+    }
+
+    if (!World) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("No world available"),
+                             nullptr, TEXT("NO_WORLD"));
+      return true;
+    }
+
+    // Find actor by name or label
+    AActor* FoundActor = nullptr;
+    for (TActorIterator<AActor> It(World); It; ++It) {
+      if (It->GetName() == ActorName || It->GetActorLabel() == ActorName) {
+        FoundActor = *It;
+        break;
+      }
+    }
+
+    if (!FoundActor) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             FString::Printf(TEXT("Actor not found: %s"), *ActorName),
+                             nullptr, TEXT("ACTOR_NOT_FOUND"));
+      return true;
+    }
+
+    // Find component by name (fuzzy matching)
+    UActorComponent* TargetComponent = nullptr;
+    for (UActorComponent* Comp : FoundActor->GetComponents()) {
+      if (!Comp) continue;
+      if (Comp->GetName().Equals(ComponentName, ESearchCase::IgnoreCase) ||
+          Comp->GetReadableName().Equals(ComponentName, ESearchCase::IgnoreCase) ||
+          Comp->GetName().Contains(ComponentName, ESearchCase::IgnoreCase)) {
+        TargetComponent = Comp;
+        break;
+      }
+    }
+
+    if (!TargetComponent) {
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             FString::Printf(TEXT("Component '%s' not found on actor '%s'"),
+                                             *ComponentName, *ActorName),
+                             nullptr, TEXT("COMPONENT_NOT_FOUND"));
+      return true;
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("name"), TargetComponent->GetName());
+    ResultObj->SetStringField(TEXT("class"), TargetComponent->GetClass()->GetName());
+    ResultObj->SetBoolField(TEXT("isActive"), TargetComponent->IsActive());
+    ResultObj->SetStringField(TEXT("actorName"), FoundActor->GetActorLabel());
+
+    // Get all BlueprintVisible properties using reflection
+    UClass* CompClass = TargetComponent->GetClass();
+    TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+
+    for (TFieldIterator<FProperty> PropIt(CompClass); PropIt; ++PropIt) {
+      FProperty* Prop = *PropIt;
+      if (Prop->HasAnyPropertyFlags(CPF_BlueprintVisible)) {
+        FString PropName = Prop->GetName();
+
+        // Handle common property types
+        if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop)) {
+          bool Value = BoolProp->GetPropertyValue_InContainer(TargetComponent);
+          Properties->SetBoolField(PropName, Value);
+        } else if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop)) {
+          float Value = FloatProp->GetPropertyValue_InContainer(TargetComponent);
+          Properties->SetNumberField(PropName, Value);
+        } else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop)) {
+          double Value = DoubleProp->GetPropertyValue_InContainer(TargetComponent);
+          Properties->SetNumberField(PropName, Value);
+        } else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop)) {
+          int32 Value = IntProp->GetPropertyValue_InContainer(TargetComponent);
+          Properties->SetNumberField(PropName, Value);
+        } else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop)) {
+          FString Value = StrProp->GetPropertyValue_InContainer(TargetComponent);
+          Properties->SetStringField(PropName, Value);
+        } else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop)) {
+          FName Value = NameProp->GetPropertyValue_InContainer(TargetComponent);
+          Properties->SetStringField(PropName, Value.ToString());
+        } else if (FStructProperty* StructProp = CastField<FStructProperty>(Prop)) {
+          // Export struct as string for common types
+          FString ValueText;
+          const void* ValuePtr = StructProp->ContainerPtrToValuePtr<void>(TargetComponent);
+          Prop->ExportTextItem_Direct(ValueText, ValuePtr, nullptr, TargetComponent, PPF_None);
+          Properties->SetStringField(PropName, ValueText);
+        }
+      }
+    }
+
+    ResultObj->SetObjectField(TEXT("properties"), Properties);
+
+    // Add scene component specific info if applicable
+    if (USceneComponent* SceneComp = Cast<USceneComponent>(TargetComponent)) {
+      TSharedPtr<FJsonObject> TransformObj = MakeShared<FJsonObject>();
+
+      FVector RelLoc = SceneComp->GetRelativeLocation();
+      FRotator RelRot = SceneComp->GetRelativeRotation();
+      FVector RelScale = SceneComp->GetRelativeScale3D();
+
+      TransformObj->SetNumberField(TEXT("x"), RelLoc.X);
+      TransformObj->SetNumberField(TEXT("y"), RelLoc.Y);
+      TransformObj->SetNumberField(TEXT("z"), RelLoc.Z);
+      TransformObj->SetNumberField(TEXT("pitch"), RelRot.Pitch);
+      TransformObj->SetNumberField(TEXT("yaw"), RelRot.Yaw);
+      TransformObj->SetNumberField(TEXT("roll"), RelRot.Roll);
+      TransformObj->SetNumberField(TEXT("scaleX"), RelScale.X);
+      TransformObj->SetNumberField(TEXT("scaleY"), RelScale.Y);
+      TransformObj->SetNumberField(TEXT("scaleZ"), RelScale.Z);
+
+      ResultObj->SetObjectField(TEXT("relativeTransform"), TransformObj);
+
+      // World transform
+      TSharedPtr<FJsonObject> WorldTransformObj = MakeShared<FJsonObject>();
+      FVector WorldLoc = SceneComp->GetComponentLocation();
+      FRotator WorldRot = SceneComp->GetComponentRotation();
+      FVector WorldScale = SceneComp->GetComponentScale();
+
+      WorldTransformObj->SetNumberField(TEXT("x"), WorldLoc.X);
+      WorldTransformObj->SetNumberField(TEXT("y"), WorldLoc.Y);
+      WorldTransformObj->SetNumberField(TEXT("z"), WorldLoc.Z);
+      WorldTransformObj->SetNumberField(TEXT("pitch"), WorldRot.Pitch);
+      WorldTransformObj->SetNumberField(TEXT("yaw"), WorldRot.Yaw);
+      WorldTransformObj->SetNumberField(TEXT("roll"), WorldRot.Roll);
+      WorldTransformObj->SetNumberField(TEXT("scaleX"), WorldScale.X);
+      WorldTransformObj->SetNumberField(TEXT("scaleY"), WorldScale.Y);
+      WorldTransformObj->SetNumberField(TEXT("scaleZ"), WorldScale.Z);
+
+      ResultObj->SetObjectField(TEXT("worldTransform"), WorldTransformObj);
+      ResultObj->SetBoolField(TEXT("isSceneComponent"), true);
+    }
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           FString::Printf(TEXT("Component state retrieved: %s.%s"),
+                                           *ActorName, *ComponentName),
+                           ResultObj, FString());
+    return true;
+#else
+    SendAutomationResponse(RequestingSocket, RequestId, false,
+                           TEXT("get_component_state requires editor build"),
                            nullptr, TEXT("NOT_IMPLEMENTED"));
     return true;
 #endif

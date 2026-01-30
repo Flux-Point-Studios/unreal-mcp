@@ -823,6 +823,14 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                     return HandlePerformanceAction(R, A, P, S);
                   });
 
+  // Python execution - allows MCP to run Python scripts in Unreal Editor
+  RegisterHandler(TEXT("execute_python"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleExecutePythonAction(R, A, P, S);
+                  });
+
   // Phase 21: Game Framework
   RegisterHandler(TEXT("manage_game_framework"),
                   [this](const FString &R, const FString &A,

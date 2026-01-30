@@ -102,14 +102,33 @@ export class AssetTools extends BaseTool implements IAssetTools {
     }, 'asset_query', { timeoutMs: DEFAULT_ASSET_OP_TIMEOUT_MS });
   }
 
-  async deleteAssets(params: { paths: string[]; fixupRedirectors?: boolean; timeoutMs?: number }): Promise<StandardActionResponse> {
+  async deleteAssets(params: {
+    paths: string[];
+    fixupRedirectors?: boolean;
+    force?: boolean;  // Skip reference check
+    timeoutMs?: number;
+  }): Promise<StandardActionResponse> {
+    // Filter empty paths AFTER normalization
     const assetPaths = (Array.isArray(params.paths) ? params.paths : [])
-      .map(p => this.normalizeAssetPath(p));
+      .map(p => this.normalizeAssetPath(p))
+      .filter(p => p && p.trim().length > 0);
+
+    if (assetPaths.length === 0) {
+      return {
+        success: false,
+        error: 'No valid asset paths after normalization',
+        errorCode: 'INVALID_ARGUMENT',
+        originalPaths: params.paths
+      };
+    }
 
     return this.sendRequest<AssetResponse>('manage_asset', {
       assetPaths,
-      fixupRedirectors: params.fixupRedirectors,
-      subAction: 'delete'
+      paths: assetPaths,  // Send BOTH for C++ compat
+      fixupRedirectors: params.fixupRedirectors ?? true,  // Default ON
+      force: params.force,
+      subAction: 'delete',
+      action: 'delete',  // Send BOTH for C++ compat
     }, 'manage_asset', { timeoutMs: params.timeoutMs || EXTENDED_ASSET_OP_TIMEOUT_MS });
   }
 

@@ -671,6 +671,12 @@ private:
       const TSharedPtr<FJsonObject> &Payload,
       TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
 
+  // Python execution handler - allows MCP to run Python scripts in Unreal Editor
+  bool HandleExecutePythonAction(
+      const FString &RequestId, const FString &Action,
+      const TSharedPtr<FJsonObject> &Payload,
+      TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
+
   // 2. Execution & Build / Test Pipeline
   bool HandlePipelineAction(const FString &RequestId, const FString &Action,
                             const TSharedPtr<FJsonObject> &Payload,

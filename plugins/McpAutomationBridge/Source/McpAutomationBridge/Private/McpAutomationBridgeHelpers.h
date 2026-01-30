@@ -1316,9 +1316,178 @@ ApplyJsonValueToProperty(void *TargetContainer, FProperty *Property,
         continue;
       }
 
-      // Unsupported inner type -> fail explicitly
-      OutError =
-          TEXT("Unsupported array inner property type for JSON assignment");
+      // Struct inner type - use FJsonObjectConverter for complex struct arrays
+      if (FStructProperty *StructInner = CastField<FStructProperty>(Inner)) {
+        if (V->Type == EJson::Object) {
+          TSharedPtr<FJsonObject> StructObj = V->AsObject();
+          if (StructObj.IsValid() && StructInner->Struct) {
+            if (FJsonObjectConverter::JsonObjectToUStruct(
+                    StructObj.ToSharedRef(), StructInner->Struct, ElemPtr, 0, 0)) {
+              continue;
+            }
+            OutError = FString::Printf(
+                TEXT("Failed to convert JSON object to struct '%s' at array index %d"),
+                *StructInner->Struct->GetName(), i);
+            return false;
+          }
+        } else if (V->Type == EJson::String) {
+          // Try parsing JSON string
+          const FString JsonStr = V->AsString();
+          TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonStr);
+          TSharedPtr<FJsonObject> ParsedObj;
+          if (FJsonSerializer::Deserialize(Reader, ParsedObj) && ParsedObj.IsValid()) {
+            if (FJsonObjectConverter::JsonObjectToUStruct(
+                    ParsedObj.ToSharedRef(), StructInner->Struct, ElemPtr, 0, 0)) {
+              continue;
+            }
+          }
+          OutError = FString::Printf(
+              TEXT("Failed to parse JSON string to struct '%s' at array index %d"),
+              *StructInner->Struct->GetName(), i);
+          return false;
+        }
+        OutError = FString::Printf(
+            TEXT("Expected JSON object or string for struct array element at index %d"), i);
+        return false;
+      }
+
+      // Object reference inner type (UObject*)
+      if (FObjectProperty *ObjInner = CastField<FObjectProperty>(Inner)) {
+        if (V->Type == EJson::String) {
+          const FString Path = V->AsString();
+          UObject *Res = nullptr;
+          if (!Path.IsEmpty()) {
+            Res = LoadObject<UObject>(nullptr, *Path);
+            if (!Res) {
+              Res = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
+            }
+          }
+          if (!Res && !Path.IsEmpty()) {
+            OutError = FString::Printf(
+                TEXT("Failed to load object at path '%s' for array index %d"), *Path, i);
+            return false;
+          }
+          ObjInner->SetObjectPropertyValue(ElemPtr, Res);
+          continue;
+        } else if (V->Type == EJson::Null) {
+          ObjInner->SetObjectPropertyValue(ElemPtr, nullptr);
+          continue;
+        }
+        OutError = FString::Printf(
+            TEXT("Expected string path or null for object reference at array index %d"), i);
+        return false;
+      }
+
+      // Class reference inner type (TSubclassOf<>, UClass*)
+      if (FClassProperty *ClassInner = CastField<FClassProperty>(Inner)) {
+        if (V->Type == EJson::String) {
+          const FString Path = V->AsString();
+          UClass *LoadedClass = nullptr;
+          if (!Path.IsEmpty()) {
+            // Try loading as a class directly
+            LoadedClass = LoadClass<UObject>(nullptr, *Path);
+            if (!LoadedClass) {
+              // Try StaticLoadClass for Blueprint classes
+              LoadedClass = StaticLoadClass(UObject::StaticClass(), nullptr, *Path);
+            }
+          }
+          if (!LoadedClass && !Path.IsEmpty()) {
+            OutError = FString::Printf(
+                TEXT("Failed to load class at path '%s' for array index %d"), *Path, i);
+            return false;
+          }
+          ClassInner->SetObjectPropertyValue(ElemPtr, LoadedClass);
+          continue;
+        } else if (V->Type == EJson::Null) {
+          ClassInner->SetObjectPropertyValue(ElemPtr, nullptr);
+          continue;
+        }
+        OutError = FString::Printf(
+            TEXT("Expected string path or null for class reference at array index %d"), i);
+        return false;
+      }
+
+      // Soft object reference inner type
+      if (FSoftObjectProperty *SoftObjInner = CastField<FSoftObjectProperty>(Inner)) {
+        FSoftObjectPtr *SoftPtr = reinterpret_cast<FSoftObjectPtr *>(ElemPtr);
+        if (V->Type == EJson::String) {
+          const FString Path = V->AsString();
+          if (Path.IsEmpty()) {
+            *SoftPtr = FSoftObjectPtr();
+          } else {
+            *SoftPtr = FSoftObjectPath(Path);
+          }
+          continue;
+        } else if (V->Type == EJson::Null) {
+          *SoftPtr = FSoftObjectPtr();
+          continue;
+        }
+        OutError = FString::Printf(
+            TEXT("Expected string path or null for soft object at array index %d"), i);
+        return false;
+      }
+
+      // Soft class reference inner type
+      if (FSoftClassProperty *SoftClassInner = CastField<FSoftClassProperty>(Inner)) {
+        FSoftObjectPtr *SoftPtr = reinterpret_cast<FSoftObjectPtr *>(ElemPtr);
+        if (V->Type == EJson::String) {
+          const FString Path = V->AsString();
+          if (Path.IsEmpty()) {
+            *SoftPtr = FSoftObjectPtr();
+          } else {
+            *SoftPtr = FSoftObjectPath(Path);
+          }
+          continue;
+        } else if (V->Type == EJson::Null) {
+          *SoftPtr = FSoftObjectPtr();
+          continue;
+        }
+        OutError = FString::Printf(
+            TEXT("Expected string path or null for soft class at array index %d"), i);
+        return false;
+      }
+
+      // Enum inner type
+      if (FEnumProperty *EnumInner = CastField<FEnumProperty>(Inner)) {
+        if (UEnum *Enum = EnumInner->GetEnum()) {
+          if (FNumericProperty *UnderlyingProp = EnumInner->GetUnderlyingProperty()) {
+            if (V->Type == EJson::String) {
+              const FString InStr = V->AsString();
+              int64 EnumVal = Enum->GetValueByNameString(InStr);
+              if (EnumVal == INDEX_NONE) {
+                const FString FullName = Enum->GenerateFullEnumName(*InStr);
+                EnumVal = Enum->GetValueByName(FName(*FullName));
+              }
+              if (EnumVal == INDEX_NONE) {
+                OutError = FString::Printf(
+                    TEXT("Invalid enum value '%s' for enum '%s' at array index %d"),
+                    *InStr, *Enum->GetName(), i);
+                return false;
+              }
+              UnderlyingProp->SetIntPropertyValue(ElemPtr, EnumVal);
+              continue;
+            } else if (V->Type == EJson::Number) {
+              const int64 Val = static_cast<int64>(V->AsNumber());
+              if (!Enum->IsValidEnumValue(Val)) {
+                OutError = FString::Printf(
+                    TEXT("Numeric value %lld is not valid for enum '%s' at array index %d"),
+                    Val, *Enum->GetName(), i);
+                return false;
+              }
+              UnderlyingProp->SetIntPropertyValue(ElemPtr, Val);
+              continue;
+            }
+          }
+        }
+        OutError = FString::Printf(
+            TEXT("Expected string or number for enum at array index %d"), i);
+        return false;
+      }
+
+      // Unsupported inner type -> fail explicitly with more detail
+      OutError = FString::Printf(
+          TEXT("Unsupported array inner property type '%s' for JSON assignment"),
+          Inner ? *Inner->GetClass()->GetName() : TEXT("null"));
       return false;
     }
     return true;

@@ -764,7 +764,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'system_control',
     category: 'core',
-    description: 'Run profiling, set quality/CVars, execute console commands, run UBT, and manage widgets.',
+    description: 'Run profiling, set quality/CVars, execute console commands, run UBT, cook content, package projects, hot reload/live coding for C++ changes, launch editor in various modes, and manage widgets.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -775,10 +775,19 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'run_ubt', 'run_tests', 'subscribe', 'unsubscribe', 'spawn_category', 'start_session', 'lumen_update_scene',
             'play_sound', 'create_widget', 'show_widget', 'add_widget_child',
             'set_cvar', 'get_project_settings', 'validate_assets',
-            'set_project_setting'
+            'set_project_setting', 'execute_python', 'run_python', 'compile_project',
+            'cook_content', 'package_project',
+            'hot_reload', 'live_coding',
+            'launch_editor', 'launch_headless', 'get_editor_status',
+            'get_log', 'read_log',
+            'get_player_state', 'get_pie_status', 'inspect_actor', 'get_component_state'
           ],
           description: 'Action'
         },
+        // Runtime inspection parameters (for inspect_actor, get_component_state actions)
+        actorName: { type: 'string', description: 'Name or label of the actor to inspect (for inspect_actor, get_component_state)' },
+        componentName: { type: 'string', description: 'Name of the component to get state for (for get_component_state)' },
+        includeComponents: { type: 'boolean', description: 'Include component details in actor inspection (default: true, for inspect_actor)' },
         profileType: commonSchemas.stringProp,
         category: commonSchemas.stringProp,
         level: commonSchemas.numberProp,
@@ -797,7 +806,34 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         section: commonSchemas.stringProp,
         key: commonSchemas.stringProp,
         value: commonSchemas.stringProp,
-        configName: commonSchemas.stringProp
+        configName: commonSchemas.stringProp,
+        // Python script execution parameters
+        scriptPath: { type: 'string', description: 'Path to Python script file to execute (optional if scriptContent provided)' },
+        scriptContent: { type: 'string', description: 'Inline Python code to execute (optional if scriptPath provided)' },
+        scriptArgs: { type: 'array', items: { type: 'string' }, description: 'Arguments to pass to the Python script' },
+        // Compile project parameters
+        clean: { type: 'boolean', description: 'Perform a clean build (delete intermediate files before compiling)' },
+        // Cook content parameters
+        maps: { type: 'array', items: { type: 'string' }, description: 'Specific maps to cook (empty = all maps)' },
+        iterative: { type: 'boolean', description: 'Use iterative cooking (faster for incremental changes, default: true)' },
+        // Package project parameters
+        outputDir: { type: 'string', description: 'Output directory for packaged project' },
+        compress: { type: 'boolean', description: 'Compress packaged files (default: true)' },
+        // Hot reload / Live coding parameters
+        waitForCompletion: { type: 'boolean', description: 'Wait for hot reload to complete (default: true)' },
+        modules: { type: 'array', items: { type: 'string' }, description: 'Specific modules to reload (empty = all changed modules)' },
+        // Editor launch parameters (for launch_editor, launch_headless actions)
+        projectPath: { type: 'string', description: 'Path to the .uproject file (required for launch actions)' },
+        mode: { type: 'string', enum: ['editor', 'headless', 'game', 'server', 'commandlet'], description: 'Launch mode (default: editor for launch_editor, headless for launch_headless)' },
+        additionalArgs: { type: 'string', description: 'Additional command-line arguments to pass to the editor' },
+        editorPath: { type: 'string', description: 'Custom path to the Unreal Editor executable (auto-detected if not provided)' },
+        commandletName: { type: 'string', description: 'Name of the commandlet to run (required when mode is "commandlet")' },
+        commandletArgs: { type: 'string', description: 'Arguments to pass to the commandlet' },
+        waitForReady: { type: 'boolean', description: 'Wait for MCP connection to be established (default: true)' },
+        timeoutMs: { type: 'number', description: 'Timeout in milliseconds to wait for editor ready (default: 60000)' },
+        // Log reading parameters (for get_log, read_log actions)
+        lines: { type: 'number', description: 'Number of recent log lines to retrieve (default: 100)' },
+        severity: { type: 'string', enum: ['Error', 'Warning', 'Log', 'Display', 'Verbose'], description: 'Filter log entries by severity level' }
       },
       required: ['action']
     },
@@ -805,7 +841,33 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         ...commonSchemas.outputBase,
-        output: commonSchemas.stringProp
+        output: commonSchemas.stringProp,
+        pythonOutput: commonSchemas.stringProp,
+        returnValue: commonSchemas.stringProp,
+        pid: { type: 'number', description: 'Process ID of launched editor' },
+        connectionEstablished: { type: 'boolean', description: 'Whether MCP connection was established' },
+        entries: { type: 'array', items: { type: 'object' }, description: 'Array of log entries (for get_log action)' },
+        count: { type: 'number', description: 'Number of log entries returned' },
+        // PIE diagnostics output fields
+        isPlaying: { type: 'boolean', description: 'Whether PIE session is currently active (for get_pie_status)' },
+        isPaused: { type: 'boolean', description: 'Whether PIE session is paused (for get_pie_status)' },
+        timeSeconds: { type: 'number', description: 'Current game time in seconds (for get_pie_status)' },
+        deltaSeconds: { type: 'number', description: 'Last frame delta time (for get_pie_status)' },
+        position: { type: 'object', description: 'Player position {x, y, z} (for get_player_state)' },
+        rotation: { type: 'object', description: 'Player rotation {pitch, yaw, roll} (for get_player_state)' },
+        velocity: { type: 'object', description: 'Player velocity {x, y, z} (for get_player_state)' },
+        isMovingOnGround: { type: 'boolean', description: 'Whether player is on ground (for get_player_state)' },
+        isFalling: { type: 'boolean', description: 'Whether player is falling (for get_player_state)' },
+        maxWalkSpeed: { type: 'number', description: 'Character max walk speed (for get_player_state)' },
+        pawnClass: { type: 'string', description: 'Class name of player pawn (for get_player_state)' },
+        // Runtime inspection output fields (for inspect_actor, get_component_state)
+        name: { type: 'string', description: 'Actor or component name (for inspect_actor, get_component_state)' },
+        class: { type: 'string', description: 'Class name of the actor or component' },
+        label: { type: 'string', description: 'Actor label (for inspect_actor)' },
+        transform: { type: 'object', description: 'Actor transform with location, rotation, scale (for inspect_actor)' },
+        components: { type: 'array', items: { type: 'object' }, description: 'Array of component info (for inspect_actor with includeComponents=true)' },
+        properties: { type: 'object', description: 'Component properties (for get_component_state)' },
+        isActive: { type: 'boolean', description: 'Whether the component is active (for get_component_state)' }
       }
     }
   },
@@ -890,7 +952,24 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         path: commonSchemas.directoryPath,
         contextPath: commonSchemas.assetPath,
         actionPath: commonSchemas.assetPath,
-        key: commonSchemas.stringProp
+        key: commonSchemas.stringProp,
+        modifiers: {
+          type: 'array',
+          items: {
+            oneOf: [
+              { type: 'string', enum: ['Negate', 'Scalar', 'DeadZone', 'Swizzle'] },
+              {
+                type: 'object',
+                properties: {
+                  type: { type: 'string', enum: ['Negate', 'Scalar', 'DeadZone', 'Swizzle'] },
+                  value: { type: 'number' }
+                },
+                required: ['type']
+              }
+            ]
+          },
+          description: 'Input modifiers for add_mapping: "Negate" inverts value, "Scalar" multiplies, "DeadZone" filters small inputs'
+        }
       },
       required: ['action']
     },
@@ -898,7 +977,8 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: {
         ...commonSchemas.outputBase,
-        assetPath: commonSchemas.assetPath
+        assetPath: commonSchemas.assetPath,
+        modifierCount: { type: 'number' }
       }
     }
   },
@@ -4533,6 +4613,43 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         },
         scatteredMeshes: { type: 'number', description: 'Number of meshes scattered along spline.' },
         error: commonSchemas.stringProp
+      }
+    }
+  },
+  // Python Execution Tool
+  {
+    name: 'execute_python',
+    category: 'utility',
+    description: 'Execute Python scripts in Unreal Editor without manual intervention. Run script files or inline code using Unreal Python API.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['execute_script', 'execute_code', 'get_python_info'],
+          description: 'Action to perform: execute_script (run .py file), execute_code (run inline code), get_python_info (environment info)'
+        },
+        scriptPath: {
+          type: 'string',
+          description: 'Absolute or project-relative path to Python script file (for execute_script action)'
+        },
+        code: {
+          type: 'string',
+          description: 'Python code to execute inline (for execute_code action). Has access to unreal module.'
+        }
+      },
+      required: ['action']
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        success: commonSchemas.booleanProp,
+        message: commonSchemas.stringProp,
+        output: { type: 'string', description: 'Standard output from Python execution' },
+        error: commonSchemas.stringProp,
+        returnValue: { description: 'Return value from Python execution (if any)' },
+        pythonVersion: { type: 'string', description: 'Python version (for get_python_info)' },
+        unrealPythonVersion: { type: 'string', description: 'Unreal Python plugin version' }
       }
     }
   }

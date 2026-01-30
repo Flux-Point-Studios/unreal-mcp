@@ -622,12 +622,29 @@ export interface SystemArgs extends HandlerArgs {
 // Input Types
 // ============================================================================
 
+/** Input value type for Enhanced Input injection - can be boolean, 1D, 2D, or 3D axis */
+export type InputActionValue =
+    | boolean
+    | number
+    | { x: number; y: number }
+    | { x: number; y: number; z: number };
+
 export interface InputArgs extends HandlerArgs {
     name?: string;
     path?: string;
     actionPath?: string;
     contextPath?: string;
     key?: string;
+    /** Optional modifiers for the key mapping (e.g., ["Negate"] or [{"type": "Scalar", "value": 0.5}]) */
+    modifiers?: (string | { type: string; value?: number })[];
+    /** Path to the Input Action asset for injection (e.g., "/Game/Input/Actions/IA_Move") */
+    inputActionPath?: string;
+    /** Input value for injection - can be boolean (digital), number (1D), {x,y} (2D), or {x,y,z} (3D) */
+    value?: InputActionValue;
+    /** Array of Input Action paths to clear (for clear_injected_inputs action) */
+    inputActionPaths?: string[];
+    /** Optional trigger class names to apply during input injection */
+    triggers?: string[];
 }
 
 // ============================================================================
@@ -1333,12 +1350,31 @@ export interface VolumesArgs extends HandlerArgs {
     
     // Lightmass Importance Volume specific
     bLightmassReplacementPrimitive?: boolean;
-    
+
     // Query parameters
     filter?: string;
     volumeType?: string;
-    
+
     // Save option
     save?: boolean;
+}
+
+// ============================================================================
+// Python Execution Types
+// ============================================================================
+
+/**
+ * Arguments for execute_python tool
+ *
+ * Covers:
+ * - Script Execution: execute Python script files
+ * - Code Execution: execute inline Python code
+ * - Environment Info: get Python environment information
+ */
+export interface PythonArgs extends HandlerArgs {
+    /** Absolute or project-relative path to Python script file (for execute_script action) */
+    scriptPath?: string;
+    /** Inline Python code to execute (for execute_code action) */
+    code?: string;
 }
 

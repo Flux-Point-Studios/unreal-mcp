@@ -635,12 +635,17 @@ bool UMcpAutomationBridgeSubsystem::HandleBulkDeleteAssets(
   }
 
   const TArray<TSharedPtr<FJsonValue>> *AssetPathsArray = nullptr;
+  // Accept BOTH assetPaths and paths for compatibility with different callers
   if (!Payload->TryGetArrayField(TEXT("assetPaths"), AssetPathsArray) ||
       !AssetPathsArray || AssetPathsArray->Num() == 0) {
-    SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("assetPaths array required"),
-                        TEXT("INVALID_ARGUMENT"));
-    return true;
+    // Try alternative parameter name
+    if (!Payload->TryGetArrayField(TEXT("paths"), AssetPathsArray) ||
+        !AssetPathsArray || AssetPathsArray->Num() == 0) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("assetPaths or paths array required"),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
   }
 
   bool bShowConfirmation = false;
@@ -1360,8 +1365,10 @@ bool UMcpAutomationBridgeSubsystem::HandleMoveAsset(
  * Handles asset deletion requests.
  *
  * @param RequestId Unique request identifier.
- * @param Payload JSON payload containing 'path' (string) or 'paths' (array of
- * strings).
+ * @param Payload JSON payload containing:
+ *   - 'assetPath' or 'path' (string) for single asset
+ *   - 'assetPaths' or 'paths' (array of strings) for multiple assets
+ *   - 'fixupRedirectors' (bool, optional, default true) to fix up redirectors
  * @param Socket WebSocket connection.
  * @return True if handled.
  */
@@ -1369,19 +1376,31 @@ bool UMcpAutomationBridgeSubsystem::HandleDeleteAssets(
     const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket) {
 #if WITH_EDITOR
-  // Support both single 'path' and array 'paths'
+  // Support both naming conventions: assetPaths/assetPath AND paths/path
   TArray<FString> PathsToDelete;
   const TArray<TSharedPtr<FJsonValue>> *PathsArray = nullptr;
-  if (Payload->TryGetArrayField(TEXT("paths"), PathsArray) && PathsArray) {
+
+  // Try assetPaths first, then paths for array of assets
+  if (!Payload->TryGetArrayField(TEXT("assetPaths"), PathsArray) ||
+      !PathsArray) {
+    Payload->TryGetArrayField(TEXT("paths"), PathsArray);
+  }
+
+  if (PathsArray) {
     for (const auto &Val : *PathsArray) {
       if (Val.IsValid() && Val->Type == EJson::String)
         PathsToDelete.Add(Val->AsString());
     }
   }
 
+  // Try assetPath first, then path for single asset
   FString SinglePath;
-  if (Payload->TryGetStringField(TEXT("path"), SinglePath) &&
-      !SinglePath.IsEmpty()) {
+  if (!Payload->TryGetStringField(TEXT("assetPath"), SinglePath) ||
+      SinglePath.IsEmpty()) {
+    Payload->TryGetStringField(TEXT("path"), SinglePath);
+  }
+
+  if (!SinglePath.IsEmpty()) {
     PathsToDelete.Add(SinglePath);
   }
 
@@ -1391,20 +1410,61 @@ bool UMcpAutomationBridgeSubsystem::HandleDeleteAssets(
     return true;
   }
 
+  // Optional: fixup redirectors after deletion (default true)
+  bool bFixupRedirectors = true;
+  Payload->TryGetBoolField(TEXT("fixupRedirectors"), bFixupRedirectors);
+
   int32 DeletedCount = 0;
+  TArray<FString> DeletedPaths;
   for (const FString &Path : PathsToDelete) {
     if (UEditorAssetLibrary::DoesDirectoryExist(Path)) {
       if (UEditorAssetLibrary::DeleteDirectory(Path)) {
         DeletedCount++;
+        DeletedPaths.Add(Path);
       }
     } else if (UEditorAssetLibrary::DeleteAsset(Path)) {
       DeletedCount++;
+      DeletedPaths.Add(Path);
+    }
+  }
+
+  // Fix up redirectors if requested and assets were deleted
+  if (bFixupRedirectors && DeletedCount > 0) {
+    FAssetRegistryModule &AssetRegistryModule =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
+            TEXT("AssetRegistry"));
+    IAssetRegistry &AssetRegistry = AssetRegistryModule.Get();
+
+    FARFilter Filter;
+    Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/CoreUObject"),
+                                             TEXT("ObjectRedirector")));
+
+    TArray<FAssetData> RedirectorAssets;
+    AssetRegistry.GetAssets(Filter, RedirectorAssets);
+
+    if (RedirectorAssets.Num() > 0) {
+      TArray<UObjectRedirector *> Redirectors;
+      for (const FAssetData &Asset : RedirectorAssets) {
+        if (UObjectRedirector *Redirector =
+                Cast<UObjectRedirector>(Asset.GetAsset())) {
+          Redirectors.Add(Redirector);
+        }
+      }
+
+      if (Redirectors.Num() > 0) {
+        IAssetTools &AssetTools =
+            FModuleManager::LoadModuleChecked<FAssetToolsModule>(
+                TEXT("AssetTools"))
+                .Get();
+        AssetTools.FixupReferencers(Redirectors);
+      }
     }
   }
 
   TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
   Resp->SetBoolField(TEXT("success"), DeletedCount > 0);
   Resp->SetNumberField(TEXT("deletedCount"), DeletedCount);
+  Resp->SetNumberField(TEXT("requestedCount"), PathsToDelete.Num());
   SendAutomationResponse(Socket, RequestId, true, TEXT("Assets deleted"), Resp,
                          FString());
   return true;

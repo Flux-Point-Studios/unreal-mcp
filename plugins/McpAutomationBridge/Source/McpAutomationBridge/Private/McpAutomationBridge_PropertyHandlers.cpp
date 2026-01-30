@@ -1,5 +1,5 @@
 #include "McpAutomationBridgeGlobals.h"
-#include "McpAutomationBridgeHelpers.h"
+#include "McpAutomationBridgeHelpers.h" // Enhanced with struct array support
 #include "McpAutomationBridgeSubsystem.h"
 
 bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(

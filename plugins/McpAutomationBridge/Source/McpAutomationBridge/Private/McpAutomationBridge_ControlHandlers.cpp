@@ -2437,6 +2437,119 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorAction(
   if (LowerSub == TEXT("open_asset"))
     return HandleControlEditorOpenAsset(RequestId, Payload, RequestingSocket);
 
+  // --------------------------------------------------------------------------
+  // begin_transaction
+  // --------------------------------------------------------------------------
+  if (LowerSub == TEXT("begin_transaction")) {
+    FString TransactionName;
+    if (!Payload->TryGetStringField(TEXT("transactionName"), TransactionName)) {
+      Payload->TryGetStringField(TEXT("name"), TransactionName);
+    }
+    if (TransactionName.IsEmpty()) {
+      TransactionName = TEXT("MCP Transaction");
+    }
+
+    FString Description;
+    Payload->TryGetStringField(TEXT("description"), Description);
+
+    // Begin the transaction
+    GEditor->BeginTransaction(*TransactionName);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("transactionName"), TransactionName);
+    Result->SetStringField(TEXT("status"), TEXT("started"));
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           FString::Printf(TEXT("Transaction '%s' started"),
+                                           *TransactionName),
+                           Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // commit_transaction
+  // --------------------------------------------------------------------------
+  if (LowerSub == TEXT("commit_transaction") ||
+      LowerSub == TEXT("end_transaction")) {
+    GEditor->EndTransaction();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("status"), TEXT("committed"));
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("Transaction committed"), Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // rollback_transaction
+  // --------------------------------------------------------------------------
+  if (LowerSub == TEXT("rollback_transaction") ||
+      LowerSub == TEXT("cancel_transaction")) {
+    GEditor->CancelTransaction(0); // Cancel current transaction
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("status"), TEXT("rolled_back"));
+
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("Transaction rolled back"), Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // undo
+  // --------------------------------------------------------------------------
+  if (LowerSub == TEXT("undo") || LowerSub == TEXT("undo_last")) {
+    int32 Count = 1;
+    Payload->TryGetNumberField(TEXT("count"), Count);
+    Count = FMath::Max(1, Count);
+
+    int32 UndoneCount = 0;
+    for (int32 i = 0; i < Count; i++) {
+      if (GEditor->UndoTransaction()) {
+        UndoneCount++;
+      } else {
+        break; // No more actions to undo
+      }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetNumberField(TEXT("requestedCount"), Count);
+    Result->SetNumberField(TEXT("undoneCount"), UndoneCount);
+
+    SendAutomationResponse(
+        RequestingSocket, RequestId, true,
+        FString::Printf(TEXT("Undid %d action(s)"), UndoneCount), Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // redo
+  // --------------------------------------------------------------------------
+  if (LowerSub == TEXT("redo")) {
+    int32 Count = 1;
+    Payload->TryGetNumberField(TEXT("count"), Count);
+    Count = FMath::Max(1, Count);
+
+    int32 RedoneCount = 0;
+    for (int32 i = 0; i < Count; i++) {
+      if (GEditor->RedoTransaction()) {
+        RedoneCount++;
+      } else {
+        break; // No more actions to redo
+      }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetNumberField(TEXT("requestedCount"), Count);
+    Result->SetNumberField(TEXT("redoneCount"), RedoneCount);
+
+    SendAutomationResponse(
+        RequestingSocket, RequestId, true,
+        FString::Printf(TEXT("Redid %d action(s)"), RedoneCount), Result);
+    return true;
+  }
+
   SendAutomationResponse(
       RequestingSocket, RequestId, false,
       FString::Printf(TEXT("Unknown editor control action: %s"), *LowerSub),

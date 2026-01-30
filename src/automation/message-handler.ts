@@ -161,6 +161,13 @@ export class MessageHandler {
             if (expected && echoed && typeof echoed === 'string') {
                 const got = echoed.toLowerCase();
 
+                // Skip mismatch check when response action is an asset path
+                // (e.g., /Game/... or /Script/...) - Unreal often echoes asset paths
+                // instead of the original action name for certain operations
+                if (echoed.startsWith('/Game/') || echoed.startsWith('/Script/')) {
+                    return response;
+                }
+
                 const consolidatedToolActions = new Set([
                     'animation_physics',
                     'create_effect',

@@ -5,6 +5,59 @@ import { executeAutomationRequest } from './common-handlers.js';
 import { normalizeArgs, extractString, extractOptionalString, extractOptionalNumber, extractOptionalBoolean, extractOptionalArray } from './argument-helper.js';
 import { ResponseFactory } from '../../utils/response-factory.js';
 import { sanitizePath } from '../../utils/validation.js';
+import { Logger } from '../../utils/logger.js';
+
+const log = new Logger('AssetHandlers');
+
+// ============================================================================
+// Delete Operation Dry-Run and Confirmation Token Helpers
+// ============================================================================
+
+/**
+ * Generates a confirmation token for delete operations.
+ * The token is derived from the sorted paths and current timestamp to ensure uniqueness.
+ *
+ * @param paths - Array of asset paths to be deleted
+ * @returns A confirmation token string
+ */
+function generateConfirmToken(paths: string[]): string {
+  const data = paths.sort().join('|') + '|' + Date.now();
+  // Simple hash - in production you'd use crypto
+  let hash = 0;
+  for (let i = 0; i < data.length; i++) {
+    const char = data.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return `confirm_${Math.abs(hash).toString(36)}`;
+}
+
+/**
+ * Store for confirmation tokens with expiry tracking.
+ * Tokens expire after 5 minutes for security purposes.
+ */
+const confirmTokens = new Map<string, { paths: string[]; expires: number }>();
+
+/**
+ * Verifies that a confirmation token is valid for the given paths.
+ * Checks both token existence and path matching.
+ *
+ * @param token - The confirmation token to verify
+ * @param paths - The paths that should match the token
+ * @returns True if the token is valid and paths match
+ */
+function verifyConfirmToken(token: string, paths: string[]): boolean {
+  const stored = confirmTokens.get(token);
+  if (!stored) return false;
+  if (Date.now() > stored.expires) {
+    confirmTokens.delete(token);
+    return false;
+  }
+  // Verify paths match (using copies to avoid mutating originals)
+  const sortedStored = [...stored.paths].sort().join('|');
+  const sortedPaths = [...paths].sort().join('|');
+  return sortedStored === sortedPaths;
+}
 
 /** Asset info from list response */
 interface AssetListItem {
@@ -30,6 +83,37 @@ interface AssetOperationResponse {
   tags?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   [key: string]: unknown;
+}
+
+/**
+ * Tags an asset with MCP provenance metadata.
+ * This is used to track which assets were created by the MCP server
+ * and allows for cleanup of session-specific assets.
+ *
+ * @param tools - The tools interface for executing requests
+ * @param assetPath - The path to the asset to tag
+ * @param sessionId - Optional session identifier for grouping assets
+ */
+export async function tagMcpAsset(
+  tools: ITools,
+  assetPath: string,
+  sessionId?: string
+): Promise<void> {
+  try {
+    await executeAutomationRequest(tools, 'manage_asset', {
+      subAction: 'set_metadata',
+      assetPath,
+      metadata: {
+        'MCP.CreatedBy': 'unreal-engine-mcp-server',
+        'MCP.Version': '0.6.0',
+        'MCP.SessionId': sessionId || 'unknown',
+        'MCP.Timestamp': new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    // Non-fatal - just log and continue
+    log.warn(`Failed to tag asset ${assetPath} with MCP provenance:`, error);
+  }
 }
 
 export async function handleAssetTools(action: string, args: HandlerArgs, tools: ITools): Promise<Record<string, unknown>> {
@@ -222,19 +306,36 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
       case 'delete_assets':
       case 'delete_asset':
       case 'delete': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['path'] },
+          { key: 'assetPaths', aliases: ['paths'] },
+          { key: 'fixupRedirectors', default: true },
+          { key: 'force', default: false },
+          { key: 'dryRun', default: false },
+          { key: 'confirmToken' },
+        ]);
+
         let paths: string[] = [];
-        const argsTyped = args as AssetArgs;
-        if (Array.isArray(argsTyped.assetPaths)) {
-          paths = argsTyped.assetPaths as string[];
-        } else {
-          const single = argsTyped.assetPath || argsTyped.path;
-          if (typeof single === 'string' && single.trim()) {
-            paths = [single.trim()];
-          }
+
+        // Handle array input (support both assetPaths and paths)
+        if (Array.isArray(params.assetPaths)) {
+          paths = params.assetPaths.map((p: unknown) => String(p).trim()).filter((p: string) => p.length > 0);
+        } else if (Array.isArray(params.paths)) {
+          paths = params.paths.map((p: unknown) => String(p).trim()).filter((p: string) => p.length > 0);
         }
 
+        // Handle single path (support both assetPath and path)
+        if (params.assetPath && typeof params.assetPath === 'string') {
+          paths.push(params.assetPath.trim());
+        } else if (params.path && typeof params.path === 'string') {
+          paths.push(params.path.trim());
+        }
+
+        // Deduplicate and filter empty paths
+        paths = [...new Set(paths)].filter(p => p.length > 0);
+
         if (paths.length === 0) {
-          throw new Error('No paths provided for delete action');
+          return ResponseFactory.error('No valid asset paths provided', 'INVALID_ARGUMENT');
         }
 
         // Normalize paths: strip object sub-path suffix (e.g., /Game/Folder/Asset.Asset -> /Game/Folder/Asset)
@@ -254,7 +355,88 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
           return normalized;
         });
 
-        const res = await tools.assetTools.deleteAssets({ paths: normalizedPaths });
+        // Extract dry-run and confirmation parameters
+        const dryRun = extractOptionalBoolean(params, 'dryRun') ?? false;
+        const confirmToken = extractOptionalString(params, 'confirmToken');
+        const force = extractOptionalBoolean(params, 'force') ?? false;
+
+        // Get references for all paths to check if assets are in use
+        let refsRes: { references?: Array<{ assetPath: string; referencers: string[] }>; totalReferences?: number } = {};
+        let totalReferences = 0;
+        let hasReferences = false;
+
+        try {
+          refsRes = await executeAutomationRequest(tools, 'manage_asset', {
+            subAction: 'get_references',
+            assetPaths: normalizedPaths,
+          }) as { references?: Array<{ assetPath: string; referencers: string[] }>; totalReferences?: number };
+          totalReferences = refsRes.totalReferences ?? 0;
+          hasReferences = totalReferences > 0;
+        } catch (error) {
+          // If reference checking fails, log warning and continue without reference info
+          log.warn('Failed to check asset references:', error);
+        }
+
+        // DRY RUN MODE: Preview what would be deleted without actually deleting
+        if (dryRun) {
+          // Generate confirmation token for subsequent actual delete
+          const token = generateConfirmToken(normalizedPaths);
+          confirmTokens.set(token, {
+            paths: [...normalizedPaths],
+            expires: Date.now() + 5 * 60 * 1000, // 5 minutes expiry
+          });
+
+          return ResponseFactory.success({
+            dryRun: true,
+            wouldDelete: normalizedPaths,
+            assetCount: normalizedPaths.length,
+            references: refsRes.references ?? [],
+            totalReferences,
+            requireConfirm: hasReferences,
+            confirmToken: hasReferences ? token : undefined,
+            expiresIn: hasReferences ? '5 minutes' : undefined,
+            hint: hasReferences
+              ? 'Assets have references. Call again with confirmToken to proceed.'
+              : 'No references found. You can proceed safely.',
+          }, `Dry run complete - ${normalizedPaths.length} asset(s) would be deleted`);
+        }
+
+        // ACTUAL DELETE: Check for references and require confirmation if needed
+        // If has references and no confirm token (and not forced), refuse deletion
+        if (hasReferences && !confirmToken && !force) {
+          return ResponseFactory.error(
+            'Assets have references. Use dryRun:true first, then pass confirmToken to proceed, or use force:true to override.',
+            'ASSET_IN_USE',
+            {
+              references: refsRes.references,
+              totalReferences,
+              hint: 'Add dryRun:true to preview, or force:true to delete anyway',
+            }
+          );
+        }
+
+        // Verify confirm token if provided
+        if (confirmToken && !verifyConfirmToken(confirmToken, normalizedPaths)) {
+          return ResponseFactory.error(
+            'Invalid or expired confirm token',
+            'INVALID_ARGUMENT',
+            {
+              hint: 'Token may have expired (5 min limit) or paths changed. Use dryRun:true to get a new token.',
+            }
+          );
+        }
+
+        // Clean up used token to prevent reuse
+        if (confirmToken) {
+          confirmTokens.delete(confirmToken);
+        }
+
+        // Proceed with actual deletion
+        const res = await tools.assetTools.deleteAssets({
+          paths: normalizedPaths,
+          fixupRedirectors: (params.fixupRedirectors as boolean | undefined) ?? true,
+          force: force || (confirmToken !== undefined), // Force if token provided
+        });
         return ResponseFactory.success(res, 'Assets deleted successfully');
       }
 
@@ -632,6 +814,112 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         });
         return ResponseFactory.success(res, 'Material node added successfully');
       }
+
+      // MCP Asset Provenance and Cleanup Handlers
+
+      case 'find_mcp_assets': {
+        // Find all assets created by the MCP server, optionally filtered by session
+        const params = normalizeArgs(args, [
+          { key: 'sessionId' },
+          { key: 'path', default: '/Game' },
+        ]);
+
+        const sessionId = extractOptionalString(params, 'sessionId');
+        const searchPath = extractString(params, 'path') || '/Game';
+
+        const res = await executeAutomationRequest(tools, 'manage_asset', {
+          subAction: 'find_by_metadata',
+          path: searchPath,
+          metadataKey: 'MCP.CreatedBy',
+          metadataValue: 'unreal-engine-mcp-server',
+          sessionId,  // Optional filter by session
+        }) as { assets?: unknown[] };
+
+        const assetCount = Array.isArray(res.assets) ? res.assets.length : 0;
+        return ResponseFactory.success(res, `Found ${assetCount} MCP-created assets`);
+      }
+
+      case 'cleanup_mcp_session': {
+        // Clean up all assets created during a specific MCP session
+        const params = normalizeArgs(args, [
+          { key: 'sessionId', required: true },
+          { key: 'dryRun', default: true },  // Default to dry run for safety
+          { key: 'path', default: '/Game' },
+        ]);
+
+        const sessionId = extractString(params, 'sessionId');
+        const dryRun = extractOptionalBoolean(params, 'dryRun') ?? true;
+        const searchPath = extractString(params, 'path') || '/Game';
+
+        if (!sessionId) {
+          return ResponseFactory.error('sessionId is required', 'INVALID_ARGUMENT');
+        }
+
+        // First, find all assets from this session
+        const findRes = await executeAutomationRequest(tools, 'manage_asset', {
+          subAction: 'find_by_metadata',
+          path: searchPath,
+          metadataKey: 'MCP.SessionId',
+          metadataValue: sessionId,
+        }) as { assets?: Array<{ path?: string; assetPath?: string }> };
+
+        const assets = Array.isArray(findRes.assets) ? findRes.assets : [];
+
+        if (assets.length === 0) {
+          return ResponseFactory.success({
+            sessionId,
+            assetsFound: 0,
+            dryRun,
+          }, 'No assets found for this session');
+        }
+
+        if (dryRun) {
+          return ResponseFactory.success({
+            dryRun: true,
+            sessionId,
+            assetsFound: assets.length,
+            wouldDelete: assets,
+            hint: 'Set dryRun:false to actually delete these assets',
+          }, `Would delete ${assets.length} assets (dry run)`);
+        }
+
+        // Actually delete the assets
+        const paths = assets.map((a: { path?: string; assetPath?: string }) => a.path || a.assetPath).filter(Boolean) as string[];
+        const deleteRes = await tools.assetTools.deleteAssets({
+          paths,
+          fixupRedirectors: true,
+        });
+
+        return ResponseFactory.success({
+          sessionId,
+          deleted: deleteRes,
+          assetsDeleted: paths.length,
+        }, `Cleaned up ${paths.length} assets from session ${sessionId}`);
+      }
+
+      case 'set_asset_metadata': {
+        // Manually set metadata on an asset for custom tagging
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['path'], required: true },
+          { key: 'metadata', required: true },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+        const metadata = params.metadata;
+
+        if (!assetPath || !metadata || typeof metadata !== 'object') {
+          return ResponseFactory.error('assetPath and metadata object are required', 'INVALID_ARGUMENT');
+        }
+
+        const res = await executeAutomationRequest(tools, 'manage_asset', {
+          subAction: 'set_metadata',
+          assetPath,
+          metadata,
+        });
+
+        return ResponseFactory.success(res, 'Asset metadata updated');
+      }
+
       default: {
         // Pass all args through to C++ handler for unhandled actions
         const res = await executeAutomationRequest(tools, action || 'manage_asset', { ...args, subAction: action }) as AssetOperationResponse;

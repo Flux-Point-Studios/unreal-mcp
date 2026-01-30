@@ -1,7 +1,100 @@
+/**
+ * Location: src/automation/handshake.ts
+ *
+ * Summary:
+ * Handles WebSocket handshake protocol between MCP server and Unreal Engine plugin.
+ * Provides version negotiation and capability verification for graceful degradation
+ * when plugin versions are mismatched.
+ *
+ * Used by:
+ * - bridge.ts: Uses HandshakeHandler for initial connection handshake
+ * - connection-manager.ts: May use performVersionHandshake for version validation
+ */
+
 import { WebSocket } from 'ws';
 import { Logger } from '../utils/logger.js';
 import { AutomationBridgeMessage } from './types.js';
 import { EventEmitter } from 'node:events';
+
+/** Server version constant - update when releasing new versions */
+export const SERVER_VERSION = '0.6.0';
+
+/** Minimum plugin version required for full feature support */
+export const MIN_PLUGIN_VERSION = '0.5.0';
+
+/** Result of version handshake validation */
+export interface VersionHandshakeResult {
+  success: boolean;
+  warning?: string;
+  degradedFeatures?: string[];
+  pluginVersion?: string;
+  serverVersion?: string;
+}
+
+/**
+ * Compare two semantic version strings.
+ * @param v1 - First version string (e.g., "0.6.0")
+ * @param v2 - Second version string (e.g., "0.5.0")
+ * @returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal
+ */
+export function compareVersions(v1: string, v2: string): number {
+  const parts1 = v1.split('.').map(Number);
+  const parts2 = v2.split('.').map(Number);
+
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const p1 = parts1[i] || 0;
+    const p2 = parts2[i] || 0;
+    if (p1 > p2) return 1;
+    if (p1 < p2) return -1;
+  }
+  return 0;
+}
+
+/**
+ * Perform version handshake with the Unreal Engine plugin.
+ * Validates plugin version against minimum requirements and returns
+ * degraded feature information if version is too old.
+ *
+ * @param getPluginInfo - Async function that retrieves plugin version and capabilities
+ * @returns Handshake result with version info and any warnings
+ */
+export async function performVersionHandshake(
+  getPluginInfo: () => Promise<{ version?: string; capabilities?: string[] }>
+): Promise<VersionHandshakeResult> {
+  const log = new Logger('VersionHandshake');
+
+  try {
+    const pluginInfo = await getPluginInfo();
+    const pluginVersion = pluginInfo.version || '0.0.0';
+
+    if (compareVersions(pluginVersion, MIN_PLUGIN_VERSION) < 0) {
+      log.warn(`Plugin version ${pluginVersion} < required ${MIN_PLUGIN_VERSION}`);
+
+      // Warn but don't refuse - graceful degradation
+      return {
+        success: true,
+        warning: `Plugin version ${pluginVersion} may not support all features. Update recommended.`,
+        degradedFeatures: ['transactions', 'reparent_material_instance', 'semanticMaterialGraph'],
+        pluginVersion,
+        serverVersion: SERVER_VERSION,
+      };
+    }
+
+    log.info(`Version handshake successful. Plugin version: ${pluginVersion}, Server version: ${SERVER_VERSION}`);
+    return {
+      success: true,
+      pluginVersion,
+      serverVersion: SERVER_VERSION,
+    };
+  } catch (error) {
+    log.warn('Version handshake failed, proceeding with defaults:', error);
+    return {
+      success: true,
+      warning: 'Could not verify plugin version',
+      serverVersion: SERVER_VERSION,
+    };
+  }
+}
 
 export class HandshakeHandler extends EventEmitter {
     private log = new Logger('HandshakeHandler');

@@ -74,7 +74,7 @@ export interface IAssetTools {
     duplicateAsset(params: { sourcePath: string; destinationPath: string; overwrite?: boolean }): Promise<StandardActionResponse>;
     renameAsset(params: { sourcePath: string; destinationPath: string }): Promise<StandardActionResponse>;
     moveAsset(params: { sourcePath: string; destinationPath: string }): Promise<StandardActionResponse>;
-    deleteAssets(params: { paths: string[]; fixupRedirectors?: boolean; timeoutMs?: number }): Promise<StandardActionResponse>;
+    deleteAssets(params: { paths: string[]; fixupRedirectors?: boolean; force?: boolean; timeoutMs?: number }): Promise<StandardActionResponse>;
     searchAssets(params: { classNames?: string[]; packagePaths?: string[]; recursivePaths?: boolean; recursiveClasses?: boolean; limit?: number }): Promise<StandardActionResponse>;
     saveAsset(assetPath: string): Promise<StandardActionResponse>;
     findByTag(params: { tag: string; value?: string }): Promise<StandardActionResponse>;
@@ -264,6 +264,7 @@ export interface ITools {
     behaviorTreeTools: BehaviorTreeTools;
     logTools: LogTools;
     inputTools?: InputTools;
+    pythonTools?: import('../tools/python.js').PythonTools;
 
     automationBridge?: AutomationBridge;
     // Index signature allows additional tool properties

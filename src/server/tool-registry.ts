@@ -35,6 +35,7 @@ import { IntrospectionTools } from '../tools/introspection.js';
 import { EngineTools } from '../tools/engine.js';
 import { BehaviorTreeTools } from '../tools/behavior-tree.js';
 import { InputTools } from '../tools/input.js';
+import { PythonTools } from '../tools/python.js';
 
 import { LogTools } from '../tools/logs.js';
 import { getProjectSetting } from '../utils/ini-reader.js';
@@ -146,6 +147,7 @@ export class ToolRegistry {
         const behaviorTreeTools = new BehaviorTreeTools(this.bridge);
 
         const inputTools = new InputTools();
+        const pythonTools = new PythonTools();
         const logTools = new LogTools(this.bridge);
 
         // Wire AutomationBridge
@@ -154,7 +156,7 @@ export class ToolRegistry {
             lightingTools, landscapeTools, foliageTools, debugTools,
             performanceTools, audioTools, uiTools, introspectionTools,
 
-            engineTools, environmentTools, inputTools
+            engineTools, environmentTools, inputTools, pythonTools
         ];
         toolsWithAutomation.forEach(t => t.setAutomationBridge(this.automationBridge));
 
@@ -336,7 +338,7 @@ export class ToolRegistry {
                 landscapeTools, foliageTools, environmentTools, debugTools, performanceTools,
                 audioTools, systemTools, uiTools, sequenceTools, introspectionTools,
 
-                engineTools, behaviorTreeTools, inputTools, logTools,
+                engineTools, behaviorTreeTools, inputTools, pythonTools, logTools,
                 elicit: elicitation.elicit,
                 supportsElicitation: elicitation.supports,
                 elicitationTimeoutMs: this.defaultElicitationTimeoutMs,

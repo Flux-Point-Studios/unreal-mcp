@@ -42,6 +42,7 @@ import { handleLevelStructureTools } from './handlers/level-structure-handlers.j
 import { handleVolumeTools } from './handlers/volume-handlers.js';
 import { handleNavigationTools } from './handlers/navigation-handlers.js';
 import { handleSplineTools } from './handlers/spline-handlers.js';
+import { handlePythonTools } from './handlers/python-handlers.js';
 // import { getDynamicHandlerForTool } from './dynamic-handler-registry.js';
 // import { consolidatedToolDefinitions } from './consolidated-tool-definitions.js';
 
@@ -450,6 +451,9 @@ function registerDefaultHandlers() {
 
   // 40. SPLINE SYSTEM (Phase 26)
   toolRegistry.register('manage_splines', async (args, tools) => await handleSplineTools(getAction(args), args, tools));
+
+  // 41. PYTHON EXECUTION
+  toolRegistry.register('execute_python', async (args, tools) => await handlePythonTools(getAction(args), args, tools));
 }
 
 // Initialize default handlers immediately

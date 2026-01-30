@@ -457,8 +457,25 @@ export async function handleMaterialAuthoringTools(
         const assetPath = extractString(params, 'assetPath');
         const sourceNodeId = extractString(params, 'sourceNodeId');
         const sourcePin = extractOptionalString(params, 'sourcePin') ?? '';
-        const targetNodeId = extractString(params, 'targetNodeId');
+        let targetNodeId = extractString(params, 'targetNodeId');
         const targetPin = extractString(params, 'targetPin');
+
+        // Map common target names to backend format
+        const targetNodeMappings: Record<string, string> = {
+          'material': 'Main',
+          'Material': 'Main',
+          'root': 'Main',
+          'Root': 'Main',
+          'output': 'Main',
+          'Output': 'Main',
+          'main': 'Main',
+          'MaterialOutput': 'Main',
+          'MaterialResult': 'Main',
+        };
+
+        if (targetNodeId && targetNodeMappings[targetNodeId]) {
+          targetNodeId = targetNodeMappings[targetNodeId];
+        }
 
         const res = (await executeAutomationRequest(tools, 'manage_material_authoring', {
           subAction: 'connect_nodes',
@@ -594,14 +611,47 @@ export async function handleMaterialAuthoringTools(
           { key: 'name', required: true },
           { key: 'path', aliases: ['directory'], default: '/Game/Materials' },
           { key: 'parentMaterial', aliases: ['parent'], required: true },
+          { key: 'overwrite', default: false },
           { key: 'save', default: true },
         ]);
 
         const name = extractString(params, 'name');
-        const path = extractOptionalString(params, 'path') ?? '/Game/Materials';
+        const path = extractString(params, 'path') || '/Game/Materials';
         const parentMaterial = extractString(params, 'parentMaterial');
+        const overwrite = extractOptionalBoolean(params, 'overwrite') ?? false;
         const save = extractOptionalBoolean(params, 'save') ?? true;
 
+        if (!name || !parentMaterial) {
+          return ResponseFactory.error('name and parentMaterial are required', 'INVALID_ARGUMENT');
+        }
+
+        const fullPath = `${path}/${name}`;
+
+        // If exists and overwrite=true, REPARENT instead of delete+recreate
+        if (overwrite) {
+          const existsRes = (await executeAutomationRequest(tools, 'manage_asset', {
+            subAction: 'exists',
+            assetPath: fullPath,
+          })) as { exists?: boolean };
+
+          if (existsRes.exists) {
+            // Reparent in place - preserves references!
+            const reparentRes = (await executeAutomationRequest(tools, 'manage_material_authoring', {
+              subAction: 'reparent_material_instance',
+              assetPath: fullPath,
+              parentMaterial,
+              preserveParameters: false, // Fresh start for overwrite
+              save,
+            })) as MaterialAuthoringResponse;
+
+            if (reparentRes.success !== false) {
+              return ResponseFactory.success(reparentRes, `Material instance '${name}' reparented to ${parentMaterial}`);
+            }
+            // Fall through to create if reparent failed (maybe it wasn't a MI)
+          }
+        }
+
+        // Normal creation
         const res = (await executeAutomationRequest(tools, 'manage_material_authoring', {
           subAction: 'create_material_instance',
           name,
@@ -611,9 +661,40 @@ export async function handleMaterialAuthoringTools(
         })) as MaterialAuthoringResponse;
 
         if (res.success === false) {
-          return ResponseFactory.error(res.error ?? 'Failed to create material instance', res.errorCode);
+          return ResponseFactory.error(res.error ?? 'Failed to create material instance', 'CREATE_FAILED');
         }
         return ResponseFactory.success(res, res.message ?? `Material instance '${name}' created`);
+      }
+
+      case 'reparent_material_instance': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['path', 'materialInstance'], required: true },
+          { key: 'parentMaterial', aliases: ['newParent', 'parent'], required: true },
+          { key: 'preserveParameters', default: true },
+          { key: 'save', default: true },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+        const parentMaterial = extractString(params, 'parentMaterial');
+        const preserveParameters = extractOptionalBoolean(params, 'preserveParameters') ?? true;
+        const save = extractOptionalBoolean(params, 'save') ?? true;
+
+        if (!assetPath || !parentMaterial) {
+          return ResponseFactory.error('assetPath and parentMaterial are required', 'INVALID_ARGUMENT');
+        }
+
+        const res = (await executeAutomationRequest(tools, 'manage_material_authoring', {
+          subAction: 'reparent_material_instance',
+          assetPath,
+          parentMaterial,
+          preserveParameters,
+          save,
+        })) as MaterialAuthoringResponse;
+
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to reparent', 'INVALID_PARENT');
+        }
+        return ResponseFactory.success(res, res.message ?? `Material instance parent changed to ${parentMaterial}`);
       }
 
       case 'set_scalar_parameter_value': {
@@ -809,9 +890,111 @@ export async function handleMaterialAuthoringTools(
         return ResponseFactory.success(res, res.message ?? 'Material info retrieved');
       }
 
+      // ===== 8.6 Material Graph Introspection =====
+      case 'get_material_output_node': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['materialPath'], required: true },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+        if (!assetPath) {
+          return ResponseFactory.error('assetPath is required', 'INVALID_ARGUMENT');
+        }
+
+        const res = (await executeAutomationRequest(tools, 'manage_material_authoring', {
+          subAction: 'get_material_output_node',
+          assetPath,
+        })) as MaterialAuthoringResponse;
+
+        // Returns: { nodeId: "GUID...", availablePins: ["BaseColor", "Metallic", "Roughness", ...] }
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to get material output node', res.errorCode);
+        }
+        return ResponseFactory.success(res, res.message ?? 'Material output node retrieved');
+      }
+
+      case 'find_material_nodes': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['materialPath'], required: true },
+          { key: 'nodeType', aliases: ['type'] },  // "VectorParameter", "ScalarParameter", etc.
+          { key: 'nameContains' },
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+        if (!assetPath) {
+          return ResponseFactory.error('assetPath is required', 'INVALID_ARGUMENT');
+        }
+
+        const nodeType = extractOptionalString(params, 'nodeType');
+        const nameContains = extractOptionalString(params, 'nameContains');
+
+        const res = (await executeAutomationRequest(tools, 'manage_material_authoring', {
+          subAction: 'find_nodes',
+          assetPath,
+          nodeType,
+          nameContains,
+        })) as MaterialAuthoringResponse & { nodes?: unknown[] };
+
+        // Returns: [{ nodeId, type, name, position, pins }]
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to find material nodes', res.errorCode);
+        }
+        const nodeCount = Array.isArray(res.nodes) ? res.nodes.length : 0;
+        return ResponseFactory.success(res, res.message ?? `Found ${nodeCount} nodes`);
+      }
+
+      case 'connect_material_semantic': {
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', aliases: ['materialPath'], required: true },
+          { key: 'fromNode', required: true },  // Can be: nodeId, "VectorParameter:BaseColor", etc.
+          { key: 'fromPin', default: '' },
+          { key: 'toOutput', required: true },  // "BaseColor", "Roughness", "Normal", etc.
+        ]);
+
+        const assetPath = extractString(params, 'assetPath');
+        let fromNode = extractString(params, 'fromNode');
+        const fromPin = extractOptionalString(params, 'fromPin') ?? '';
+        const toOutput = extractString(params, 'toOutput');
+
+        if (!assetPath || !fromNode || !toOutput) {
+          return ResponseFactory.error('assetPath, fromNode, and toOutput are required', 'INVALID_ARGUMENT');
+        }
+
+        // If fromNode is semantic (e.g., "VectorParameter:BaseColor"), resolve it
+        if (fromNode.includes(':')) {
+          const [type, name] = fromNode.split(':');
+          const found = (await executeAutomationRequest(tools, 'manage_material_authoring', {
+            subAction: 'find_nodes',
+            assetPath,
+            nodeType: type,
+            nameContains: name,
+          })) as MaterialAuthoringResponse & { nodes?: Array<{ nodeId: string }> };
+
+          if (!found.nodes?.length) {
+            return ResponseFactory.error(`Node not found: ${fromNode}`, 'NODE_NOT_FOUND');
+          }
+          fromNode = found.nodes[0].nodeId;
+        }
+
+        // Connect directly to the material output
+        const res = (await executeAutomationRequest(tools, 'manage_material_authoring', {
+          subAction: 'connect_nodes',
+          assetPath,
+          sourceNodeId: fromNode,
+          sourcePin: fromPin || 'RGB',  // Default for vector params
+          targetNodeId: 'Main',  // Material output
+          inputName: toOutput,
+        })) as MaterialAuthoringResponse;
+
+        if (res.success === false) {
+          return ResponseFactory.error(res.error ?? 'Failed to connect', 'CONNECTION_FAILED');
+        }
+        return ResponseFactory.success(res, res.message ?? `Connected to ${toOutput}`);
+      }
+
       default:
         return ResponseFactory.error(
-          `Unknown material authoring action: ${action}. Available actions: create_material, set_blend_mode, set_shading_model, add_texture_sample, add_scalar_parameter, add_vector_parameter, add_math_node, connect_nodes, create_material_instance, set_scalar_parameter_value, set_vector_parameter_value, set_texture_parameter_value, compile_material, get_material_info`,
+          `Unknown material authoring action: ${action}. Available actions: create_material, set_blend_mode, set_shading_model, add_texture_sample, add_scalar_parameter, add_vector_parameter, add_math_node, connect_nodes, create_material_instance, reparent_material_instance, set_scalar_parameter_value, set_vector_parameter_value, set_texture_parameter_value, compile_material, get_material_info, get_material_output_node, find_material_nodes, connect_material_semantic`,
           'UNKNOWN_ACTION'
         );
     }

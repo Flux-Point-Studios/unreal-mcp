@@ -1460,6 +1460,104 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
   }
 
   // --------------------------------------------------------------------------
+  // reparent_material_instance
+  // --------------------------------------------------------------------------
+  if (SubAction == TEXT("reparent_material_instance")) {
+    FString AssetPath, ParentMaterialPath;
+    if (!Payload->TryGetStringField(TEXT("assetPath"), AssetPath) || AssetPath.IsEmpty()) {
+      // Try alternative names
+      if (!Payload->TryGetStringField(TEXT("materialInstance"), AssetPath) &&
+          !Payload->TryGetStringField(TEXT("path"), AssetPath)) {
+        SendAutomationError(Socket, RequestId, TEXT("Missing 'assetPath'."),
+                            TEXT("INVALID_ARGUMENT"));
+        return true;
+      }
+    }
+
+    if (!Payload->TryGetStringField(TEXT("parentMaterial"), ParentMaterialPath) ||
+        ParentMaterialPath.IsEmpty()) {
+      // Try alternative names
+      if (!Payload->TryGetStringField(TEXT("newParent"), ParentMaterialPath) &&
+          !Payload->TryGetStringField(TEXT("parent"), ParentMaterialPath)) {
+        SendAutomationError(Socket, RequestId, TEXT("Missing 'parentMaterial'."),
+                            TEXT("INVALID_ARGUMENT"));
+        return true;
+      }
+    }
+
+    bool bPreserveParameters = true;
+    Payload->TryGetBoolField(TEXT("preserveParameters"), bPreserveParameters);
+
+    bool bSave = true;
+    Payload->TryGetBoolField(TEXT("save"), bSave);
+
+    // Load the material instance
+    UMaterialInstanceConstant *MI = LoadObject<UMaterialInstanceConstant>(nullptr, *AssetPath);
+    if (!MI) {
+      SendAutomationError(Socket, RequestId,
+                          FString::Printf(TEXT("Material instance not found: %s"), *AssetPath),
+                          TEXT("ASSET_NOT_FOUND"));
+      return true;
+    }
+
+    // Load the new parent material
+    UMaterialInterface *NewParent = LoadObject<UMaterialInterface>(nullptr, *ParentMaterialPath);
+    if (!NewParent) {
+      SendAutomationError(Socket, RequestId,
+                          FString::Printf(TEXT("Parent material not found: %s"), *ParentMaterialPath),
+                          TEXT("INVALID_PARENT"));
+      return true;
+    }
+
+    // Store current parameters if preserving
+    TArray<FScalarParameterValue> ScalarParams;
+    TArray<FVectorParameterValue> VectorParams;
+    TArray<FTextureParameterValue> TextureParams;
+
+    if (bPreserveParameters) {
+      // Copy current parameter values from the material instance
+      ScalarParams = MI->ScalarParameterValues;
+      VectorParams = MI->VectorParameterValues;
+      TextureParams = MI->TextureParameterValues;
+    }
+
+    // Reparent using SetParentEditorOnly
+    MI->SetParentEditorOnly(NewParent);
+
+    // Restore parameters if preserving (they may have been reset by reparent)
+    if (bPreserveParameters) {
+      for (const FScalarParameterValue &Param : ScalarParams) {
+        MI->SetScalarParameterValueEditorOnly(Param.ParameterInfo.Name, Param.ParameterValue);
+      }
+      for (const FVectorParameterValue &Param : VectorParams) {
+        MI->SetVectorParameterValueEditorOnly(Param.ParameterInfo.Name, Param.ParameterValue);
+      }
+      for (const FTextureParameterValue &Param : TextureParams) {
+        if (Param.ParameterValue) {
+          MI->SetTextureParameterValueEditorOnly(Param.ParameterInfo.Name, Param.ParameterValue);
+        }
+      }
+    }
+
+    MI->PostEditChange();
+    MI->MarkPackageDirty();
+
+    if (bSave) {
+      SaveMaterialInstanceAsset(MI);
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), MI->GetPathName());
+    Result->SetStringField(TEXT("newParent"), NewParent->GetPathName());
+    Result->SetBoolField(TEXT("parametersPreserved"), bPreserveParameters);
+
+    SendAutomationResponse(Socket, RequestId, true,
+                           FString::Printf(TEXT("Reparented to %s"), *ParentMaterialPath),
+                           Result);
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
   // set_scalar_parameter_value
   // --------------------------------------------------------------------------
   if (SubAction == TEXT("set_scalar_parameter_value")) {

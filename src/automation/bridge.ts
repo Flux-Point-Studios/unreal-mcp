@@ -23,6 +23,12 @@ import { ConnectionManager } from './connection-manager.js';
 import { RequestTracker } from './request-tracker.js';
 import { HandshakeHandler } from './handshake.js';
 import { MessageHandler } from './message-handler.js';
+import {
+    launchEditor,
+    waitForEditorReady,
+    type LaunchOptions,
+    type LaunchMode
+} from '../utils/editor-launch.js';
 
 const require = createRequire(import.meta.url);
 const packageInfo: { name?: string; version?: string } = (() => {
@@ -66,6 +72,13 @@ export class AutomationBridge extends EventEmitter {
     private queuedRequestItems: QueuedRequestItem[] = [];
     private connectionPromise?: Promise<void>;
     private connectionLock = false;
+
+    // Auto-launch configuration for CI/CD scenarios
+    private autoLaunchProjectPath?: string;
+    private autoLaunchMode: LaunchMode = 'headless';
+    private autoLaunchEnabled = false;
+    private autoLaunchTimeoutMs = 120000; // 2 minutes to wait for editor to launch and connect
+    private editorLaunched = false;
 
     constructor(options: AutomationBridgeOptions = {}) {
         super();
@@ -373,6 +386,173 @@ export class AutomationBridge extends EventEmitter {
         return this.connectionManager.isConnected();
     }
 
+    // ============================================================================
+    // AUTO-LAUNCH CONFIGURATION - For CI/CD automation
+    // ============================================================================
+
+    /**
+     * Configures auto-launch settings for CI/CD scenarios.
+     * When enabled, the bridge will automatically launch the Unreal Editor
+     * if connection attempts fail.
+     *
+     * @param options Auto-launch configuration options
+     */
+    configureAutoLaunch(options: {
+        projectPath: string;
+        mode?: LaunchMode;
+        enabled?: boolean;
+        timeoutMs?: number;
+        editorPath?: string;
+    }): void {
+        this.autoLaunchProjectPath = options.projectPath;
+        this.autoLaunchMode = options.mode ?? 'headless';
+        this.autoLaunchEnabled = options.enabled ?? true;
+        this.autoLaunchTimeoutMs = options.timeoutMs ?? 120000;
+        this.log.info(`Auto-launch configured: project=${options.projectPath}, mode=${this.autoLaunchMode}, enabled=${this.autoLaunchEnabled}`);
+    }
+
+    /**
+     * Disables auto-launch functionality.
+     */
+    disableAutoLaunch(): void {
+        this.autoLaunchEnabled = false;
+        this.log.info('Auto-launch disabled');
+    }
+
+    /**
+     * Gets the current auto-launch configuration.
+     */
+    getAutoLaunchConfig(): {
+        enabled: boolean;
+        projectPath?: string;
+        mode: LaunchMode;
+        timeoutMs: number;
+        editorLaunched: boolean;
+    } {
+        return {
+            enabled: this.autoLaunchEnabled,
+            projectPath: this.autoLaunchProjectPath,
+            mode: this.autoLaunchMode,
+            timeoutMs: this.autoLaunchTimeoutMs,
+            editorLaunched: this.editorLaunched
+        };
+    }
+
+    /**
+     * Attempts to launch the Unreal Editor and establish a connection.
+     * This can be called manually or will be invoked automatically if
+     * auto-launch is enabled and connection fails.
+     *
+     * @param options Launch options (overrides auto-launch config)
+     * @returns Promise that resolves when editor is launched and connected
+     */
+    async launchAndConnect(options?: Partial<LaunchOptions>): Promise<{
+        pid?: number;
+        connected: boolean;
+        message: string;
+    }> {
+        const projectPath = options?.projectPath ?? this.autoLaunchProjectPath;
+        if (!projectPath) {
+            throw new Error('Project path is required for launching the editor');
+        }
+
+        const mode = options?.mode ?? this.autoLaunchMode;
+        const timeoutMs = this.autoLaunchTimeoutMs;
+
+        this.log.info(`Launching Unreal Editor: project=${projectPath}, mode=${mode}`);
+
+        try {
+            // Launch the editor
+            const result = await launchEditor({
+                projectPath,
+                mode,
+                additionalArgs: options?.additionalArgs,
+                editorPath: options?.editorPath,
+                commandletName: options?.commandletName,
+                commandletArgs: options?.commandletArgs,
+                detached: true
+            });
+
+            this.editorLaunched = true;
+            this.log.info(`Editor process started with PID: ${result.pid}`);
+
+            // For commandlet mode, we don't wait for connection
+            if (mode === 'commandlet') {
+                return {
+                    pid: result.pid,
+                    connected: false,
+                    message: 'Commandlet launched (no MCP connection expected)'
+                };
+            }
+
+            // Wait for the MCP connection to be established
+            try {
+                await waitForEditorReady(
+                    timeoutMs,
+                    2000,
+                    () => this.isConnected()
+                );
+
+                return {
+                    pid: result.pid,
+                    connected: true,
+                    message: 'Editor launched and MCP connection established'
+                };
+            } catch (waitError) {
+                const errMsg = waitError instanceof Error ? waitError.message : String(waitError);
+                this.log.warn(`Editor launched but MCP connection timed out: ${errMsg}`);
+
+                // Try to start a connection attempt
+                if (!this.isConnected()) {
+                    this.startClient();
+
+                    // Give it one more short wait
+                    try {
+                        await waitForEditorReady(10000, 1000, () => this.isConnected());
+                        return {
+                            pid: result.pid,
+                            connected: true,
+                            message: 'Editor launched and MCP connection established (delayed)'
+                        };
+                    } catch {
+                        // Connection still not established
+                    }
+                }
+
+                return {
+                    pid: result.pid,
+                    connected: false,
+                    message: `Editor launched but MCP connection not established: ${errMsg}`
+                };
+            }
+        } catch (launchError) {
+            const errMsg = launchError instanceof Error ? launchError.message : String(launchError);
+            this.log.error(`Failed to launch editor: ${errMsg}`);
+            throw new Error(`Failed to launch editor: ${errMsg}`);
+        }
+    }
+
+    /**
+     * Internal method to attempt auto-launch when connection fails.
+     * Only runs once per bridge lifetime.
+     */
+    private async attemptAutoLaunch(): Promise<boolean> {
+        if (!this.autoLaunchEnabled || !this.autoLaunchProjectPath || this.editorLaunched) {
+            return false;
+        }
+
+        this.log.info('Attempting auto-launch of Unreal Editor...');
+
+        try {
+            const result = await this.launchAndConnect();
+            return result.connected;
+        } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            this.log.error(`Auto-launch failed: ${errMsg}`);
+            return false;
+        }
+    }
+
     getStatus(): AutomationBridgeStatus {
 
         const connectionInfos = Array.from(this.connectionManager.getActiveSockets().entries()).map(([socket, info]) => ({
@@ -490,11 +670,22 @@ export class AutomationBridge extends EventEmitter {
                     }
                 } catch (err: unknown) {
                     this.log.error('Lazy connection failed', err);
-                    // We don't throw here immediately, we let the isConnected check fail below 
-                    // or throw a specific error.
-                    // Actually, if connection failed, we should probably fail the request.
-                    const errObj = err as Record<string, unknown> | null;
-                    throw new Error(`Failed to establish connection to Unreal Engine: ${String(errObj?.message ?? err)}`);
+
+                    // If auto-launch is enabled and we haven't launched yet, try auto-launching
+                    if (this.autoLaunchEnabled && !this.editorLaunched && this.autoLaunchProjectPath) {
+                        this.log.info('Connection failed, attempting auto-launch...');
+                        const autoLaunched = await this.attemptAutoLaunch();
+                        if (autoLaunched) {
+                            this.log.info('Auto-launch successful, connection established');
+                            // Connection is now established, continue with the request
+                        } else {
+                            const errObj = err as Record<string, unknown> | null;
+                            throw new Error(`Failed to establish connection to Unreal Engine (auto-launch also failed): ${String(errObj?.message ?? err)}`);
+                        }
+                    } else {
+                        const errObj = err as Record<string, unknown> | null;
+                        throw new Error(`Failed to establish connection to Unreal Engine: ${String(errObj?.message ?? err)}`);
+                    }
                 }
             } else {
                 throw new Error('Automation bridge disabled');
@@ -502,7 +693,16 @@ export class AutomationBridge extends EventEmitter {
         }
 
         if (!this.isConnected()) {
-            throw new Error('Automation bridge not connected');
+            // One more chance: try auto-launch if enabled
+            if (this.autoLaunchEnabled && !this.editorLaunched && this.autoLaunchProjectPath) {
+                this.log.info('Not connected, attempting auto-launch...');
+                const autoLaunched = await this.attemptAutoLaunch();
+                if (!autoLaunched) {
+                    throw new Error('Automation bridge not connected (auto-launch failed)');
+                }
+            } else {
+                throw new Error('Automation bridge not connected');
+            }
         }
 
         if (this.requestTracker.getPendingCount() >= this.requestTracker.getMaxPendingRequests()) {
