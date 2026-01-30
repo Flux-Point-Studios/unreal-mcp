@@ -308,71 +308,88 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
       return true;
     }
 
-    // Parse the input value - can be boolean, number, 2D vector, or 3D vector
+    // Get the action's expected value type for type-aware parsing
+    EInputActionValueType ExpectedType = Action->ValueType;
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+        TEXT("inject_input_for_action: Action %s expects type %d"),
+        *InputActionPath, (int)ExpectedType);
+
+    // Parse the input value based on the action's expected type
     FInputActionValue RawValue;
     bool bValueParsed = false;
 
-    // Debug: Log the raw JSON value field
-    const TSharedPtr<FJsonValue>* RawJsonValue = Payload->Values.Find(TEXT("value"));
-    if (RawJsonValue && RawJsonValue->IsValid())
-    {
-      UE_LOG(LogTemp, Warning, TEXT("[MCP INPUT] Raw JSON value type: %d"), static_cast<int>((*RawJsonValue)->Type));
-    }
-
-    // Try boolean first
-    bool BoolValue;
-    if (Payload->TryGetBoolField(TEXT("value"), BoolValue)) {
-      UE_LOG(LogTemp, Warning, TEXT("[MCP INPUT] Parsed as BOOL: %s"), BoolValue ? TEXT("true") : TEXT("false"));
-      RawValue = FInputActionValue(BoolValue ? 1.0f : 0.0f);
-      bValueParsed = true;
-    }
-
-    // Try object FIRST (before number) - handles wrapped negative numbers {x: -1, y: 0}
-    // and 2D/3D vectors. This must come before number parsing because negative numbers
-    // are wrapped in objects by the TypeScript layer to preserve their sign.
-    if (!bValueParsed) {
-      const TSharedPtr<FJsonObject>* ValueObj;
-      if (Payload->TryGetObjectField(TEXT("value"), ValueObj) && ValueObj->IsValid()) {
-        double X = 0.0, Y = 0.0, Z = 0.0;
-        bool bHasX = (*ValueObj)->TryGetNumberField(TEXT("x"), X);
-        bool bHasY = (*ValueObj)->TryGetNumberField(TEXT("y"), Y);
-        bool bHasZ = (*ValueObj)->TryGetNumberField(TEXT("z"), Z);
-
-        UE_LOG(LogTemp, Warning, TEXT("[MCP INPUT] Parsed as OBJECT: X=%f (has=%s), Y=%f (has=%s), Z=%f (has=%s)"),
-          X, bHasX ? TEXT("yes") : TEXT("no"),
-          Y, bHasY ? TEXT("yes") : TEXT("no"),
-          Z, bHasZ ? TEXT("yes") : TEXT("no"));
-
-        if (bHasX && bHasY && bHasZ) {
-          // 3D vector
-          RawValue = FInputActionValue(FVector(X, Y, Z));
+    switch (ExpectedType) {
+      case EInputActionValueType::Boolean:
+      {
+        bool BoolValue = true;
+        Payload->TryGetBoolField(TEXT("value"), BoolValue);
+        RawValue = FInputActionValue(BoolValue);
+        bValueParsed = true;
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+            TEXT("inject_input_for_action: Parsed Boolean value: %s"),
+            BoolValue ? TEXT("true") : TEXT("false"));
+        break;
+      }
+      case EInputActionValueType::Axis1D:
+      {
+        double NumValue = 1.0;
+        if (Payload->TryGetNumberField(TEXT("value"), NumValue)) {
+          RawValue = FInputActionValue(static_cast<float>(NumValue));
           bValueParsed = true;
-        } else if (bHasX && bHasY) {
-          // 2D vector - also handles wrapped negative numbers {x: -1, y: 0}
-          // For 1D actions, only X component is used
+        } else {
+          // Try object with x field (handles wrapped negative numbers)
+          const TSharedPtr<FJsonObject>* ValueObj;
+          if (Payload->TryGetObjectField(TEXT("value"), ValueObj)) {
+            double X = 0.0;
+            (*ValueObj)->TryGetNumberField(TEXT("x"), X);
+            RawValue = FInputActionValue(static_cast<float>(X));
+            bValueParsed = true;
+            NumValue = X;
+          }
+        }
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+            TEXT("inject_input_for_action: Parsed Axis1D value: %f"), NumValue);
+        break;
+      }
+      case EInputActionValueType::Axis2D:
+      {
+        const TSharedPtr<FJsonObject>* ValueObj;
+        if (Payload->TryGetObjectField(TEXT("value"), ValueObj)) {
+          double X = 0.0, Y = 0.0;
+          (*ValueObj)->TryGetNumberField(TEXT("x"), X);
+          (*ValueObj)->TryGetNumberField(TEXT("y"), Y);
           RawValue = FInputActionValue(FVector2D(X, Y));
           bValueParsed = true;
-        } else if (bHasX) {
-          // Just X - treat as 1D
-          RawValue = FInputActionValue(static_cast<float>(X));
-          bValueParsed = true;
+          UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+              TEXT("inject_input_for_action: Parsed Axis2D value: (%f, %f)"), X, Y);
         }
+        break;
+      }
+      case EInputActionValueType::Axis3D:
+      {
+        const TSharedPtr<FJsonObject>* ValueObj;
+        if (Payload->TryGetObjectField(TEXT("value"), ValueObj)) {
+          double X = 0.0, Y = 0.0, Z = 0.0;
+          (*ValueObj)->TryGetNumberField(TEXT("x"), X);
+          (*ValueObj)->TryGetNumberField(TEXT("y"), Y);
+          (*ValueObj)->TryGetNumberField(TEXT("z"), Z);
+          RawValue = FInputActionValue(FVector(X, Y, Z));
+          bValueParsed = true;
+          UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+              TEXT("inject_input_for_action: Parsed Axis3D value: (%f, %f, %f)"), X, Y, Z);
+        }
+        break;
       }
     }
 
-    // Try number (1D axis) - for positive numbers sent directly
     if (!bValueParsed) {
-      double NumValue;
-      if (Payload->TryGetNumberField(TEXT("value"), NumValue)) {
-        UE_LOG(LogTemp, Warning, TEXT("[MCP INPUT] Parsed as NUMBER: %f"), NumValue);
-        RawValue = FInputActionValue(static_cast<float>(NumValue));
-        bValueParsed = true;
-      }
-    }
-
-    if (!bValueParsed) {
+      FString ExpectedTypeStr =
+          ExpectedType == EInputActionValueType::Boolean ? TEXT("boolean") :
+          ExpectedType == EInputActionValueType::Axis1D ? TEXT("number or {x}") :
+          ExpectedType == EInputActionValueType::Axis2D ? TEXT("{x, y}") :
+          ExpectedType == EInputActionValueType::Axis3D ? TEXT("{x, y, z}") : TEXT("unknown");
       SendAutomationError(RequestingSocket, RequestId,
-                          TEXT("value field is required and must be boolean, number, or object with x,y(,z) fields."),
+                          FString::Printf(TEXT("value field is required and must match expected type for action. Expected: %s"), *ExpectedTypeStr),
                           TEXT("INVALID_ARGUMENT"));
       return true;
     }
@@ -497,11 +514,28 @@ bool UMcpAutomationBridgeSubsystem::HandleInputAction(
     for (const FString& ActionPath : ActionPathsToClear) {
       UInputAction* Action = LoadObject<UInputAction>(nullptr, *ActionPath);
       if (Action && Subsystem) {
-        // Inject zero value to clear the input
-        FInputActionValue ZeroValue(0.0f);
+        // Inject zero value of the correct type based on action's ValueType
+        FInputActionValue ZeroValue;
+        switch (Action->ValueType) {
+          case EInputActionValueType::Boolean:
+            ZeroValue = FInputActionValue(false);
+            break;
+          case EInputActionValueType::Axis1D:
+            ZeroValue = FInputActionValue(0.0f);
+            break;
+          case EInputActionValueType::Axis2D:
+            ZeroValue = FInputActionValue(FVector2D::ZeroVector);
+            break;
+          case EInputActionValueType::Axis3D:
+            ZeroValue = FInputActionValue(FVector::ZeroVector);
+            break;
+        }
         Subsystem->InjectInputForAction(Action, ZeroValue, {}, {});
         McpInputInjection::UntrackInjectedAction(ActionPath);
         ClearedCount++;
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+            TEXT("clear_injected_inputs: Cleared action %s with type %d"),
+            *ActionPath, (int)Action->ValueType);
       } else {
         FailedPaths.Add(ActionPath);
       }

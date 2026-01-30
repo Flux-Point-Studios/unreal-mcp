@@ -699,6 +699,12 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                          TSharedPtr<FMcpBridgeWebSocket> S) {
                     return HandleSystemControlAction(R, A, P, S);
                   });
+  RegisterHandler(TEXT("describe_capabilities"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleDescribeCapabilities(R, A, P, S);
+                  });
   RegisterHandler(TEXT("manage_blueprint_graph"),
                   [this](const FString &R, const FString &A,
                          const TSharedPtr<FJsonObject> &P,
@@ -869,6 +875,14 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                          const TSharedPtr<FJsonObject> &P,
                          TSharedPtr<FMcpBridgeWebSocket> S) {
                     return HandleManageNavigationAction(R, A, P, S);
+                  });
+
+  // Editor Control: Quit Editor
+  RegisterHandler(TEXT("quit_editor"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleQuitEditor(R, P, S);
                   });
 }
 

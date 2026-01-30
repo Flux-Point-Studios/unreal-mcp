@@ -2726,3 +2726,53 @@ bool UMcpAutomationBridgeSubsystem::HandleControlActorGet(
   return false;
 #endif
 }
+
+// ----------------------------------------------------------------------------
+// HandleQuitEditor
+// Location: McpAutomationBridge_ControlHandlers.cpp
+// Purpose: Safely shuts down the Unreal Editor with confirmation requirement.
+// Usage: Called via the "quit_editor" action from the MCP automation bridge.
+//        Requires "confirmed: true" in payload for safety.
+//        Optionally saves dirty packages before exit (default: true).
+// ----------------------------------------------------------------------------
+bool UMcpAutomationBridgeSubsystem::HandleQuitEditor(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> Socket) {
+#if WITH_EDITOR
+  // Safety: require explicit confirmation
+  bool bConfirmed = false;
+  Payload->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+
+  if (!bConfirmed) {
+    SendAutomationError(Socket, RequestId,
+                        TEXT("quit_editor requires 'confirmed: true' for safety"),
+                        TEXT("CONFIRMATION_REQUIRED"));
+    return true;
+  }
+
+  // Optional: save all dirty packages first
+  bool bSaveAll = true;
+  Payload->TryGetBoolField(TEXT("saveAll"), bSaveAll);
+
+  if (bSaveAll) {
+    FEditorFileUtils::SaveDirtyPackages(
+        /*bPromptUserToSave=*/false,
+        /*bSaveMapPackages=*/true,
+        /*bSaveContentPackages=*/true);
+  }
+
+  // Send response BEFORE shutdown
+  TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+  Data->SetBoolField(TEXT("shuttingDown"), true);
+  SendAutomationResponse(Socket, RequestId, true,
+                         TEXT("Editor shutdown initiated"), Data);
+
+  // Schedule the exit on the game thread (allows response to be sent)
+  AsyncTask(ENamedThreads::GameThread,
+            []() { FPlatformMisc::RequestExit(false); });
+
+  return true;
+#else
+  return false;
+#endif
+}

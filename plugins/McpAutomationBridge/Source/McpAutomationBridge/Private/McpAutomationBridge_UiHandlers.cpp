@@ -1,3 +1,32 @@
+/**
+ * Location: McpAutomationBridge/Private/McpAutomationBridge_UiHandlers.cpp
+ *
+ * Summary:
+ * This file implements UI automation handlers for the MCP Automation Bridge plugin.
+ * It provides functionality for:
+ * - Widget creation and manipulation (create_widget, add_widget_child)
+ * - Screenshot capture (screenshot)
+ * - Play-in-Editor control (play_in_editor, stop_play)
+ * - Input simulation (simulate_input)
+ * - HUD management (create_hud, set_widget_text, set_widget_image, set_widget_visibility)
+ * - Automation Driver session management (ui_session_start, ui_session_end, ui_click,
+ *   ui_type, ui_hover, ui_focus, ui_wait_for, ui_element_exists, ui_get_element_text)
+ *
+ * The Automation Driver provides programmatic UI testing capabilities through
+ * Unreal Engine's IAutomationDriver API. IMPORTANT: When enabled, the Automation
+ * Driver blocks platform input to ensure deterministic test execution.
+ *
+ * Usage:
+ * These handlers are registered with the McpAutomationBridgeSubsystem and invoked
+ * via HandleUiAction() when "system_control" or "manage_ui" actions are received
+ * from the MCP server.
+ *
+ * Related Files:
+ * - McpAutomationBridgeSubsystem.h/cpp - Main subsystem that routes actions
+ * - McpAutomationBridgeHelpers.h - Common helper functions
+ * - McpAutomationBridgeGlobals.h - Global definitions and macros
+ */
+
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
@@ -29,7 +58,69 @@
 #else
 #define MCP_HAS_WIDGET_FACTORY 0
 #endif
+
+// Automation Driver includes for UI testing capabilities
+#if __has_include("IAutomationDriverModule.h")
+#include "IAutomationDriverModule.h"
+#include "IAutomationDriver.h"
+#include "IDriverElement.h"
+#include "IElementLocator.h"
+#include "LocateBy.h"
+#include "WaitUntil.h"
+#include "AutomationDriverTypeDefs.h"
+#define MCP_HAS_AUTOMATION_DRIVER 1
+#else
+#define MCP_HAS_AUTOMATION_DRIVER 0
 #endif
+#endif
+
+// ============================================================================
+// Automation Driver Session State
+// ============================================================================
+// The Automation Driver MUST be explicitly enabled/disabled for each session.
+// When enabled, it BLOCKS platform input to ensure deterministic test execution.
+// Always follow the pattern: Enable() -> run sequence -> Disable()
+// ============================================================================
+#if WITH_EDITOR && MCP_HAS_AUTOMATION_DRIVER
+namespace McpUIAutomation
+{
+    // Active driver instance - only valid while session is active
+    static TSharedPtr<IAutomationDriver, ESPMode::ThreadSafe> ActiveDriver;
+
+    // Thread-safety mutex for driver access
+    static FCriticalSection DriverMutex;
+
+    // Helper to create locator from type and value strings
+    static TSharedRef<IElementLocator, ESPMode::ThreadSafe> CreateLocator(
+        const FString& LocatorType, const FString& LocatorValue)
+    {
+        if (LocatorType.Equals(TEXT("id"), ESearchCase::IgnoreCase))
+        {
+            return By::Id(LocatorValue);
+        }
+        else if (LocatorType.Equals(TEXT("path"), ESearchCase::IgnoreCase))
+        {
+            return By::Path(LocatorValue);
+        }
+        else if (LocatorType.Equals(TEXT("cursor"), ESearchCase::IgnoreCase))
+        {
+            return By::Cursor();
+        }
+        else if (LocatorType.Equals(TEXT("focus"), ESearchCase::IgnoreCase) ||
+                 LocatorType.Equals(TEXT("keyboard_focus"), ESearchCase::IgnoreCase))
+        {
+            return By::KeyboardFocus();
+        }
+        else if (LocatorType.Equals(TEXT("user_focus"), ESearchCase::IgnoreCase))
+        {
+            // Default to user 0 if not specified
+            return By::UserFocus(0);
+        }
+        // Default to path-based locator
+        return By::Path(LocatorValue);
+    }
+}
+#endif // WITH_EDITOR && MCP_HAS_AUTOMATION_DRIVER
 
 bool UMcpAutomationBridgeSubsystem::HandleUiAction(
     const FString &RequestId, const FString &Action,
@@ -645,7 +736,521 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
         ErrorCode = TEXT("WIDGET_NOT_FOUND");
       }
     }
-  } else {
+  }
+  // ============================================================================
+  // Automation Driver Session Management Handlers
+  // ============================================================================
+  // These handlers provide programmatic UI testing capabilities through
+  // Unreal Engine's Automation Driver API. The driver MUST be explicitly
+  // enabled/disabled for each test session.
+  //
+  // CRITICAL: When enabled, the Automation Driver BLOCKS platform input!
+  // Always follow: ui_session_start -> operations -> ui_session_end
+  // ============================================================================
+#if MCP_HAS_AUTOMATION_DRIVER
+  else if (LowerSub == TEXT("ui_session_start")) {
+    // Enable Automation Driver and create session
+    // WARNING: This blocks nearly all platform input until ui_session_end!
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("UI automation session already active - call ui_session_end first");
+      ErrorCode = TEXT("SESSION_ACTIVE");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      // Load and enable the Automation Driver module
+      IAutomationDriverModule& Module = FModuleManager::LoadModuleChecked<IAutomationDriverModule>("AutomationDriver");
+
+      // Enable the driver - THIS BLOCKS PLATFORM INPUT
+      Module.Enable();
+
+      // Create driver instance
+      McpUIAutomation::ActiveDriver = Module.CreateDriver();
+
+      bSuccess = true;
+      Message = TEXT("UI automation session started - platform input is now blocked");
+      Resp->SetBoolField(TEXT("sessionActive"), true);
+      Resp->SetStringField(TEXT("warning"), TEXT("Platform input is blocked while session is active"));
+    }
+  } else if (LowerSub == TEXT("ui_session_end")) {
+    // Disable Automation Driver and end session
+    // This restores platform input
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      // Disable the driver - restores platform input
+      IAutomationDriverModule& Module = FModuleManager::GetModuleChecked<IAutomationDriverModule>("AutomationDriver");
+      Module.Disable();
+
+      // Clear driver reference
+      McpUIAutomation::ActiveDriver.Reset();
+
+      bSuccess = true;
+      Message = TEXT("UI automation session ended - platform input restored");
+      Resp->SetBoolField(TEXT("sessionActive"), false);
+    }
+  } else if (LowerSub == TEXT("ui_session_status")) {
+    // Get current session status
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    bool bSessionActive = McpUIAutomation::ActiveDriver.IsValid();
+    bool bModuleEnabled = false;
+
+    if (FModuleManager::Get().IsModuleLoaded("AutomationDriver")) {
+      IAutomationDriverModule& Module = FModuleManager::GetModuleChecked<IAutomationDriverModule>("AutomationDriver");
+      bModuleEnabled = Module.IsEnabled();
+    }
+
+    bSuccess = true;
+    Message = bSessionActive ? TEXT("UI automation session is active") : TEXT("No UI automation session active");
+    Resp->SetBoolField(TEXT("sessionActive"), bSessionActive);
+    Resp->SetBoolField(TEXT("moduleEnabled"), bModuleEnabled);
+    Resp->SetBoolField(TEXT("inputBlocked"), bModuleEnabled);
+  } else if (LowerSub == TEXT("ui_click")) {
+    // Click on element by locator
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path"); // Default to path-based locator
+      }
+
+      // Create locator and find element
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      // Check if element exists before clicking
+      if (Element->Exists()) {
+        bool bClickResult = Element->Click();
+        if (bClickResult) {
+          bSuccess = true;
+          Message = FString::Printf(TEXT("Clicked element: %s=%s"), *LocatorType, *LocatorValue);
+          Resp->SetStringField(TEXT("locatorType"), LocatorType);
+          Resp->SetStringField(TEXT("locatorValue"), LocatorValue);
+        } else {
+          Message = FString::Printf(TEXT("Click failed on element: %s=%s"), *LocatorType, *LocatorValue);
+          ErrorCode = TEXT("CLICK_FAILED");
+          Resp->SetStringField(TEXT("error"), Message);
+        }
+      } else {
+        Message = FString::Printf(TEXT("Element not found: %s=%s"), *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_double_click")) {
+    // Double-click on element by locator
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      if (Element->Exists()) {
+        bool bClickResult = Element->DoubleClick();
+        if (bClickResult) {
+          bSuccess = true;
+          Message = FString::Printf(TEXT("Double-clicked element: %s=%s"), *LocatorType, *LocatorValue);
+        } else {
+          Message = FString::Printf(TEXT("Double-click failed on element: %s=%s"), *LocatorType, *LocatorValue);
+          ErrorCode = TEXT("CLICK_FAILED");
+          Resp->SetStringField(TEXT("error"), Message);
+        }
+      } else {
+        Message = FString::Printf(TEXT("Element not found: %s=%s"), *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_hover")) {
+    // Hover over element by locator
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      if (Element->Exists()) {
+        bool bHoverResult = Element->Hover();
+        if (bHoverResult) {
+          bSuccess = true;
+          Message = FString::Printf(TEXT("Hovering over element: %s=%s"), *LocatorType, *LocatorValue);
+          Resp->SetBoolField(TEXT("isHovered"), Element->IsHovered());
+        } else {
+          Message = FString::Printf(TEXT("Hover failed on element: %s=%s"), *LocatorType, *LocatorValue);
+          ErrorCode = TEXT("HOVER_FAILED");
+          Resp->SetStringField(TEXT("error"), Message);
+        }
+      } else {
+        Message = FString::Printf(TEXT("Element not found: %s=%s"), *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_type")) {
+    // Type text into focused element or specified element
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString Text;
+      Payload->TryGetStringField(TEXT("text"), Text);
+
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          (LocatorType.IsEmpty() || LocatorValue.IsEmpty())
+              ? McpUIAutomation::ActiveDriver->FindElement(By::KeyboardFocus())
+              : McpUIAutomation::ActiveDriver->FindElement(
+                    McpUIAutomation::CreateLocator(LocatorType, LocatorValue));
+
+      if (Element->Exists()) {
+        bool bTypeResult = Element->Type(Text);
+        if (bTypeResult) {
+          bSuccess = true;
+          Message = FString::Printf(TEXT("Typed text: '%s'"), *Text);
+          Resp->SetStringField(TEXT("typedText"), Text);
+        } else {
+          Message = TEXT("Type operation failed");
+          ErrorCode = TEXT("TYPE_FAILED");
+          Resp->SetStringField(TEXT("error"), Message);
+        }
+      } else {
+        Message = TEXT("Target element not found for typing");
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_focus")) {
+    // Focus on element by locator
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      if (Element->Exists()) {
+        if (Element->CanFocus()) {
+          bool bFocusResult = Element->Focus();
+          if (bFocusResult) {
+            bSuccess = true;
+            Message = FString::Printf(TEXT("Focused element: %s=%s"), *LocatorType, *LocatorValue);
+            Resp->SetBoolField(TEXT("isFocused"), Element->IsFocused());
+          } else {
+            Message = FString::Printf(TEXT("Focus failed on element: %s=%s"), *LocatorType, *LocatorValue);
+            ErrorCode = TEXT("FOCUS_FAILED");
+            Resp->SetStringField(TEXT("error"), Message);
+          }
+        } else {
+          Message = FString::Printf(TEXT("Element cannot be focused: %s=%s"), *LocatorType, *LocatorValue);
+          ErrorCode = TEXT("NOT_FOCUSABLE");
+          Resp->SetStringField(TEXT("error"), Message);
+        }
+      } else {
+        Message = FString::Printf(TEXT("Element not found: %s=%s"), *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_scroll")) {
+    // Scroll element by delta
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+      double Delta = 1.0;
+      Payload->TryGetNumberField(TEXT("delta"), Delta);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      if (Element->Exists()) {
+        bool bScrollResult = Element->ScrollBy(static_cast<float>(Delta));
+        if (bScrollResult) {
+          bSuccess = true;
+          Message = FString::Printf(TEXT("Scrolled element by delta: %.2f"), Delta);
+          Resp->SetNumberField(TEXT("delta"), Delta);
+        } else {
+          Message = TEXT("Scroll operation failed");
+          ErrorCode = TEXT("SCROLL_FAILED");
+          Resp->SetStringField(TEXT("error"), Message);
+        }
+      } else {
+        Message = FString::Printf(TEXT("Element not found: %s=%s"), *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_wait_for")) {
+    // Wait for element to appear/become visible/interactable
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      double TimeoutMs = 5000.0;
+      Payload->TryGetNumberField(TEXT("timeoutMs"), TimeoutMs);
+
+      FString WaitCondition;
+      Payload->TryGetStringField(TEXT("condition"), WaitCondition);
+      if (WaitCondition.IsEmpty()) {
+        WaitCondition = TEXT("exists"); // Default wait condition
+      }
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+
+      // Create appropriate wait delegate based on condition
+      FDriverWaitDelegate WaitDelegate;
+      FWaitTimeout Timeout = FWaitTimeout::InMilliseconds(TimeoutMs);
+
+      if (WaitCondition.Equals(TEXT("visible"), ESearchCase::IgnoreCase)) {
+        WaitDelegate = Until::ElementIsVisible(Locator, Timeout);
+      } else if (WaitCondition.Equals(TEXT("hidden"), ESearchCase::IgnoreCase)) {
+        WaitDelegate = Until::ElementIsHidden(Locator, Timeout);
+      } else if (WaitCondition.Equals(TEXT("interactable"), ESearchCase::IgnoreCase)) {
+        WaitDelegate = Until::ElementIsInteractable(Locator, Timeout);
+      } else if (WaitCondition.Equals(TEXT("focused"), ESearchCase::IgnoreCase)) {
+        WaitDelegate = Until::ElementIsFocusedByKeyboard(Locator, Timeout);
+      } else {
+        // Default: wait for element to exist
+        WaitDelegate = Until::ElementExists(Locator, Timeout);
+      }
+
+      bool bWaitResult = McpUIAutomation::ActiveDriver->Wait(WaitDelegate);
+
+      Resp->SetBoolField(TEXT("found"), bWaitResult);
+      Resp->SetStringField(TEXT("condition"), WaitCondition);
+      Resp->SetNumberField(TEXT("timeoutMs"), TimeoutMs);
+
+      if (bWaitResult) {
+        bSuccess = true;
+        Message = FString::Printf(TEXT("Wait condition '%s' satisfied for: %s=%s"),
+            *WaitCondition, *LocatorType, *LocatorValue);
+      } else {
+        Message = FString::Printf(TEXT("Timeout waiting for condition '%s': %s=%s"),
+            *WaitCondition, *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("TIMEOUT");
+        Resp->SetStringField(TEXT("error"), Message);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_element_exists")) {
+    // Check if element exists
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      bool bExists = Element->Exists();
+      bSuccess = true;
+      Message = bExists
+          ? FString::Printf(TEXT("Element exists: %s=%s"), *LocatorType, *LocatorValue)
+          : FString::Printf(TEXT("Element does not exist: %s=%s"), *LocatorType, *LocatorValue);
+
+      Resp->SetBoolField(TEXT("exists"), bExists);
+      Resp->SetStringField(TEXT("locatorType"), LocatorType);
+      Resp->SetStringField(TEXT("locatorValue"), LocatorValue);
+    }
+  } else if (LowerSub == TEXT("ui_get_element_info")) {
+    // Get comprehensive element information
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FString LocatorType, LocatorValue;
+      Payload->TryGetStringField(TEXT("locatorType"), LocatorType);
+      Payload->TryGetStringField(TEXT("locatorValue"), LocatorValue);
+
+      if (LocatorType.IsEmpty()) {
+        LocatorType = TEXT("path");
+      }
+
+      TSharedRef<IElementLocator, ESPMode::ThreadSafe> Locator =
+          McpUIAutomation::CreateLocator(LocatorType, LocatorValue);
+      TSharedRef<IDriverElement, ESPMode::ThreadSafe> Element =
+          McpUIAutomation::ActiveDriver->FindElement(Locator);
+
+      if (Element->Exists()) {
+        bSuccess = true;
+        Message = FString::Printf(TEXT("Element info retrieved: %s=%s"), *LocatorType, *LocatorValue);
+
+        // Get element properties
+        Resp->SetBoolField(TEXT("exists"), true);
+        Resp->SetBoolField(TEXT("visible"), Element->IsVisible());
+        Resp->SetBoolField(TEXT("interactable"), Element->IsInteractable());
+        Resp->SetBoolField(TEXT("focused"), Element->IsFocused());
+        Resp->SetBoolField(TEXT("canFocus"), Element->CanFocus());
+        Resp->SetBoolField(TEXT("hovered"), Element->IsHovered());
+        Resp->SetBoolField(TEXT("checked"), Element->IsChecked());
+        Resp->SetBoolField(TEXT("scrollable"), Element->IsScrollable());
+
+        // Get position and size
+        FVector2D Position = Element->GetAbsolutePosition();
+        FVector2D Size = Element->GetSize();
+
+        TSharedPtr<FJsonObject> PositionObj = MakeShared<FJsonObject>();
+        PositionObj->SetNumberField(TEXT("x"), Position.X);
+        PositionObj->SetNumberField(TEXT("y"), Position.Y);
+        Resp->SetObjectField(TEXT("position"), PositionObj);
+
+        TSharedPtr<FJsonObject> SizeObj = MakeShared<FJsonObject>();
+        SizeObj->SetNumberField(TEXT("width"), Size.X);
+        SizeObj->SetNumberField(TEXT("height"), Size.Y);
+        Resp->SetObjectField(TEXT("size"), SizeObj);
+
+        // Get text if available
+        FText ElementText = Element->GetText();
+        if (!ElementText.IsEmpty()) {
+          Resp->SetStringField(TEXT("text"), ElementText.ToString());
+        }
+      } else {
+        Message = FString::Printf(TEXT("Element not found: %s=%s"), *LocatorType, *LocatorValue);
+        ErrorCode = TEXT("ELEMENT_NOT_FOUND");
+        Resp->SetStringField(TEXT("error"), Message);
+        Resp->SetBoolField(TEXT("exists"), false);
+      }
+    }
+  } else if (LowerSub == TEXT("ui_get_cursor_position")) {
+    // Get current cursor position
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      FVector2D CursorPos = McpUIAutomation::ActiveDriver->GetCursorPosition();
+      bSuccess = true;
+      Message = FString::Printf(TEXT("Cursor position: (%.2f, %.2f)"), CursorPos.X, CursorPos.Y);
+
+      TSharedPtr<FJsonObject> PositionObj = MakeShared<FJsonObject>();
+      PositionObj->SetNumberField(TEXT("x"), CursorPos.X);
+      PositionObj->SetNumberField(TEXT("y"), CursorPos.Y);
+      Resp->SetObjectField(TEXT("cursorPosition"), PositionObj);
+    }
+  } else if (LowerSub == TEXT("ui_wait_time")) {
+    // Wait for a specified duration
+    FScopeLock Lock(&McpUIAutomation::DriverMutex);
+
+    if (!McpUIAutomation::ActiveDriver.IsValid()) {
+      Message = TEXT("No UI automation session active - call ui_session_start first");
+      ErrorCode = TEXT("NO_SESSION");
+      Resp->SetStringField(TEXT("error"), Message);
+    } else {
+      double DurationMs = 1000.0;
+      Payload->TryGetNumberField(TEXT("durationMs"), DurationMs);
+
+      bool bWaitResult = McpUIAutomation::ActiveDriver->Wait(FTimespan::FromMilliseconds(DurationMs));
+
+      bSuccess = bWaitResult;
+      Message = FString::Printf(TEXT("Waited for %.0f ms"), DurationMs);
+      Resp->SetNumberField(TEXT("durationMs"), DurationMs);
+      Resp->SetBoolField(TEXT("completed"), bWaitResult);
+    }
+  }
+#endif // MCP_HAS_AUTOMATION_DRIVER
+  else {
     Message = FString::Printf(
         TEXT("System control action '%s' not implemented"), *LowerSub);
     ErrorCode = TEXT("NOT_IMPLEMENTED");

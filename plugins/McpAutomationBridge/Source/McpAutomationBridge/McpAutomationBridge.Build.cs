@@ -87,7 +87,10 @@ public class McpAutomationBridge : ModuleRules
                 // Phase 6: Geometry Script (GeometryScripting plugin dependency in .uplugin ensures availability)
                 "GeometryCore", "GeometryScriptingCore", "GeometryScriptingEditor", "GeometryFramework", "DynamicMesh", "MeshDescription", "StaticMeshDescription",
                 // Phase 24: Navigation volumes
-                "NavigationSystem"
+                "NavigationSystem",
+                // UI Automation Driver for programmatic UI testing
+                // Provides IAutomationDriver, IDriverElement, By::, Until:: for UI element interaction
+                "AutomationDriver"
             });
 
             // --- Feature Detection Logic ---

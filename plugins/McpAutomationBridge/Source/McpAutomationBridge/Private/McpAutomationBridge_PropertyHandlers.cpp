@@ -2,6 +2,12 @@
 #include "McpAutomationBridgeHelpers.h" // Enhanced with struct array support
 #include "McpAutomationBridgeSubsystem.h"
 
+#if WITH_EDITOR
+#include "Engine/Blueprint.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#endif
+
 bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
     const FString &RequestId, const FString &Action,
     const TSharedPtr<FJsonObject> &Payload,
@@ -64,6 +70,21 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
         TEXT("OBJECT_NOT_FOUND"));
     return true;
   }
+
+  // Detect if we are setting a property on a Blueprint CDO (Class Default Object)
+  // If so, we need special handling to mark and compile the Blueprint for persistence
+  bool bIsBlueprintCDO = false;
+  UBlueprint* OwningBlueprint = nullptr;
+
+#if WITH_EDITOR
+  if (RootObject) {
+    UClass* ObjClass = RootObject->GetClass();
+    if (ObjClass && ObjClass->ClassGeneratedBy) {
+      OwningBlueprint = Cast<UBlueprint>(ObjClass->ClassGeneratedBy);
+      bIsBlueprintCDO = (OwningBlueprint != nullptr);
+    }
+  }
+#endif
 
   // Special handling for common AActor properties that are actually functions
   // or require setters
@@ -253,7 +274,14 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
   if (bMarkDirty)
     RootObject->MarkPackageDirty();
 #if WITH_EDITOR
-  RootObject->PostEditChange();
+  if (bIsBlueprintCDO && OwningBlueprint) {
+    OwningBlueprint->Modify();
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(OwningBlueprint);
+    FKismetEditorUtilities::CompileBlueprint(OwningBlueprint);
+    SaveLoadedAssetThrottled(OwningBlueprint);
+  } else {
+    RootObject->PostEditChange();
+  }
 #endif
 
   TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();

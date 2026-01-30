@@ -699,6 +699,11 @@ private:
                             const TSharedPtr<FJsonObject> &Payload,
                             TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
 
+  // System handlers (capabilities, introspection, configuration)
+  bool HandleDescribeCapabilities(const FString &RequestId, const FString &Action,
+                                  const TSharedPtr<FJsonObject> &Payload,
+                                  TSharedPtr<FMcpBridgeWebSocket> RequestingSocket);
+
   // 4. Input, UI, Hotkeys & Dialogs
   bool
   HandleUiAutomationAction(const FString &RequestId, const FString &Action,
@@ -909,6 +914,9 @@ private:
   bool HandleControlEditorOpenAsset(const FString &RequestId,
                                     const TSharedPtr<FJsonObject> &Payload,
                                     TSharedPtr<FMcpBridgeWebSocket> Socket);
+  bool HandleQuitEditor(const FString &RequestId,
+                        const TSharedPtr<FJsonObject> &Payload,
+                        TSharedPtr<FMcpBridgeWebSocket> Socket);
 
   // Asset handlers
   bool HandleImportAsset(const FString &RequestId,
