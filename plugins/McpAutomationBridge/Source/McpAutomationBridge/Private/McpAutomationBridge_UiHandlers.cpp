@@ -27,6 +27,7 @@
  * - McpAutomationBridgeGlobals.h - Global definitions and macros
  */
 
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
@@ -144,7 +145,7 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
 
   FString SubAction;
   if (Payload->HasField(TEXT("subAction"))) {
-    SubAction = Payload->GetStringField(TEXT("subAction"));
+    SubAction = GetJsonStringField(Payload, TEXT("subAction"));
   } else {
     Payload->TryGetStringField(TEXT("action"), SubAction);
   }
@@ -399,9 +400,15 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           const int32 Height = Size.Y;
 
           // Compress to PNG
+          // Note: ThumbnailCompressImageArray was introduced in UE 5.1
           TArray<uint8> PngData;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
           FImageUtils::ThumbnailCompressImageArray(Width, Height, Bitmap,
                                                    PngData);
+#else
+          // UE 5.0 fallback - use CompressImageArray
+          FImageUtils::CompressImageArray(Width, Height, Bitmap, PngData);
+#endif
 
           if (PngData.Num() == 0) {
             // Alternative: compress as PNG using IImageWrapper

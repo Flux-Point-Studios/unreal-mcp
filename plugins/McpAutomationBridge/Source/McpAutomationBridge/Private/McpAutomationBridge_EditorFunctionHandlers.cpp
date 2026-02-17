@@ -1,4 +1,5 @@
 #include "McpAutomationBridgeGlobals.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
 #if WITH_EDITOR
@@ -284,6 +285,7 @@ bool UMcpAutomationBridgeSubsystem::HandleExecuteEditorFunction(
     Out->SetStringField(TEXT("actorName"), Spawned->GetActorLabel());
     Out->SetStringField(TEXT("actorPath"), Spawned->GetPathName());
     Out->SetBoolField(TEXT("success"), true);
+    AddActorVerification(Out, Spawned);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Actor spawned"), Out, FString());
     return true;
@@ -407,6 +409,7 @@ bool UMcpAutomationBridgeSubsystem::HandleExecuteEditorFunction(
     TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
     Out->SetBoolField(TEXT("success"), true);
     Out->SetStringField(TEXT("possessed"), FoundPawn->GetActorLabel());
+    AddActorVerification(Out, FoundPawn);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Possessed pawn"), Out, FString());
     return true;
@@ -518,11 +521,14 @@ bool UMcpAutomationBridgeSubsystem::HandleExecuteEditorFunction(
           QualityEnum = ELightingBuildQuality::Quality_Medium;
         } else if (LowerQuality == TEXT("high")) {
           QualityEnum = ELightingBuildQuality::Quality_High;
+        } else if (LowerQuality == TEXT("production")) {
+          QualityEnum = ELightingBuildQuality::Quality_Production;
         } else {
           TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
           Err->SetBoolField(TEXT("success"), false);
           Err->SetStringField(TEXT("error"), TEXT("unknown_quality"));
           Err->SetStringField(TEXT("quality"), Quality);
+          Err->SetStringField(TEXT("validValues"), TEXT("preview, medium, high, production"));
           SendAutomationResponse(RequestingSocket, RequestId, false,
                                  TEXT("Unknown lighting quality"), Err,
                                  TEXT("UNKNOWN_QUALITY"));
@@ -543,11 +549,20 @@ bool UMcpAutomationBridgeSubsystem::HandleExecuteEditorFunction(
         }
       }
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
       LES->BuildLightMaps(QualityEnum, /*bWithReflectionCaptures*/ false);
       TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
       R->SetBoolField(TEXT("requested"), true);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Build lighting requested"), R, FString());
+#else
+      // UE 5.0 fallback - BuildLightMaps not available
+      TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+      R->SetBoolField(TEXT("requested"), false);
+      R->SetStringField(TEXT("error"), TEXT("BuildLightMaps not available in UE 5.0"));
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             TEXT("Build lighting not available in UE 5.0"), R, TEXT("NOT_AVAILABLE"));
+#endif
     } else {
       SendAutomationResponse(RequestingSocket, RequestId, false,
                              TEXT("LevelEditorSubsystem not available"),
@@ -839,8 +854,13 @@ bool UMcpAutomationBridgeSubsystem::HandleExecuteEditorFunction(
     // Resolve factory
     UClass *FactoryUClass = ResolveClassByName(FactoryClass);
     if (!FactoryUClass) {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
       // Try finding by short name or full path
       FactoryUClass = UClass::TryFindTypeSlow<UClass>(FactoryClass);
+#else
+      // UE 5.0: Use ResolveClassByName instead of deprecated ANY_PACKAGE
+      FactoryUClass = ResolveClassByName(FactoryClass);
+#endif
     }
 
     // Quick factory lookup by short name if full resolution failed
@@ -877,10 +897,8 @@ bool UMcpAutomationBridgeSubsystem::HandleExecuteEditorFunction(
     UObject *NewAsset =
         AssetTools.CreateAsset(AssetName, PackagePath, nullptr, Factory);
     if (NewAsset) {
-      // Force save
-      TArray<UPackage *> PackagesToSave;
-      PackagesToSave.Add(NewAsset->GetOutermost());
-      FEditorFileUtils::PromptForCheckoutAndSave(PackagesToSave, false, false);
+      // Use McpSafeAssetSave instead of modal PromptForCheckoutAndSave to avoid D3D12 crashes
+      McpSafeAssetSave(NewAsset);
 
       TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
       Out->SetStringField(TEXT("name"), NewAsset->GetName());

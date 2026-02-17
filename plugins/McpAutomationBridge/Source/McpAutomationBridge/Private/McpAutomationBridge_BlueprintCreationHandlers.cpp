@@ -1,4 +1,5 @@
 #include "McpAutomationBridge_BlueprintCreationHandlers.h"
+#include "Dom/JsonObject.h"
 #include "HAL/PlatformTime.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
@@ -285,9 +286,15 @@ static void ApplyPropertiesToObject(UObject *TargetObj,
     }
 
     if (!TextValue.IsEmpty()) {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
       Property->ImportText_Direct(
           *TextValue, Property->ContainerPtrToValuePtr<void>(TargetObj),
           TargetObj, 0);
+#else
+      // UE 5.0: Use ImportText with different signature
+      Property->ImportText(*TextValue, Property->ContainerPtrToValuePtr<void>(TargetObj),
+          PPF_None, TargetObj);
+#endif
     }
   }
 }
@@ -399,6 +406,7 @@ bool FBlueprintCreationHandlers::HandleBlueprintCreate(
     ResultPayload->SetStringField(TEXT("assetPath"),
                                   PreExistingBP->GetPathName());
     ResultPayload->SetBoolField(TEXT("saved"), true);
+    AddAssetVerification(ResultPayload, PreExistingBP);
 
     FScopeLock Lock(&GBlueprintCreateMutex);
     if (TArray<TPair<FString, TSharedPtr<FMcpBridgeWebSocket>>> *Subs =
@@ -533,6 +541,7 @@ bool FBlueprintCreationHandlers::HandleBlueprintCreate(
       ResultPayload->SetStringField(TEXT("assetPath"),
                                     ExistingBP->GetPathName());
       ResultPayload->SetBoolField(TEXT("saved"), true);
+      AddAssetVerification(ResultPayload, ExistingBP);
 
       FScopeLock Lock(&GBlueprintCreateMutex);
       if (TArray<TPair<FString, TSharedPtr<FMcpBridgeWebSocket>>> *Subs =
@@ -597,6 +606,7 @@ bool FBlueprintCreationHandlers::HandleBlueprintCreate(
   ResultPayload->SetStringField(TEXT("assetPath"),
                                 CreatedBlueprint->GetPathName());
   ResultPayload->SetBoolField(TEXT("saved"), true);
+  AddAssetVerification(ResultPayload, CreatedBlueprint);
   FScopeLock Lock(&GBlueprintCreateMutex);
   if (TArray<TPair<FString, TSharedPtr<FMcpBridgeWebSocket>>> *Subs =
           GBlueprintCreateInflight.Find(CreateKey)) {

@@ -13,10 +13,15 @@ export interface AutomationBridgeOptions {
     maxPendingRequests?: number;
     maxConcurrentConnections?: number;
     maxQueuedRequests?: number;
+    maxInboundMessagesPerMinute?: number;
+    maxInboundAutomationRequestsPerMinute?: number;
+    useTls?: boolean;
     clientMode?: boolean;
     clientHost?: string;
     clientPort?: number;
     serverLegacyEnabled?: boolean;
+    /** SECURITY: Allow non-loopback host binding for LAN access. Default: false (loopback-only). */
+    allowNonLoopback?: boolean;
 }
 
 export interface AutomationBridgeMessage {
@@ -30,6 +35,19 @@ export interface AutomationBridgeResponseMessage extends AutomationBridgeMessage
     message?: string;
     error?: string;
     result?: unknown;
+}
+
+/**
+ * Progress update message sent by UE during long operations.
+ * Used to extend request timeout and provide status feedback.
+ */
+export interface ProgressUpdateMessage extends AutomationBridgeMessage {
+    type: 'progress_update';
+    requestId: string;
+    percent?: number;       // 0-100 progress indicator
+    message?: string;       // Human-readable status
+    timestamp?: string;     // ISO timestamp
+    stillWorking?: boolean; // True if operation is still in progress
 }
 
 export interface AutomationBridgeStatus {
@@ -87,6 +105,12 @@ export interface PendingRequest {
     eventTimeout?: NodeJS.Timeout | undefined;
     eventTimeoutMs?: number | undefined;
     initialResponse?: AutomationBridgeResponseMessage | undefined;
+    // Progress tracking for timeout extension
+    extensionCount?: number;
+    lastProgressPercent?: number;
+    staleCount?: number;
+    absoluteTimeout?: NodeJS.Timeout;
+    totalExtensionMs?: number;
 }
 
 /**

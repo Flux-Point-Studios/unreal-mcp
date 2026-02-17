@@ -1,4 +1,5 @@
 #include "McpAutomationBridgeSubsystem.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
 
@@ -15,7 +16,7 @@ bool UMcpAutomationBridgeSubsystem::HandleInsightsAction(const FString& RequestI
         return true;
     }
 
-    FString SubAction = Payload->GetStringField(TEXT("subAction"));
+    FString SubAction = GetJsonStringField(Payload, TEXT("subAction"));
 
     if (SubAction == TEXT("start_session"))
     {
@@ -23,16 +24,19 @@ bool UMcpAutomationBridgeSubsystem::HandleInsightsAction(const FString& RequestI
         // "Trace.Start"
         
         FString Channels;
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
         if (Payload->TryGetStringField(TEXT("channels"), Channels) && !Channels.IsEmpty())
         {
              GEngine->Exec(nullptr, *FString::Printf(TEXT("Trace.Start %s"), *Channels));
+             Result->SetStringField(TEXT("channels"), Channels);
         }
         else
         {
              GEngine->Exec(nullptr, TEXT("Trace.Start"));
         }
-        
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Trace session started."));
+        Result->SetStringField(TEXT("action"), TEXT("start_trace"));
+        Result->SetStringField(TEXT("status"), TEXT("started"));
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Trace session started."), Result);
         return true;
     }
 

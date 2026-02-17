@@ -1,4 +1,5 @@
 #include "McpAutomationBridgeSettings.h"
+#include "Dom/JsonObject.h"
 
 #include "Internationalization/Text.h"
 
@@ -20,6 +21,13 @@ UMcpAutomationBridgeSettings::UMcpAutomationBridgeSettings()
     ListenHost = TEXT("127.0.0.1");
     ListenPorts = TEXT("8090,8091");
     bMultiListen = true;
+    bRequireCapabilityToken = false;
+    bAllowNonLoopback = false; // Security: default to loopback-only binding
+    MaxMessagesPerMinute = 600;
+    MaxAutomationRequestsPerMinute = 600;
+    bEnableTls = false;
+    TlsCertificatePath = TEXT("");
+    TlsPrivateKeyPath = TEXT("");
 
     // Reasonable runtime tuning defaults
     HeartbeatIntervalMs = 1000; // advertise heartbeats every 1s

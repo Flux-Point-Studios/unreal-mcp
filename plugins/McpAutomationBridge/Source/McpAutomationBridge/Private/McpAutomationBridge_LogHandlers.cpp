@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeSubsystem.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
@@ -104,7 +105,7 @@ bool UMcpAutomationBridgeSubsystem::HandleLogAction(const FString& RequestId, co
         return true;
     }
 
-    FString SubAction = Payload->GetStringField(TEXT("subAction"));
+    FString SubAction = GetJsonStringField(Payload, TEXT("subAction"));
 
     if (SubAction == TEXT("subscribe"))
     {
@@ -115,7 +116,10 @@ bool UMcpAutomationBridgeSubsystem::HandleLogAction(const FString& RequestId, co
             UE_LOG(LogMcpAutomationBridgeSubsystem, Display, TEXT("Log streaming enabled by client request."));
         }
 
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Subscribed to editor logs."));
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("action"), TEXT("subscribe"));
+        Result->SetBoolField(TEXT("subscribed"), true);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Subscribed to editor logs."), Result);
         return true;
     }
     else if (SubAction == TEXT("unsubscribe"))
@@ -127,7 +131,10 @@ bool UMcpAutomationBridgeSubsystem::HandleLogAction(const FString& RequestId, co
             UE_LOG(LogMcpAutomationBridgeSubsystem, Display, TEXT("Log streaming disabled by client request."));
         }
 
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Unsubscribed from editor logs."));
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("action"), TEXT("unsubscribe"));
+        Result->SetBoolField(TEXT("subscribed"), false);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Unsubscribed from editor logs."), Result);
         return true;
     }
 

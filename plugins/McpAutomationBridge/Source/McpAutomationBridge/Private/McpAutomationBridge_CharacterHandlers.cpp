@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 // McpAutomationBridge_CharacterHandlers.cpp
 // Phase 14: Character & Movement System
 // Implements 19 actions for character creation, movement configuration, and advanced movement.
@@ -63,6 +64,21 @@ static void SetBPVarDefaultValue(UBlueprint* Blueprint, FName VarName, const FSt
 static UBlueprint* CreateCharacterBlueprint(const FString& Path, const FString& Name, FString& OutError)
 {
     FString FullPath = Path / Name;
+
+    // Validate path before CreatePackage (prevents crashes from // and path traversal)
+    if (!IsValidAssetPath(FullPath))
+    {
+        OutError = FString::Printf(TEXT("Invalid asset path: '%s'. Path must start with '/', cannot contain '..' or '//'."), *FullPath);
+        return nullptr;
+    }
+
+    // Check if asset already exists to prevent assertion failures
+    if (UEditorAssetLibrary::DoesAssetExist(FullPath))
+    {
+        OutError = FString::Printf(TEXT("Asset already exists at path: %s"), *FullPath);
+        return nullptr;
+    }
+
     UPackage* Package = CreatePackage(*FullPath);
     if (!Package)
     {
@@ -110,8 +126,9 @@ static FRotator GetRotatorFromJsonChar(const TSharedPtr<FJsonObject>& Obj)
     );
 }
 
-// Helper to add a Blueprint variable with proper category
-static bool AddBlueprintVariable(UBlueprint* Blueprint, const FString& VarName, const FEdGraphPinType& PinType, const FString& Category = TEXT(""))
+namespace {
+// Helper to add a Blueprint variable with proper category (suffixed to avoid Unity build collision)
+static bool AddBlueprintVariableChar(UBlueprint* Blueprint, const FString& VarName, const FEdGraphPinType& PinType, const FString& Category = TEXT(""))
 {
     if (!Blueprint) return false;
     
@@ -124,6 +141,7 @@ static bool AddBlueprintVariable(UBlueprint* Blueprint, const FString& VarName, 
     
     return bSuccess;
 }
+} // namespace
 #endif
 
 bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
@@ -209,6 +227,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetStringField(TEXT("blueprintPath"), Path / Name);
         Result->SetStringField(TEXT("name"), Name);
         Result->SetStringField(TEXT("parentClass"), TEXT("Character"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Character blueprint created"), Result);
         return true;
     }
@@ -250,6 +269,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
         Result->SetNumberField(TEXT("capsuleRadius"), CapsuleRadius);
         Result->SetNumberField(TEXT("capsuleHalfHeight"), CapsuleHalfHeight);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Capsule configured"), Result);
         return true;
     }
@@ -321,6 +341,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
         if (!SkeletalMeshPath.IsEmpty()) Result->SetStringField(TEXT("skeletalMesh"), SkeletalMeshPath);
         if (!AnimBPPath.IsEmpty()) Result->SetStringField(TEXT("animBlueprint"), AnimBPPath);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Mesh configured"), Result);
         return true;
     }
@@ -406,6 +427,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetNumberField(TEXT("springArmLength"), SpringArmLength);
         Result->SetBoolField(TEXT("usePawnControlRotation"), UsePawnControlRotation);
         Result->SetBoolField(TEXT("lagEnabled"), LagEnabled);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Camera configured"), Result);
         return true;
     }
@@ -461,6 +483,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
 
         TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
         Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Movement speeds configured"), Result);
         return true;
     }
@@ -508,6 +531,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
 
         TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
         Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Jump configured"), Result);
         return true;
     }
@@ -553,6 +577,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
 
         TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
         Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Rotation configured"), Result);
         return true;
     }
@@ -582,20 +607,20 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         FString StateVarName = FString::Printf(TEXT("bIsIn%sMode"), *ModeName);
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, StateVarName, BoolPinType, TEXT("Movement States"));
+        AddBlueprintVariableChar(Blueprint, StateVarName, BoolPinType, TEXT("Movement States"));
 
         // Add custom mode ID variable
         FString ModeIdVarName = FString::Printf(TEXT("CustomModeId_%s"), *ModeName);
         FEdGraphPinType IntPinType;
         IntPinType.PinCategory = UEdGraphSchema_K2::PC_Int;
-        AddBlueprintVariable(Blueprint, ModeIdVarName, IntPinType, TEXT("Movement States"));
+        AddBlueprintVariableChar(Blueprint, ModeIdVarName, IntPinType, TEXT("Movement States"));
 
         // Add custom speed variable for this mode
         FString SpeedVarName = FString::Printf(TEXT("%sSpeed"), *ModeName);
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, SpeedVarName, FloatPinType, TEXT("Movement States"));
+        AddBlueprintVariableChar(Blueprint, SpeedVarName, FloatPinType, TEXT("Movement States"));
 
         // Set default values for the variables
         SetBPVarDefaultValue(Blueprint, FName(*ModeIdVarName), FString::FromInt(ModeId));
@@ -621,6 +646,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetStringField(TEXT("stateVariable"), StateVarName);
         Result->SetStringField(TEXT("speedVariable"), SpeedVarName);
         Result->SetNumberField(TEXT("customSpeed"), CustomSpeed);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Custom movement mode added with state tracking variables"), Result);
         return true;
     }
@@ -662,6 +688,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
 
         TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
         Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Nav movement configured"), Result);
         return true;
     }
@@ -694,14 +721,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add mantling state and configuration variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bIsMantling"), BoolPinType, TEXT("Mantling"));
-        AddBlueprintVariable(Blueprint, TEXT("bCanMantle"), BoolPinType, TEXT("Mantling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsMantling"), BoolPinType, TEXT("Mantling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bCanMantle"), BoolPinType, TEXT("Mantling"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("MantleHeight"), FloatPinType, TEXT("Mantling"));
-        AddBlueprintVariable(Blueprint, TEXT("MantleReachDistance"), FloatPinType, TEXT("Mantling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("MantleHeight"), FloatPinType, TEXT("Mantling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("MantleReachDistance"), FloatPinType, TEXT("Mantling"));
 
         // Set default values for mantling configuration
         SetBPVarDefaultValue(Blueprint, FName(TEXT("bCanMantle")), TEXT("true"));
@@ -712,7 +739,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         FEdGraphPinType VectorPinType;
         VectorPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
         VectorPinType.PinSubCategoryObject = TBaseStructure<FVector>::Get();
-        AddBlueprintVariable(Blueprint, TEXT("MantleTargetLocation"), VectorPinType, TEXT("Mantling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("MantleTargetLocation"), VectorPinType, TEXT("Mantling"));
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
@@ -723,6 +750,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         if (!MantleAnim.IsEmpty()) Result->SetStringField(TEXT("mantleAnimation"), MantleAnim);
         Result->SetStringField(TEXT("stateVariable"), TEXT("bIsMantling"));
         Result->SetStringField(TEXT("targetVariable"), TEXT("MantleTargetLocation"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Mantling system configured with state variables"), Result);
         return true;
     }
@@ -751,14 +779,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add vaulting state and configuration variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bIsVaulting"), BoolPinType, TEXT("Vaulting"));
-        AddBlueprintVariable(Blueprint, TEXT("bCanVault"), BoolPinType, TEXT("Vaulting"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsVaulting"), BoolPinType, TEXT("Vaulting"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bCanVault"), BoolPinType, TEXT("Vaulting"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("VaultHeight"), FloatPinType, TEXT("Vaulting"));
-        AddBlueprintVariable(Blueprint, TEXT("VaultDepth"), FloatPinType, TEXT("Vaulting"));
+        AddBlueprintVariableChar(Blueprint, TEXT("VaultHeight"), FloatPinType, TEXT("Vaulting"));
+        AddBlueprintVariableChar(Blueprint, TEXT("VaultDepth"), FloatPinType, TEXT("Vaulting"));
 
         // Set default values for vaulting configuration
         SetBPVarDefaultValue(Blueprint, FName(TEXT("bCanVault")), TEXT("true"));
@@ -769,8 +797,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         FEdGraphPinType VectorPinType;
         VectorPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
         VectorPinType.PinSubCategoryObject = TBaseStructure<FVector>::Get();
-        AddBlueprintVariable(Blueprint, TEXT("VaultStartLocation"), VectorPinType, TEXT("Vaulting"));
-        AddBlueprintVariable(Blueprint, TEXT("VaultEndLocation"), VectorPinType, TEXT("Vaulting"));
+        AddBlueprintVariableChar(Blueprint, TEXT("VaultStartLocation"), VectorPinType, TEXT("Vaulting"));
+        AddBlueprintVariableChar(Blueprint, TEXT("VaultEndLocation"), VectorPinType, TEXT("Vaulting"));
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
@@ -780,6 +808,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetNumberField(TEXT("vaultDepth"), VaultDepth);
         if (!VaultAnim.IsEmpty()) Result->SetStringField(TEXT("vaultAnimation"), VaultAnim);
         Result->SetStringField(TEXT("stateVariable"), TEXT("bIsVaulting"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Vaulting system configured with state variables"), Result);
         return true;
     }
@@ -808,23 +837,23 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add climbing state and configuration variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bIsClimbing"), BoolPinType, TEXT("Climbing"));
-        AddBlueprintVariable(Blueprint, TEXT("bCanClimb"), BoolPinType, TEXT("Climbing"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsClimbing"), BoolPinType, TEXT("Climbing"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bCanClimb"), BoolPinType, TEXT("Climbing"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("ClimbSpeed"), FloatPinType, TEXT("Climbing"));
+        AddBlueprintVariableChar(Blueprint, TEXT("ClimbSpeed"), FloatPinType, TEXT("Climbing"));
 
         FEdGraphPinType NamePinType;
         NamePinType.PinCategory = UEdGraphSchema_K2::PC_Name;
-        AddBlueprintVariable(Blueprint, TEXT("ClimbableTag"), NamePinType, TEXT("Climbing"));
+        AddBlueprintVariableChar(Blueprint, TEXT("ClimbableTag"), NamePinType, TEXT("Climbing"));
 
         // Add climb surface normal for proper orientation
         FEdGraphPinType VectorPinType;
         VectorPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
         VectorPinType.PinSubCategoryObject = TBaseStructure<FVector>::Get();
-        AddBlueprintVariable(Blueprint, TEXT("ClimbSurfaceNormal"), VectorPinType, TEXT("Climbing"));
+        AddBlueprintVariableChar(Blueprint, TEXT("ClimbSurfaceNormal"), VectorPinType, TEXT("Climbing"));
 
         // Set default values for climbing configuration
         SetBPVarDefaultValue(Blueprint, FName(TEXT("bCanClimb")), TEXT("true"));
@@ -850,6 +879,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetStringField(TEXT("climbableTag"), ClimbableTag);
         if (!ClimbAnim.IsEmpty()) Result->SetStringField(TEXT("climbAnimation"), ClimbAnim);
         Result->SetStringField(TEXT("stateVariable"), TEXT("bIsClimbing"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Climbing system configured with state variables"), Result);
         return true;
     }
@@ -879,17 +909,17 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add sliding state and configuration variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bIsSliding"), BoolPinType, TEXT("Sliding"));
-        AddBlueprintVariable(Blueprint, TEXT("bCanSlide"), BoolPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsSliding"), BoolPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bCanSlide"), BoolPinType, TEXT("Sliding"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("SlideSpeed"), FloatPinType, TEXT("Sliding"));
-        AddBlueprintVariable(Blueprint, TEXT("SlideDuration"), FloatPinType, TEXT("Sliding"));
-        AddBlueprintVariable(Blueprint, TEXT("SlideCooldown"), FloatPinType, TEXT("Sliding"));
-        AddBlueprintVariable(Blueprint, TEXT("SlideTimeRemaining"), FloatPinType, TEXT("Sliding"));
-        AddBlueprintVariable(Blueprint, TEXT("SlideCooldownRemaining"), FloatPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("SlideSpeed"), FloatPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("SlideDuration"), FloatPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("SlideCooldown"), FloatPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("SlideTimeRemaining"), FloatPinType, TEXT("Sliding"));
+        AddBlueprintVariableChar(Blueprint, TEXT("SlideCooldownRemaining"), FloatPinType, TEXT("Sliding"));
 
         // Set default values for sliding configuration
         SetBPVarDefaultValue(Blueprint, FName(TEXT("bCanSlide")), TEXT("true"));
@@ -906,6 +936,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetNumberField(TEXT("slideCooldown"), SlideCooldown);
         if (!SlideAnim.IsEmpty()) Result->SetStringField(TEXT("slideAnimation"), SlideAnim);
         Result->SetStringField(TEXT("stateVariable"), TEXT("bIsSliding"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Sliding system configured with state and timing variables"), Result);
         return true;
     }
@@ -935,23 +966,23 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add wall running state and configuration variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bIsWallRunning"), BoolPinType, TEXT("Wall Running"));
-        AddBlueprintVariable(Blueprint, TEXT("bIsWallRunningLeft"), BoolPinType, TEXT("Wall Running"));
-        AddBlueprintVariable(Blueprint, TEXT("bIsWallRunningRight"), BoolPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsWallRunning"), BoolPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsWallRunningLeft"), BoolPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsWallRunningRight"), BoolPinType, TEXT("Wall Running"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("WallRunSpeed"), FloatPinType, TEXT("Wall Running"));
-        AddBlueprintVariable(Blueprint, TEXT("WallRunDuration"), FloatPinType, TEXT("Wall Running"));
-        AddBlueprintVariable(Blueprint, TEXT("WallRunGravityScale"), FloatPinType, TEXT("Wall Running"));
-        AddBlueprintVariable(Blueprint, TEXT("WallRunTimeRemaining"), FloatPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("WallRunSpeed"), FloatPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("WallRunDuration"), FloatPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("WallRunGravityScale"), FloatPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("WallRunTimeRemaining"), FloatPinType, TEXT("Wall Running"));
 
         // Add wall normal for orientation
         FEdGraphPinType VectorPinType;
         VectorPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
         VectorPinType.PinSubCategoryObject = TBaseStructure<FVector>::Get();
-        AddBlueprintVariable(Blueprint, TEXT("WallRunNormal"), VectorPinType, TEXT("Wall Running"));
+        AddBlueprintVariableChar(Blueprint, TEXT("WallRunNormal"), VectorPinType, TEXT("Wall Running"));
 
         // Configure CMC for custom movement mode
         ACharacter* CharCDO = Blueprint->GeneratedClass 
@@ -973,6 +1004,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetNumberField(TEXT("wallRunGravityScale"), WallRunGravity);
         if (!WallRunAnim.IsEmpty()) Result->SetStringField(TEXT("wallRunAnimation"), WallRunAnim);
         Result->SetStringField(TEXT("stateVariable"), TEXT("bIsWallRunning"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Wall running system configured with state variables"), Result);
         return true;
     }
@@ -1002,24 +1034,24 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add grappling state and configuration variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bIsGrappling"), BoolPinType, TEXT("Grappling"));
-        AddBlueprintVariable(Blueprint, TEXT("bHasGrappleTarget"), BoolPinType, TEXT("Grappling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsGrappling"), BoolPinType, TEXT("Grappling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bHasGrappleTarget"), BoolPinType, TEXT("Grappling"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("GrappleRange"), FloatPinType, TEXT("Grappling"));
-        AddBlueprintVariable(Blueprint, TEXT("GrappleSpeed"), FloatPinType, TEXT("Grappling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("GrappleRange"), FloatPinType, TEXT("Grappling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("GrappleSpeed"), FloatPinType, TEXT("Grappling"));
 
         FEdGraphPinType NamePinType;
         NamePinType.PinCategory = UEdGraphSchema_K2::PC_Name;
-        AddBlueprintVariable(Blueprint, TEXT("GrappleTargetTag"), NamePinType, TEXT("Grappling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("GrappleTargetTag"), NamePinType, TEXT("Grappling"));
 
         // Add grapple target location
         FEdGraphPinType VectorPinType;
         VectorPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
         VectorPinType.PinSubCategoryObject = TBaseStructure<FVector>::Get();
-        AddBlueprintVariable(Blueprint, TEXT("GrappleTargetLocation"), VectorPinType, TEXT("Grappling"));
+        AddBlueprintVariableChar(Blueprint, TEXT("GrappleTargetLocation"), VectorPinType, TEXT("Grappling"));
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
@@ -1030,6 +1062,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         Result->SetStringField(TEXT("grappleTargetTag"), GrappleTarget);
         if (!GrappleCable.IsEmpty()) Result->SetStringField(TEXT("grappleCable"), GrappleCable);
         Result->SetStringField(TEXT("stateVariable"), TEXT("bIsGrappling"));
+        AddAssetVerification(Result, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Grappling system configured with state variables"), Result);
         return true;
     }
@@ -1063,17 +1096,17 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         // Add footstep system variables
         FEdGraphPinType BoolPinType;
         BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
-        AddBlueprintVariable(Blueprint, TEXT("bFootstepSystemEnabled"), BoolPinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("bFootstepSystemEnabled"), BoolPinType, TEXT("Footsteps"));
 
         FEdGraphPinType NamePinType;
         NamePinType.PinCategory = UEdGraphSchema_K2::PC_Name;
-        AddBlueprintVariable(Blueprint, TEXT("FootstepSocketLeft"), NamePinType, TEXT("Footsteps"));
-        AddBlueprintVariable(Blueprint, TEXT("FootstepSocketRight"), NamePinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("FootstepSocketLeft"), NamePinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("FootstepSocketRight"), NamePinType, TEXT("Footsteps"));
 
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("FootstepTraceDistance"), FloatPinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("FootstepTraceDistance"), FloatPinType, TEXT("Footsteps"));
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
@@ -1115,7 +1148,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         MapPinType.PinCategory = UEdGraphSchema_K2::PC_Name;
         MapPinType.ContainerType = EPinContainerType::Map;
         MapPinType.PinValueType.TerminalCategory = UEdGraphSchema_K2::PC_SoftObject;
-        AddBlueprintVariable(Blueprint, TEXT("FootstepSoundMap"), MapPinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("FootstepSoundMap"), MapPinType, TEXT("Footsteps"));
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
@@ -1154,8 +1187,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         FEdGraphPinType FloatPinType;
         FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
         FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
-        AddBlueprintVariable(Blueprint, TEXT("FootstepVolumeMultiplier"), FloatPinType, TEXT("Footsteps"));
-        AddBlueprintVariable(Blueprint, TEXT("FootstepParticleScale"), FloatPinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("FootstepVolumeMultiplier"), FloatPinType, TEXT("Footsteps"));
+        AddBlueprintVariableChar(Blueprint, TEXT("FootstepParticleScale"), FloatPinType, TEXT("Footsteps"));
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
@@ -1253,6 +1286,328 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
         return true;
     }
 
+    // ============================================================
+    // ALIASES & NEW SUB-ACTIONS
+    // ============================================================
+
+    // setup_movement -> alias for configure_movement_speeds
+    if (SubAction == TEXT("setup_movement"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            UCharacterMovementComponent* Movement = CharCDO->GetCharacterMovement();
+            if (Payload->HasField(TEXT("walkSpeed")))
+                Movement->MaxWalkSpeed = static_cast<float>(GetNumberFieldChar(Payload, TEXT("walkSpeed"), 600.0));
+            if (Payload->HasField(TEXT("runSpeed")))
+                Movement->MaxWalkSpeed = static_cast<float>(GetNumberFieldChar(Payload, TEXT("runSpeed"), 600.0));
+            if (Payload->HasField(TEXT("acceleration")))
+                Movement->MaxAcceleration = static_cast<float>(GetNumberFieldChar(Payload, TEXT("acceleration"), 2048.0));
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Movement configured"), Result);
+        return true;
+    }
+
+    // set_walk_speed
+    if (SubAction == TEXT("set_walk_speed"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double WalkSpeed = GetNumberFieldChar(Payload, TEXT("walkSpeed"), 600.0);
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            CharCDO->GetCharacterMovement()->MaxWalkSpeed = static_cast<float>(WalkSpeed);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("walkSpeed"), WalkSpeed);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Walk speed set"), Result);
+        return true;
+    }
+
+    // set_jump_height
+    if (SubAction == TEXT("set_jump_height"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double JumpHeight = GetNumberFieldChar(Payload, TEXT("jumpHeight"), 600.0);
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            CharCDO->GetCharacterMovement()->JumpZVelocity = static_cast<float>(JumpHeight);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("jumpHeight"), JumpHeight);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Jump height set"), Result);
+        return true;
+    }
+
+    // set_gravity_scale
+    if (SubAction == TEXT("set_gravity_scale"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double GravityScale = GetNumberFieldChar(Payload, TEXT("gravityScale"), 1.0);
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            CharCDO->GetCharacterMovement()->GravityScale = static_cast<float>(GravityScale);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("gravityScale"), GravityScale);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Gravity scale set"), Result);
+        return true;
+    }
+
+    // set_ground_friction
+    if (SubAction == TEXT("set_ground_friction"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double GroundFriction = GetNumberFieldChar(Payload, TEXT("groundFriction"), 8.0);
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            CharCDO->GetCharacterMovement()->GroundFriction = static_cast<float>(GroundFriction);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("groundFriction"), GroundFriction);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Ground friction set"), Result);
+        return true;
+    }
+
+    // set_braking_deceleration
+    if (SubAction == TEXT("set_braking_deceleration"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double Deceleration = GetNumberFieldChar(Payload, TEXT("brakingDeceleration"), 2048.0);
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            CharCDO->GetCharacterMovement()->BrakingDecelerationWalking = static_cast<float>(Deceleration);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("brakingDeceleration"), Deceleration);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Braking deceleration set"), Result);
+        return true;
+    }
+
+    // configure_crouch
+    if (SubAction == TEXT("configure_crouch"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double CrouchSpeed = GetNumberFieldChar(Payload, TEXT("crouchSpeed"), 300.0);
+        double CrouchedHalfHeight = GetNumberFieldChar(Payload, TEXT("crouchedHalfHeight"), 44.0);
+        bool CanCrouch = GetBoolFieldChar(Payload, TEXT("canCrouch"), true);
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            UCharacterMovementComponent* Movement = CharCDO->GetCharacterMovement();
+            Movement->MaxWalkSpeedCrouched = static_cast<float>(CrouchSpeed);
+            Movement->SetCrouchedHalfHeight(static_cast<float>(CrouchedHalfHeight));
+            Movement->NavAgentProps.bCanCrouch = CanCrouch;
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("crouchSpeed"), CrouchSpeed);
+        Result->SetNumberField(TEXT("crouchedHalfHeight"), CrouchedHalfHeight);
+        Result->SetBoolField(TEXT("canCrouch"), CanCrouch);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Crouch configured"), Result);
+        return true;
+    }
+
+    // configure_sprint
+    if (SubAction == TEXT("configure_sprint"))
+    {
+        if (BlueprintPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, TEXT("Missing blueprintPath."), TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            SendAutomationError(RequestingSocket, RequestId,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), TEXT("NOT_FOUND"));
+            return true;
+        }
+
+        double SprintSpeed = GetNumberFieldChar(Payload, TEXT("sprintSpeed"), 900.0);
+
+        // Add sprint state variables
+        FEdGraphPinType BoolPinType;
+        BoolPinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+        AddBlueprintVariableChar(Blueprint, TEXT("bIsSprinting"), BoolPinType, TEXT("Sprint"));
+
+        FEdGraphPinType FloatPinType;
+        FloatPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+        FloatPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+        AddBlueprintVariableChar(Blueprint, TEXT("SprintSpeed"), FloatPinType, TEXT("Sprint"));
+
+        ACharacter* CharCDO = Blueprint->GeneratedClass
+            ? Cast<ACharacter>(Blueprint->GeneratedClass->GetDefaultObject())
+            : nullptr;
+
+        if (CharCDO && CharCDO->GetCharacterMovement())
+        {
+            // Sprint speed is stored as a variable; base MaxWalkSpeed stays unchanged
+            CharCDO->GetCharacterMovement()->MaxCustomMovementSpeed = static_cast<float>(SprintSpeed);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
+        Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        Result->SetNumberField(TEXT("sprintSpeed"), SprintSpeed);
+        Result->SetStringField(TEXT("stateVariable"), TEXT("bIsSprinting"));
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Sprint configured with state variables"), Result);
+        return true;
+    }
+
     // Unknown subAction
     SendAutomationError(RequestingSocket, RequestId, 
         FString::Printf(TEXT("Unknown character subAction: %s"), *SubAction), TEXT("UNKNOWN_SUBACTION"));
@@ -1260,3 +1615,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageCharacterAction(
 
 #endif // WITH_EDITOR
 }
+
+#undef GetStringFieldChar
+#undef GetNumberFieldChar
+#undef GetBoolFieldChar
+

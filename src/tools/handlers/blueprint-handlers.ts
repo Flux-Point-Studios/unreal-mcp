@@ -11,9 +11,46 @@ interface BlueprintResponse {
   [key: string]: unknown;
 }
 
+/**
+ * Normalize blueprint path by converting backslashes to forward slashes.
+ * This ensures consistent path handling across all blueprint operations.
+ */
+function normalizeBlueprintPath(path: string | undefined): string | undefined {
+  if (!path || typeof path !== 'string') return path;
+  // Convert backslashes to forward slashes
+  let normalized = path.replace(/\\/g, '/');
+  // Collapse double slashes
+  while (normalized.includes('//')) {
+    normalized = normalized.replace(/\/\//g, '/');
+  }
+  return normalized;
+}
+
+function hasBlueprintPathTraversal(path: string | undefined): boolean {
+  if (!path) return false;
+  return path.split('/').some((segment) => segment === '..');
+}
+
 export async function handleBlueprintTools(action: string, args: HandlerArgs, tools: ITools): Promise<Record<string, unknown>> {
   const argsTyped = args as BlueprintArgs;
   const argsRecord = args as Record<string, unknown>;
+  
+  // Normalize any blueprintPath in the arguments
+  if (argsTyped.blueprintPath) {
+    argsTyped.blueprintPath = normalizeBlueprintPath(argsTyped.blueprintPath);
+  }
+  if (argsRecord.path) {
+    argsRecord.path = normalizeBlueprintPath(argsRecord.path as string);
+  }
+
+  const isUnsafePath = (value: unknown): boolean => typeof value === 'string' && hasBlueprintPathTraversal(value);
+  if (isUnsafePath(argsTyped.blueprintPath) || isUnsafePath(argsRecord.path)) {
+    return cleanObject({
+      success: false,
+      error: 'INVALID_BLUEPRINT_PATH',
+      message: 'Blueprint path blocked for security: traversal segments detected'
+    }) as Record<string, unknown>;
+  }
   
   switch (action) {
     case 'create': {
@@ -23,24 +60,27 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
       const pathArg = (argsRecord.path as string | undefined) || argsTyped.blueprintPath;
 
       if (pathArg) {
-        const parts = pathArg.split('/');
-        const extractName = parts.pop(); // The last part is the name
-
-        // If name wasn't provided, use the extracted name
-        if (!name) {
-          name = extractName;
-        }
-
-        // If savePath wasn't provided, use the extracted path
-        if (!savePath) {
+        // If name is provided, treat path as the savePath directly
+        // If name is NOT provided, parse path to extract name and savePath
+        if (name) {
+          // Name provided: use path as savePath
+          savePath = pathArg;
+        } else {
+          // Name not provided: extract name from path
+          const parts = pathArg.split('/');
+          name = parts.pop(); // The last part is the name
           savePath = parts.join('/');
         }
       }
 
       if (!savePath) savePath = '/Game';
 
+      if (!name || (typeof name !== 'string') || name.trim() === '') {
+        throw new Error('Missing or invalid required parameter: name (must be a non-empty string for create action)');
+      }
+
       const res = await tools.blueprintTools.createBlueprint({
-        name: name ?? 'NewBlueprint',
+        name: name,
         blueprintType: argsTyped.blueprintType,
         savePath: savePath,
         parentClass: argsRecord.parentClass as string | undefined,
@@ -52,7 +92,11 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
       return cleanObject(res) as Record<string, unknown>;
     }
     case 'ensure_exists': {
-      const res = await tools.blueprintTools.waitForBlueprint(argsTyped.name || argsTyped.blueprintPath || (argsRecord.path as string) || '', argsRecord.timeoutMs as number | undefined);
+      const target = argsTyped.name || argsTyped.blueprintPath || (argsRecord.path as string) || '';
+      const res = await tools.blueprintTools.waitForBlueprint(target, {
+        timeoutMs: argsRecord.timeoutMs as number | undefined,
+        shouldExist: argsTyped.shouldExist !== false
+      });
       return cleanObject(res) as Record<string, unknown>;
     }
     case 'add_variable': {
@@ -259,6 +303,7 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
       };
 
       const resolvedNodeType = (argsTyped.nodeType && nodeAliases[argsTyped.nodeType]) || argsTyped.nodeType || 'K2Node_CallFunction';
+      const resolvedMemberClass = (argsRecord.memberClass as string | undefined) || (argsRecord.nodeClass as string | undefined);
 
       // Validation for Event nodes
       if ((resolvedNodeType === 'K2Node_Event' || resolvedNodeType === 'K2Node_CustomEvent') && !(argsRecord.eventName as string | undefined) && !(argsRecord.customEventName as string | undefined) && !argsTyped.name) {
@@ -278,7 +323,7 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
         variableName: argsTyped.variableName,
         nodeName: argsRecord.nodeName as string | undefined,
         eventName: (argsRecord.eventName as string | undefined) || (argsRecord.customEventName as string | undefined),
-        memberClass: argsRecord.memberClass as string | undefined,
+        memberClass: resolvedMemberClass,
         posX: argsRecord.posX as number | undefined,
         posY: argsRecord.posY as number | undefined,
         timeoutMs: argsRecord.timeoutMs as number | undefined
@@ -331,10 +376,12 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
       return cleanObject(res) as Record<string, unknown>;
     }
     case 'set_default': {
+      // Accept 'propertyValue' as alias for 'value' (common caller convention)
+      const resolvedValue = argsTyped.value !== undefined ? argsTyped.value : argsRecord.propertyValue;
       const res = await tools.blueprintTools.setBlueprintDefault({
         blueprintName: argsTyped.name || argsTyped.blueprintPath || (argsRecord.path as string) || '',
         propertyName: argsTyped.propertyName ?? '',
-        value: argsTyped.value
+        value: resolvedValue
       });
       return cleanObject(res) as Record<string, unknown>;
     }
@@ -365,11 +412,18 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
     case 'set_node_property':
     case 'get_node_details':
     case 'get_pin_details':
-    case 'get_graph_details': {
+    case 'get_graph_details':
+    case 'create_node':
+    case 'list_node_types':
+    case 'set_pin_default_value': {
+      // Normalize blueprintPath to assetPath for C++ handler compatibility
+      const blueprintPath = argsTyped.blueprintPath || (argsRecord.path as string | undefined) || argsTyped.name;
       const processedArgs = {
         ...args,
         subAction: action,
-        blueprintPath: argsTyped.blueprintPath || (argsRecord.path as string | undefined) || argsTyped.name
+        // Ensure both blueprintPath and assetPath are set for C++ compatibility
+        blueprintPath,
+        assetPath: argsRecord.assetPath || blueprintPath
       };
       const res = await executeAutomationRequest(tools, 'manage_blueprint_graph', processedArgs, 'Automation bridge not available for blueprint graph operations');
       return cleanObject(res) as Record<string, unknown>;
@@ -391,13 +445,18 @@ export async function handleBlueprintGet(args: HandlerArgs, tools: ITools): Prom
   const argsTyped = args as BlueprintArgs;
   const argsRecord = args as Record<string, unknown>;
   
-  const res = await executeAutomationRequest(tools, 'blueprint_get', args, 'Automation bridge not available for blueprint operations') as { success?: boolean; message?: string } | null;
+  const res = await executeAutomationRequest(tools, 'blueprint_get', args, 'Automation bridge not available for blueprint operations') as { success?: boolean; message?: string; [key: string]: unknown } | null;
   if (res && res.success) {
     const blueprintPath = argsTyped.blueprintPath || (argsRecord.path as string | undefined) || argsTyped.name;
+    // Extract blueprint data from response and wrap in 'blueprint' property for schema compliance
+    const { success, message, error, blueprintPath: _, ...blueprintData } = res;
     return cleanObject({
-      ...res,
+      success,
+      message: message || 'Blueprint fetched',
+      error,
       blueprintPath: typeof blueprintPath === 'string' ? blueprintPath : undefined,
-      message: res.message || 'Blueprint fetched'
+      // Include blueprint object for schema compliance - contains all blueprint-specific data
+      blueprint: Object.keys(blueprintData).length > 0 ? blueprintData : { path: blueprintPath }
     }) as Record<string, unknown>;
   }
   return cleanObject(res) as Record<string, unknown>;

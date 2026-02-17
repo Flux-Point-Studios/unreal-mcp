@@ -213,6 +213,7 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         });
         return ResponseFactory.success(res, 'Asset imported successfully');
       }
+      case 'duplicate_asset':
       case 'duplicate': {
         const params = normalizeArgs(args, [
           { key: 'sourcePath', aliases: ['assetPath'], required: true },
@@ -246,6 +247,7 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         });
         return ResponseFactory.success(res, 'Asset duplicated successfully');
       }
+      case 'rename_asset':
       case 'rename': {
         const params = normalizeArgs(args, [
           { key: 'sourcePath', aliases: ['assetPath'], required: true },
@@ -284,6 +286,7 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         }
         return cleanObject(res);
       }
+      case 'move_asset':
       case 'move': {
         const params = normalizeArgs(args, [
           { key: 'sourcePath', aliases: ['assetPath'], required: true },
@@ -316,12 +319,15 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         ]);
 
         let paths: string[] = [];
+        const argsTyped = args as AssetArgs;
 
-        // Handle array input (support both assetPaths and paths)
+        // Handle array input (support both camelCase and snake_case)
         if (Array.isArray(params.assetPaths)) {
           paths = params.assetPaths.map((p: unknown) => String(p).trim()).filter((p: string) => p.length > 0);
         } else if (Array.isArray(params.paths)) {
           paths = params.paths.map((p: unknown) => String(p).trim()).filter((p: string) => p.length > 0);
+        } else if (Array.isArray(argsTyped.asset_paths)) {
+          paths = (argsTyped.asset_paths as string[]).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
         }
 
         // Handle single path (support both assetPath and path)
@@ -335,7 +341,9 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         paths = [...new Set(paths)].filter(p => p.length > 0);
 
         if (paths.length === 0) {
-          return ResponseFactory.error('No valid asset paths provided', 'INVALID_ARGUMENT');
+          // Return graceful error response instead of throwing
+          // This handles cleanup scenarios where paths may be empty
+          return ResponseFactory.error('No paths provided for delete action. Provide assetPath (string) or assetPaths (array).', 'INVALID_ARGUMENT');
         }
 
         // Normalize paths: strip object sub-path suffix (e.g., /Game/Folder/Asset.Asset -> /Game/Folder/Asset)
@@ -967,11 +975,13 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         const message = typeof result.message === 'string' ? result.message : '';
         const argsTyped = args as AssetArgs;
 
-        if (errorCode === 'INVALID_SUBACTION' || message.toLowerCase().includes('unknown subaction')) {
+        // Check for unknown/invalid action errors from C++ (UNKNOWN_ACTION or INVALID_SUBACTION)
+        if (errorCode === 'UNKNOWN_ACTION' || errorCode === 'INVALID_SUBACTION' ||
+            message.toLowerCase().includes('unknown action') || message.toLowerCase().includes('unknown subaction')) {
           return cleanObject({
             success: false,
-            error: 'INVALID_SUBACTION',
-            message: 'Asset action not recognized by the automation plugin.',
+            error: 'UNKNOWN_ACTION',
+            message: `Unknown asset action: ${action}`,
             action: action || 'manage_asset',
             assetPath: argsTyped.assetPath ?? argsTyped.path
           });

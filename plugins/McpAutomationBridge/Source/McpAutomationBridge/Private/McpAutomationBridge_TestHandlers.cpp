@@ -1,4 +1,5 @@
 #include "McpAutomationBridgeSubsystem.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "Misc/AutomationTest.h"
@@ -16,7 +17,7 @@ bool UMcpAutomationBridgeSubsystem::HandleTestAction(const FString& RequestId, c
         return true;
     }
 
-    FString SubAction = Payload->GetStringField(TEXT("subAction"));
+    FString SubAction = GetJsonStringField(Payload, TEXT("subAction"));
 
     if (SubAction == TEXT("run_tests"))
     {
@@ -29,7 +30,11 @@ bool UMcpAutomationBridgeSubsystem::HandleTestAction(const FString& RequestId, c
         // For this bridge, we'll just start it.
         
         FAutomationTestFramework::Get().StartTestByName(Filter, 0);
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Tests started. Check logs for results."));
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("action"), TEXT("run_tests"));
+        Result->SetStringField(TEXT("filter"), Filter);
+        Result->SetBoolField(TEXT("started"), true);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Tests started. Check logs for results."), Result);
         return true;
     }
 

@@ -7,6 +7,796 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## 🏷️ [0.5.17] - 2026-02-16
+
+> [!IMPORTANT]
+> ### 🔧 World Tools Category Fixes & Security Hardening
+> This release includes critical bug fixes, security hardening, and UE 5.7 compatibility improvements across all world-building tools (landscape, foliage, geometry, volumes, navigation).
+
+### 🛡️ Security
+
+<details>
+<summary><b>🔒 Path Validation & Input Sanitization</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/207">#207</a>)</summary>
+
+| Component | Change |
+|-----------|--------|
+| **SanitizeProjectRelativePath** | Rejects Windows absolute paths, normalizes slashes, collapses `//`, requires valid UE roots (`/Game`, `/Engine`, `/Script`) |
+| **SanitizeProjectFilePath** | File operations with path traversal protection |
+| **ValidateAssetCreationPath** | Combines folder + name validation for asset creation |
+| **Actor/Volume Name Validation** | Blocks invalid characters, enforces length checks |
+| **Snapshot Path Validation** | Prevents directory traversal attacks via snapshot paths |
+
+**Files Modified:**
+- `McpAutomationBridgeHelpers.h` (+326 lines of security helpers)
+- `src/tools/environment.ts` (snapshot path security)
+- `src/utils/path-security.ts` (path normalization)
+
+</details>
+
+### 🛠️ Fixed
+
+<details>
+<summary><b>🐛 Landscape Handler Silent Fallback Bug</b> (McpAutomationBridge_LandscapeHandlers.cpp)</summary>
+
+| Bug | Root Cause | Fix |
+|-----|------------|-----|
+| False positives on non-existent landscapes | Path matching compared `GetPathName()` (internal path) with asset path | Normalized both paths with `.uasset` stripping |
+| Silent fallback to single landscape | `if (!Landscape && LandscapeCount == 1)` used any available landscape | Removed fallback, now returns `LANDSCAPE_NOT_FOUND` error |
+| Wrong response path | Returned requested path instead of actual path | Now returns `Landscape->GetPackage()->GetPathName()` |
+
+**Affected Handlers:** `HandleModifyHeightmap`, `HandlePaintLandscapeLayer`, `HandleSculptLandscape`, `HandleSetLandscapeMaterial`
+
+</details>
+
+<details>
+<summary><b>🐛 Rotation Yaw Bug</b> (McpAutomationBridge_LightingHandlers.cpp:200)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| `Rotation.Yaw` read from `LocPtr` instead of `RotPtr` | Changed to `GetJsonNumberField((*RotPtr), TEXT("yaw"))` |
+
+**Impact:** Incorrect rotation when spawning lights with rotation parameters.
+
+</details>
+
+<details>
+<summary><b>🐛 Integer Overflow in Heightmap Operations</b> (McpAutomationBridge_LandscapeHandlers.cpp:631-635)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| `static_cast<int16>(CurrentHeights[i])` overflows for values > 32767 | Changed to `static_cast<int32>` |
+
+**Impact:** Heightmap raise/lower operations now produce correct results for heights above midpoint.
+
+</details>
+
+<details>
+<summary><b>🐛 set_curve_key Success Reporting</b> (McpAutomationBridge_AnimationHandlers.cpp:2139)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| `bSuccess` initialized `false`, only set `true` inside `if (bSuccess)` block (unreachable) | Moved success logic before the condition check |
+
+**Impact:** `set_curve_key` now correctly reports success.
+
+</details>
+
+<details>
+<summary><b>🐛 CraftingSpeed Truncation</b> (McpAutomationBridge_InventoryHandlers.cpp:2716)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| `int32 CraftingSpeed` truncated fractional multipliers (1.5 → 1) | Changed to `double` |
+
+</details>
+
+<details>
+<summary><b>🐛 Invalid Color Fallback Not Applied</b> (McpAutomationBridge_LightingHandlers.cpp:277)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| `SetLightColor()` only called when `bColorValid == true`, but `bColorValid = false` for invalid colors | Removed guard, always call `SetLightColor()` after correcting invalid colors to white |
+
+</details>
+
+<details>
+<summary><b>🐛 Double-Validation in Snapshot Path</b> (src/tools/environment.ts:253, 322)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| Redundant second `validateSnapshotPath()` call on already-resolved absolute paths | Removed redundant call |
+
+</details>
+
+<details>
+<summary><b>🐛 Intel GPU Driver Crash Prevention</b> (McpAutomationBridgeHelpers.h)</summary>
+
+| Bug | Fix |
+|-----|-----|
+| `MONZA DdiThreadingContext` exceptions on Intel GPUs during level save | Added `McpSafeLevelSave` helper with `FlushRenderingCommands` and retry logic |
+
+</details>
+
+### ✨ Added
+
+<details>
+<summary><b>🛤️ LOD Generation Enhancements</b> (McpAutomationBridge_GeometryHandlers.cpp)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **landscapePath support** | LOD generation now accepts single `landscapePath` or array `assetPaths` |
+| **lodCount parameter** | Alternative to `numLODs` for specifying LOD count |
+| **Path sanitization** | All LOD operations use `SanitizeProjectRelativePath` |
+
+</details>
+
+<details>
+<summary><b>🌿 FoliageType Auto-Creation</b> (McpAutomationBridge_FoliageHandlers.cpp)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **Auto-create FoliageType** | When painting/adding foliage, FoliageType is automatically created from StaticMesh if missing |
+| **Path validation** | All foliage operations use path sanitization |
+
+</details>
+
+<details>
+<summary><b>🏔️ Landscape Layer Auto-Creation</b> (McpAutomationBridge_LandscapeHandlers.cpp)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **Auto-create layers** | When painting, landscape layers are auto-created if they don't exist (matches UE editor behavior) |
+
+</details>
+
+<details>
+<summary><b>📊 Handler Verification</b> (Multiple Handler Files)</summary>
+
+| Pattern | Description |
+|---------|-------------|
+| **AddActorVerification** | Returns `actorPath`, `actorName`, `actorGuid`, `existsAfter`, `actorClass` |
+| **AddComponentVerification** | Returns `componentName`, `componentClass`, `ownerActorPath` |
+| **AddAssetVerification** | Returns `assetPath`, `assetName`, `existsAfter`, `assetClass` |
+| **VerifyAssetExists** | Verifies asset exists at path |
+
+**Files Updated:** PropertyHandlers, LevelHandlers, EffectHandlers, GASHandlers, SequenceHandlers, SkeletonHandlers, and 30+ additional handler files
+
+</details>
+
+### 🔧 Changed
+
+<details>
+<summary><b>🎮 UE 5.7 Compatibility</b></summary>
+
+| Component | Change |
+|-----------|--------|
+| **WebSocket Protocol** | `GetProtocolType()` (FName) replaces deprecated `GetProtocolFamily()` (enum) |
+| **SCS Save** | `McpSafeAssetSave` replaces `SaveLoadedAssetThrottled` to prevent recursive `FlushRenderingCommands` crashes |
+| **PostProcessVolume** | Conditionally compiled (removed in UE 5.7) |
+| **Niagara Graph** | Initialize `GraphSource`/`NiagaraGraph` to prevent null graph crashes |
+| **Landscape Edit** | `FLandscapeEditDataInterface` for UE 5.5+, deprecation suppression for 5.0-5.4 |
+| **WorldPartition** | Support `RuntimeHashSet` in addition to `RuntimeSpatialHash` for UE 5.7+ |
+
+</details>
+
+<details>
+<summary><b>📈 Performance Improvements</b></summary>
+
+| Component | Change |
+|-----------|--------|
+| **Heightmap Modification** | Pass `false` to `FLandscapeEditDataInterface` to prevent 60+ second GPU sync delays |
+| **Landscape Updates** | Use `MarkPackageDirty` instead of `PostEditChange` to avoid unnecessary rebuilds |
+| **Geometry Operations** | Memory pressure checks and triangle limits to prevent OOM crashes |
+
+</details>
+
+### 📊 Statistics
+
+- **Files Changed:** 70 files
+- **Lines Added:** ~7,200
+- **Lines Removed:** ~1,400
+- **Bug Fixes:** 8 critical bugs
+- **New Verification Helpers:** 4
+
+---
+
+## 🏷️ [0.5.16] - 2026-02-12
+
+> [!IMPORTANT]
+> ### 🚀 Major Feature Release: 200+ Action Handlers
+> This release adds ~200 new C++ automation sub-actions across all domains, introduces progress heartbeat protocol for long-running operations, dynamic tool management, IPv6 support, and comprehensive security hardening.
+
+### ✨ Added
+
+<details>
+<summary><b>🎮 200+ MCP Action Handlers</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/200">#200</a>)</summary>
+
+| Domain | New Actions |
+|--------|-------------|
+| **AI** | 50+ actions for EQS, Perception, State Trees, Smart Objects |
+| **Combat** | Weapons, projectiles, damage, melee combat |
+| **Character** | Character creation, movement, advanced locomotion |
+| **Inventory** | Items, equipment, loot tables, crafting |
+| **GAS** | Gameplay Ability System: abilities, effects, attributes |
+| **Audio** | MetaSounds, sound classes, dialogue |
+| **Materials** | Material expressions, landscape layers |
+| **Textures** | Texture creation, compression, virtual texturing |
+| **Levels** | 15+ new sub-actions for level management |
+| **Volumes** | 18 volume types |
+| **Performance** | Profiling, optimization, scalability |
+| **Input** | Enhanced Input Actions & Contexts |
+| **Interaction** | Interactables, destructibles, triggers |
+| **Misc** | System control, tests, logs |
+
+**New Handler Files:**
+- `McpAutomationBridge_CharacterHandlers.cpp` (337 lines)
+- `McpAutomationBridge_CombatHandlers.cpp` (398 lines)
+- `McpAutomationBridge_SystemControlHandlers.cpp` (324 lines)
+- `McpAutomationBridge_MiscHandlers.cpp` (1010 lines)
+- `McpAutomationBridge_WidgetAuthoringHandlers.cpp` (2404 lines)
+
+</details>
+
+<details>
+<summary><b>💓 Progress Heartbeat Protocol</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/201">#201</a>)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **Progress Updates** | C++ sends `progress_update` WebSocket messages during long-running operations |
+| **Deadline Extensions** | TS extends request deadlines on each update with deadlock safeguards |
+| **Stale Detection** | Detects same percentage for 3 consecutive updates |
+| **Absolute Cap** | 5-minute maximum extension limit |
+| **Max Extensions** | 10 extensions per request |
+
+**Timeout Changes:**
+- Default request timeout: 60s → 30s (extensions handle slow ops)
+
+</details>
+
+<details>
+<summary><b>🔧 Dynamic Tool Management</b></summary>
+
+| Feature | Description |
+|---------|-------------|
+| **manage_tools MCP Tool** | Enables AI to enable/disable tools at runtime |
+| **Protected Tools** | `manage_tools`, `inspect`, and core category cannot be disabled |
+| **list_changed Notifications** | Tool registry sends MCP notifications when tools change |
+| **Category Filtering** | Filter tools by category (core, world, authoring, gameplay, utility) |
+
+</details>
+
+<details>
+<summary><b>🌐 IPv6 Support</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/194">#194</a>)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **IPv6 Addresses** | Full support for IPv6 addresses in automation bridge |
+| **Hostname Resolution** | DNS resolution via `GetAddressInfo` instead of fallback to 127.0.0.1 |
+| **Address Family Detection** | Auto-detect IPv6 by checking for colons in address |
+| **Zone ID Handling** | Strip zone IDs from IPv6 addresses for Node.js compatibility |
+| **Fallback Support** | Re-create socket as IPv4 when IPv6 not available |
+
+</details>
+
+### 🛡️ Security
+
+<details>
+<summary><b>🔒 Security Hardening</b></summary>
+
+| Function | Description |
+|----------|-------------|
+| **SanitizeProjectRelativePath** | Rejects Windows absolute paths, normalizes slashes, collapses `//`, requires valid UE roots |
+| **SanitizeAssetName** | Strips SQL injection patterns, invalid characters, enforces 64-char limit |
+| **ValidateAssetCreationPath** | Combines folder + name validation |
+| **IsValidAssetPath** | Rejects `:` (Windows drive letters) and consecutive slashes |
+
+**TypeScript Security:**
+- `src/utils/path-security.ts`: Collapse `//` normalization
+- `src/utils/validation.ts`: SQL injection detection
+
+</details>
+
+<details>
+<summary><b>🔒 String Escaping Fix</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/202">#202</a>)</summary>
+
+| Issue | Fix |
+|-------|-----|
+| Incomplete string escaping in path handling | Added proper escaping for special characters |
+
+</details>
+
+### 🔧 Changed
+
+<details>
+<summary><b>🎮 UE 5.7 Compatibility Fixes</b></summary>
+
+| Component | Change |
+|-----------|--------|
+| **WebSocket** | `GetProtocolType()` (FName) replaces `GetProtocolFamily()` (enum) |
+| **SCS Save** | `McpSafeAssetSave` prevents recursive `FlushRenderingCommands` crashes |
+| **PostProcessVolume** | Conditionally compiled (removed in 5.7) |
+| **Niagara** | Initialize `GraphSource`/`NiagaraGraph` to prevent null graph crashes |
+
+</details>
+
+<details>
+<summary><b>⚡ Performance & Infrastructure</b></summary>
+
+| Change | Description |
+|--------|-------------|
+| **Memory Detection** | Windows `GlobalMemoryStatusEx` replaces heuristic detection |
+| **Rate Limit** | `MaxAutomationRequestsPerMinute` raised 120 → 600 |
+| **Logging** | Improved request/response logging with action name and filtered payload preview |
+| **Blueprint Handler** | Variable name collision generates unique suffix, type validation before loading |
+
+</details>
+
+### 🛠️ Fixed
+
+<details>
+<summary><b>🐛 Various Fixes</b></summary>
+
+| Fix | Description |
+|-----|-------------|
+| **~30 handlers** | Handlers that returned `nullptr` now return structured JSON |
+| **Blueprint** | Unknown actions return explicit error instead of silent failure |
+| **Level tools** | File existence checked before load, post-load path validation |
+| **Eject handler** | Changed from stopping PIE to ejecting from possessed pawn |
+
+</details>
+
+### 📊 Statistics
+
+- **Files Changed:** 83 files
+- **Lines Added:** ~23,000
+- **Lines Removed:** ~2,700
+- **New Action Handlers:** ~200
+- **New Handler Files:** 5
+
+---
+
+## 🏷️ [0.5.15] - 2026-02-06
+
+> [!NOTE]
+> ### 🌐 Network Configuration Release
+> This release adds support for non-loopback binding in automation bridge settings, enabling LAN access configuration.
+
+### ✨ Added
+
+<details>
+<summary><b>🌐 Non-Loopback Binding Support</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/193">#193</a>)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **Non-Loopback Binding** | Automation bridge can now bind to non-loopback addresses (e.g., `0.0.0.0`) for LAN access |
+| **Allow Non-Loopback Setting** | New `bAllowNonLoopback` setting in plugin configuration |
+| **TypeScript Support** | Added `MCP_AUTOMATION_ALLOW_NON_LOOPBACK` environment variable |
+| **Host Validation Tests** | New test suite for bridge host validation |
+
+**Configuration:**
+```env
+# Enable LAN access
+MCP_AUTOMATION_ALLOW_NON_LOOPBACK=true
+MCP_AUTOMATION_HOST=0.0.0.0
+```
+
+**Security Note:** Only enable on trusted networks with appropriate firewall rules.
+
+</details>
+
+### 🔄 Dependencies
+
+<details>
+<summary><b>Dependabot Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `github/codeql-action` | 4.32.1 → 4.32.2 | [#189](https://github.com/ChiR24/Unreal_mcp/pull/189) |
+| Dependencies group | 2 updates | [#190](https://github.com/ChiR24/Unreal_mcp/pull/190) |
+
+</details>
+
+### 📊 Statistics
+
+- **Files Changed:** 8 files
+- **Lines Added:** ~270
+- **Lines Removed:** ~10
+
+---
+
+## 🏷️ [0.5.14] - 2026-02-05
+
+> [!IMPORTANT]
+> ### 🔐 TLS & Network Security Release
+> This release introduces TLS/SSL support for secure WebSocket connections (`wss://`), per-connection rate limiting, loopback-only network binding enforcement, and authentication state tracking for the Automation Bridge.
+
+### 🛡️ Security
+
+<details>
+<summary><b>🔒 Loopback-Only Binding & Handshake Enforcement</b> (<code>70c2745</code>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Loopback Binding** | Automation Bridge now only binds to loopback addresses (127.0.0.1 or ::1) |
+| **Handshake Required** | Automation requests require completed `bridge_hello` handshake |
+
+**C++ Plugin:**
+- Rejects `0.0.0.0` and `::` bind attempts, falls back to `127.0.0.1` with warning
+- Added `AuthenticatedSockets` tracking set in `McpConnectionManager`
+- Unauthenticated sockets receive `HANDSHAKE_REQUIRED` error and connection close (code 4004)
+
+**TypeScript Bridge:**
+- Added `normalizeLoopbackHost()` to validate and enforce loopback addresses
+- Non-loopback host values rejected with warning and fallback
+
+</details>
+
+### ✨ Added
+
+<details>
+<summary><b>🔐 TLS/SSL, Rate Limiting & Schema Validation</b> (<code>d2a94cf</code>)</summary>
+
+| Feature | Description |
+|---------|-------------|
+| **TLS/SSL Support** | Full `wss://` WebSocket support with OpenSSL/TLS integration (TLS 1.2+) |
+| **Rate Limiting** | Per-connection limits: 600 messages/min, 120 automation requests/min |
+| **Schema Validation** | New Zod schemas in `src/automation/message-schema.ts` for type-safe message parsing |
+
+**New Plugin Settings:**
+- `bEnableTls`, `TlsCertificatePath`, `TlsPrivateKeyPath` - TLS configuration
+- `MaxMessagesPerMinute`, `MaxAutomationRequestsPerMinute` - Rate limit configuration
+
+**C++ Implementation:**
+- `InitializeTlsContext()`, `EstablishTls()`, `SendRaw()`, `RecvRaw()` - TLS-aware I/O
+- Requires UE 5.7+ for native socket release; graceful fallback on older versions
+
+**TypeScript Integration:**
+- Added `rateLimitState` tracking with cleanup on connection close
+
+</details>
+
+### 🛠️ Fixed
+
+<details>
+<summary><b>🔧 TLS Memory Management</b> (<code>321206e</code>)</summary>
+
+| Fix | Description |
+|-----|-------------|
+| **Struct Initialization** | Fixed `FParsedWebSocketUrl` member initialization order (Port using uninitialized `bUseTls`) |
+| **SSL Context Ownership** | Added `bOwnsSslContext` to prevent double-free of client contexts owned by `ISslManager` |
+
+</details>
+
+<details>
+<summary><b>🔧 Thread Safety & TLS Error Handling</b> (<code>6fd1553</code>)</summary>
+
+| Fix | Description |
+|-----|-------------|
+| **Mutex Protection** | Added `SocketRateLimits` cleanup in `ForceReconnect` with proper mutex locking |
+| **Declaration** | Moved `ShutdownTls()` declaration outside `WITH_SSL` guard for compilation compatibility |
+
+</details>
+
+<details>
+<summary><b>🔧 Review Feedback Fixes</b> (<code>8987a3e</code>)</summary>
+
+| Fix | Description |
+|-----|-------------|
+| **Duplicate Call** | Fixed duplicate `ActiveSockets.Empty()` call in connection manager |
+| **TypeScript Cleanup** | Added `rateLimitState` cleanup in `closeAll()` method |
+
+</details>
+
+### 🔄 Dependencies
+
+<details>
+<summary><b>NPM Package Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `@modelcontextprotocol/sdk` | 1.25.3 → 1.26.0 | [#187](https://github.com/ChiR24/Unreal_mcp/pull/187) |
+| `mcp-client-capabilities` | Latest | [#186](https://github.com/ChiR24/Unreal_mcp/pull/186) |
+
+</details>
+
+<details>
+<summary><b>GitHub Actions Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `github/codeql-action` | 4.32.0 → 4.32.1 | [#185](https://github.com/ChiR24/Unreal_mcp/pull/185) |
+| `actions/github-script` | 7.0.1 → 8.0.0 | [#184](https://github.com/ChiR24/Unreal_mcp/pull/184) |
+
+</details>
+
+---
+
+## 🏷️ [0.5.13] - 2026-02-02
+
+> [!IMPORTANT]
+> ### 🛡️ Security & Compatibility Release
+> This release includes multiple critical security fixes for command injection and path traversal vulnerabilities, along with full Unreal Engine 5.0 backward compatibility and WebSocket stability improvements.
+
+### 🛡️ Security
+
+<details>
+<summary><b>🔒 Command Injection in UITools</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/144">#144</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Vulnerability** | Command injection via unsanitized user input in widget creation |
+| **Fix** | Added `sanitizeConsoleString()` and applied `sanitizeAssetName()` to all user-provided identifiers |
+| **Contributors** | @google-labs-jules[bot] |
+
+</details>
+
+<details>
+<summary><b>🔒 Command Injection in LevelTools</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/179">#179</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Vulnerability** | Command injection via level names, event types, and game mode parameters |
+| **Fix** | Added `sanitizeCommandArgument()` and applied to all console command parameters |
+| **Contributors** | @google-labs-jules[bot] |
+
+</details>
+
+<details>
+<summary><b>🔒 Path Traversal in Asset Listing</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/163">#163</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Vulnerability** | Path traversal in `listAssets` via `filter.pathStartsWith` parameter |
+| **Fix** | Applied `normalizeAndSanitizePath()` to GraphQL `listAssets` and asset handler `list` action |
+| **Contributors** | @google-labs-jules[bot] |
+
+</details>
+
+### ✨ Added
+
+<details>
+<summary><b>🎮 Unreal Engine 5.0 Compatibility</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/183">#183</a>)</summary>
+
+| Component | Description |
+|-----------|-------------|
+| **API Abstractions** | Version-guarded macros for Material, Niagara, AssetRegistry, Animation, and World Partition APIs |
+| **Build System** | Made plugin dependencies optional with dynamic memory-based configuration |
+| **Coverage** | 41 handler files updated with UE 5.0-5.7 compatibility |
+
+**Compatibility Macros Added:**
+- `MCP_GET_MATERIAL_EXPRESSIONS()` - Abstracts material expression access
+- `MCP_DATALAYER_TYPE` / `MCP_DATALAYER_ASSET_TYPE` - Data layer type abstraction
+- `MCP_ASSET_FILTER_CLASS_PATHS` - Asset registry filter abstraction
+- `MCP_ASSET_DATA_GET_CLASS_PATH()` - FAssetData abstraction
+- `MCP_NIAGARA_EMITTER_DATA_TYPE` - Niagara emitter abstraction
+
+</details>
+
+### 🛠️ Fixed
+
+<details>
+<summary><b>🔌 WebSocket Stability</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/180">#180</a>, <a href="https://github.com/ChiR24/Unreal_mcp/pull/181">#181</a>)</summary>
+
+| Fix | Description |
+|-----|-------------|
+| **TOCTOU Race** | Fixed Time-of-Check-Time-of-Use race condition in ListenSocket shutdown |
+| **Shutdown Hang** | Fixed WebSocket server blocking cook/package builds |
+| **Version Compatibility** | Fixed `PendingReceived.RemoveAt()` API differences for UE 5.4+ |
+
+**Contributors:** @kalihman
+
+</details>
+
+<details>
+<summary><b>🔧 Resource Handlers</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/165">#165</a>)</summary>
+
+- Fixed broken actors and level resource handlers
+- Added missing actors and level resources to MCP resource list
+
+**Contributors:** @kalihman
+
+</details>
+
+<details>
+<summary><b>🔧 Other Fixes</b></summary>
+
+| Fix | Description |
+|-----|-------------|
+| UE 5.7 | Resolved macro handling and ControlRig dynamic loading issues |
+| UE 5.5 | Fixed API compatibility issues in handlers |
+| UE 5.1 | Fixed `MaterialDomain.h` inclusion path |
+| JSON | Refactored JSON handling in McpAutomationBridge |
+
+</details>
+
+### 🧪 Testing
+
+- Added security regression tests for UITools, LevelTools, and asset handlers
+
+### 🔄 Dependencies
+
+<details>
+<summary><b>GitHub Actions Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `release-drafter/release-drafter` | 6.1.1 → 6.2.0 | [#160](https://github.com/ChiR24/Unreal_mcp/pull/160) |
+| `actions/checkout` | 6.0.1 → 6.0.2 | [#161](https://github.com/ChiR24/Unreal_mcp/pull/161) |
+| `github/codeql-action` | 4.31.10 → 4.32.0 | [#168](https://github.com/ChiR24/Unreal_mcp/pull/168), [#170](https://github.com/ChiR24/Unreal_mcp/pull/170) |
+| `google-github-actions/run-gemini-cli` | Latest | [#177](https://github.com/ChiR24/Unreal_mcp/pull/177) |
+
+</details>
+
+<details>
+<summary><b>NPM Package Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `@modelcontextprotocol/sdk` | Latest | [#154](https://github.com/ChiR24/Unreal_mcp/pull/154) |
+| `hono` | 4.11.4 → 4.11.7 | [#173](https://github.com/ChiR24/Unreal_mcp/pull/173) |
+| `@types/node` | Various updates | [#158](https://github.com/ChiR24/Unreal_mcp/pull/158), [#162](https://github.com/ChiR24/Unreal_mcp/pull/162), [#175](https://github.com/ChiR24/Unreal_mcp/pull/175) |
+
+</details>
+
+---
+
+## 🏷️ [0.5.12] - 2026-01-15
+
+> [!NOTE]
+> ### 🔧 Handler Synchronization Release
+> This release focuses on synchronizing TypeScript handler parameters with C++ handlers and dependency updates.
+
+### 🛠️ Fixed
+
+<details>
+<summary><b>🔧 TS Handler Parameter Sync</b> (<code>5953232</code>)</summary>
+
+- Synchronized TypeScript handler parameters with C++ handlers for consistency
+- Fixed parameter mapping issues between TS and C++ layers
+
+</details>
+
+### 🔄 Dependencies
+
+<details>
+<summary><b>GitHub Actions Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `release-drafter/release-drafter` | 6.1.0 → 6.1.1 | [#141](https://github.com/ChiR24/Unreal_mcp/pull/141) |
+| `google-github-actions/run-gemini-cli` | Latest | [#142](https://github.com/ChiR24/Unreal_mcp/pull/142) |
+
+</details>
+
+<details>
+<summary><b>NPM Package Updates</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/143">#143</a>)</summary>
+
+| Package | Update |
+|---------|--------|
+| `@types/node` | Various dev dependency updates |
+
+</details>
+
+---
+
+## 🏷️ [0.5.11] - 2026-01-12
+
+> [!IMPORTANT]
+> ### 🛡️ Security Hardening & UE 5.7 Compatibility
+> This release includes multiple critical security fixes for path traversal and command injection vulnerabilities, along with UE 5.7 Interchange compatibility fixes.
+
+### 🛡️ Security
+
+<details>
+<summary><b>🔒 Path Traversal in Asset Import</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/125">#125</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 CRITICAL |
+| **Vulnerability** | Path traversal in asset import functionality |
+| **Fix** | Added path sanitization and validation |
+
+</details>
+
+<details>
+<summary><b>🔒 Command Injection Bypass</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/122">#122</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 CRITICAL |
+| **Vulnerability** | Command injection bypass via flexible whitespace |
+| **Fix** | Enhanced command validation to detect and block bypass attempts |
+
+</details>
+
+<details>
+<summary><b>🔒 Path Traversal in Screenshots</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/120">#120</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Vulnerability** | Path traversal in screenshot filenames |
+| **Fix** | Implemented filename sanitization and path validation |
+
+</details>
+
+<details>
+<summary><b>🔒 Path Traversal in GraphQL</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/135">#135</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Vulnerability** | Path traversal in GraphQL resolvers |
+| **Fix** | Added input sanitization for GraphQL resolver paths |
+
+</details>
+
+<details>
+<summary><b>🔒 GraphQL CORS Configuration</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/118">#118</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 MEDIUM |
+| **Vulnerability** | Insecure GraphQL CORS configuration |
+| **Fix** | Implemented secure CORS policy |
+
+</details>
+
+<details>
+<summary><b>🔒 Enhanced Command Validation</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/113">#113</a>)</summary>
+
+| Aspect | Details |
+|--------|---------|
+| **Severity** | 🚨 HIGH |
+| **Vulnerability** | Command injection bypasses |
+| **Fix** | Enhanced validation patterns to prevent injection bypasses |
+
+</details>
+
+### 🛠️ Fixed
+
+<details>
+<summary><b>🐛 UE 5.7 Asset Import Crash</b> (<a href="https://github.com/ChiR24/Unreal_mcp/pull/138">#138</a>)</summary>
+
+| Fix | Description |
+|-----|-------------|
+| **Interchange Compatibility** | Deferred asset import to next tick for UE 5.7 Interchange compatibility |
+| **Name Sanitization** | Improved asset import robustness and name sanitization |
+
+**Closes [#137](https://github.com/ChiR24/Unreal_mcp/issues/137)**
+
+</details>
+
+### 🔄 Dependencies
+
+<details>
+<summary><b>NPM Package Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `@modelcontextprotocol/sdk` | 1.25.1 → 1.25.2 | [#119](https://github.com/ChiR24/Unreal_mcp/pull/119) |
+| `hono` | 4.11.1 → 4.11.4 | [#129](https://github.com/ChiR24/Unreal_mcp/pull/129) |
+| `@types/node` | Various updates | [#130](https://github.com/ChiR24/Unreal_mcp/pull/130), [#133](https://github.com/ChiR24/Unreal_mcp/pull/133), [#134](https://github.com/ChiR24/Unreal_mcp/pull/134) |
+
+</details>
+
+<details>
+<summary><b>GitHub Actions Updates</b></summary>
+
+| Package | Update | PR |
+|---------|--------|-----|
+| `github/codeql-action` | 4.31.9 → 4.31.10 | [#126](https://github.com/ChiR24/Unreal_mcp/pull/126) |
+| `actions/setup-node` | 6.1.0 → 6.2.0 | [#133](https://github.com/ChiR24/Unreal_mcp/pull/133) |
+| `dependabot/fetch-metadata` | 2.4.0 → 2.5.0 | [#114](https://github.com/ChiR24/Unreal_mcp/pull/114) |
+
+</details>
+
+---
+
 ## 🏷️ [0.5.10] - 2026-01-04
 
 > [!IMPORTANT]

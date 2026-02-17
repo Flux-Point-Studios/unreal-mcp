@@ -32,7 +32,9 @@ public:
     UPROPERTY(config, EditAnywhere, Category = "Connection")
     bool bAlwaysListen;
 
-    /** Host to bind the listening sockets. Use 0.0.0.0 to accept connections from any interface. */
+    /** Host to bind the listening sockets. Default: 127.0.0.1 (loopback).
+     * To bind to LAN addresses (e.g., 0.0.0.0 or 192.168.x.x), enable bAllowNonLoopback in Security settings.
+     */
     UPROPERTY(config, EditAnywhere, Category = "Connection")
     FString ListenHost;
 
@@ -56,6 +58,33 @@ public:
     /** When true, require a capability token for incoming connections (enforces matching token). */
     UPROPERTY(config, EditAnywhere, Category = "Security")
     bool bRequireCapabilityToken;
+
+    /** SECURITY WARNING: When enabled, allows binding to non-loopback addresses (e.g., 0.0.0.0, 192.168.x.x).
+     * This exposes the automation bridge to your local network. Only enable if you need LAN access
+     * and understand the security implications. Default: false (loopback-only).
+     */
+    UPROPERTY(config, EditAnywhere, Category = "Security")
+    bool bAllowNonLoopback;
+
+    /** Enable TLS for the automation bridge WebSocket server. */
+    UPROPERTY(config, EditAnywhere, Category = "Security")
+    bool bEnableTls;
+
+    /** PEM certificate path used for TLS (server). */
+    UPROPERTY(config, EditAnywhere, Category = "Security")
+    FString TlsCertificatePath;
+
+    /** PEM private key path used for TLS (server). */
+    UPROPERTY(config, EditAnywhere, Category = "Security")
+    FString TlsPrivateKeyPath;
+
+    /** Max inbound WebSocket messages per minute before disconnect (0 = disabled). */
+    UPROPERTY(config, EditAnywhere, Category = "Security", meta = (ClampMin = "0"))
+    int32 MaxMessagesPerMinute;
+
+    /** Max inbound automation_request messages per minute before disconnect (0 = disabled). */
+    UPROPERTY(config, EditAnywhere, Category = "Security", meta = (ClampMin = "0"))
+    int32 MaxAutomationRequestsPerMinute;
 
     /** Optional runtime log verbosity override exposed via Project Settings. */
 

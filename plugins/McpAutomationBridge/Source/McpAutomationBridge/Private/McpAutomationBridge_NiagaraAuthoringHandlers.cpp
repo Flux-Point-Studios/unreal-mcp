@@ -3,8 +3,28 @@
 // Implements 35 actions for Niagara system/emitter creation, modules, parameters, events, and GPU simulation.
 
 #include "McpAutomationBridgeSubsystem.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
+
+// Note: FVersionedNiagaraEmitterData and related APIs were introduced in UE 5.1
+// UE 5.0 uses direct emitter pointers, UE 5.1+ uses versioned emitter data
+#if WITH_EDITOR && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#define MCP_HAS_NIAGARA_VERSIONING_APIS 1
+#define MCP_NIAGARA_EMITTER_DATA_TYPE FVersionedNiagaraEmitterData
+#define MCP_GET_EMITTER_DATA(Handle) (Handle).GetEmitterData()
+#define MCP_GET_LATEST_EMITTER_DATA(Emitter) (Emitter)->GetLatestEmitterData()
+#define MCP_GET_EMITTER_VERSION_GUID(Emitter) (Emitter)->GetExposedVersion().VersionGuid
+#else
+#define MCP_HAS_NIAGARA_VERSIONING_APIS 0
+// UE 5.0: Use UNiagaraEmitter* directly instead of MCP_NIAGARA_EMITTER_DATA_TYPE*
+#define MCP_NIAGARA_EMITTER_DATA_TYPE UNiagaraEmitter
+// UE 5.0: GetInstance() is a const method, returns UNiagaraEmitter*
+// Use (&(Handle)) to handle both pointers and references uniformly
+#define MCP_GET_EMITTER_DATA(Handle) (&(Handle))->GetInstance()
+#define MCP_GET_LATEST_EMITTER_DATA(Emitter) (Emitter)
+#define MCP_GET_EMITTER_VERSION_GUID(Emitter) FGuid()
+#endif
 
 #if WITH_EDITOR
 #include "NiagaraSystem.h"
@@ -20,7 +40,14 @@
 #include "NiagaraStackEditorData.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraSimulationStageBase.h"
+
+// FNiagaraStackGraphUtilities is only available in UE 5.1+ (NiagaraEditor module)
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
+#define MCP_HAS_NIAGARA_STACK_GRAPH_UTILITIES 1
+#else
+#define MCP_HAS_NIAGARA_STACK_GRAPH_UTILITIES 0
+#endif
 
 // Niagara Data Interfaces
 // UE 5.7+: Data interfaces moved to subfolders or different modules
@@ -53,8 +80,6 @@
 #include "NiagaraDataInterfaceCollisionQuery.h"
 #include "NiagaraScriptVariable.h"
 #include "NiagaraParameterStore.h"
-#include "NiagaraSystemFactoryNew.h"
-#include "NiagaraEmitterFactoryNew.h"
 #include "NiagaraRendererProperties.h"
 #include "NiagaraSpriteRendererProperties.h"
 #include "NiagaraMeshRendererProperties.h"
@@ -74,30 +99,31 @@
 
 // Use consolidated JSON helpers from McpAutomationBridgeHelpers.h
 // Aliases for backward compatibility with existing code in this file
-#define GetStringField GetJsonStringField
-#define GetNumberField GetJsonNumberField
-#define GetBoolField GetJsonBoolField
+#define GetStringFieldNiagAuth GetJsonStringField
+#define GetNumberFieldNiagAuth GetJsonNumberField
+#define GetBoolFieldNiagAuth GetJsonBoolField
+
 
 // Helper to get FVector from JSON object
-static FVector GetVectorFromJson(const TSharedPtr<FJsonObject>& Obj)
+static FVector GetVectorFromJsonNiag(const TSharedPtr<FJsonObject>& Obj)
 {
     if (!Obj.IsValid()) return FVector::ZeroVector;
     return FVector(
-        GetNumberField(Obj, TEXT("x"), 0.0),
-        GetNumberField(Obj, TEXT("y"), 0.0),
-        GetNumberField(Obj, TEXT("z"), 0.0)
+        GetNumberFieldNiagAuth(Obj, TEXT("x"), 0.0),
+        GetNumberFieldNiagAuth(Obj, TEXT("y"), 0.0),
+        GetNumberFieldNiagAuth(Obj, TEXT("z"), 0.0)
     );
 }
 
 // Helper to get FLinearColor from JSON object
-static FLinearColor GetColorFromJson(const TSharedPtr<FJsonObject>& Obj)
+static FLinearColor GetColorFromJsonNiagara(const TSharedPtr<FJsonObject>& Obj)
 {
     if (!Obj.IsValid()) return FLinearColor::White;
     return FLinearColor(
-        static_cast<float>(GetNumberField(Obj, TEXT("r"), 1.0)),
-        static_cast<float>(GetNumberField(Obj, TEXT("g"), 1.0)),
-        static_cast<float>(GetNumberField(Obj, TEXT("b"), 1.0)),
-        static_cast<float>(GetNumberField(Obj, TEXT("a"), 1.0))
+        static_cast<float>(GetNumberFieldNiagAuth(Obj, TEXT("r"), 1.0)),
+        static_cast<float>(GetNumberFieldNiagAuth(Obj, TEXT("g"), 1.0)),
+        static_cast<float>(GetNumberFieldNiagAuth(Obj, TEXT("b"), 1.0)),
+        static_cast<float>(GetNumberFieldNiagAuth(Obj, TEXT("a"), 1.0))
     );
 }
 
@@ -120,7 +146,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         return true;
     }
 
-    FString SubAction = GetStringField(Payload, TEXT("subAction"));
+    FString SubAction = GetStringFieldNiagAuth(Payload, TEXT("subAction"));
     if (SubAction.IsEmpty())
     {
         SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'subAction' in payload."), TEXT("INVALID_ARGUMENT"));
@@ -128,13 +154,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
     }
 
     // Common parameters
-    FString Name = GetStringField(Payload, TEXT("name"));
-    FString Path = GetStringField(Payload, TEXT("path"), TEXT("/Game"));
-    FString AssetPath = GetStringField(Payload, TEXT("assetPath"));
-    FString SystemPath = GetStringField(Payload, TEXT("systemPath"));
-    FString EmitterPath = GetStringField(Payload, TEXT("emitterPath"));
-    FString EmitterName = GetStringField(Payload, TEXT("emitterName"));
-    bool bSave = GetBoolField(Payload, TEXT("save"), true);
+    FString Name = GetStringFieldNiagAuth(Payload, TEXT("name"));
+    FString Path = GetStringFieldNiagAuth(Payload, TEXT("path"), TEXT("/Game"));
+    FString AssetPath = GetStringFieldNiagAuth(Payload, TEXT("assetPath"));
+    FString SystemPath = GetStringFieldNiagAuth(Payload, TEXT("systemPath"));
+    FString EmitterPath = GetStringFieldNiagAuth(Payload, TEXT("emitterPath"));
+    FString EmitterName = GetStringFieldNiagAuth(Payload, TEXT("emitterName"));
+    bool bSave = GetBoolFieldNiagAuth(Payload, TEXT("save"), true);
+
 
     TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject());
 
@@ -162,10 +189,28 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        UNiagaraSystemFactoryNew* Factory = NewObject<UNiagaraSystemFactoryNew>();
-        UNiagaraSystem* NewSystem = Cast<UNiagaraSystem>(Factory->FactoryCreateNew(
-            UNiagaraSystem::StaticClass(), Package, FName(*Name), RF_Public | RF_Standalone, nullptr, GWarn));
-
+        // Create NiagaraSystem directly without factory (compatible with all UE versions)
+        // Note: Factories are editor-internal and not exported for plugin use
+        UNiagaraSystem* NewSystem = NewObject<UNiagaraSystem>(Package, FName(*Name), RF_Public | RF_Standalone);
+        if (NewSystem)
+        {
+            // Add default emitter using direct API
+            // UE 5.4+ changed AddEmitterHandle signature - requires additional parameters
+            UNiagaraEmitter* NewEmitter = NewObject<UNiagaraEmitter>(NewSystem, FName(TEXT("DefaultEmitter")));
+            if (NewEmitter)
+            {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 0
+                // UE 5.0 - AddEmitterHandle takes only 2 parameters
+                NewSystem->AddEmitterHandle(*NewEmitter, FName(TEXT("DefaultEmitter")));
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
+                // UE 5.4 signature with 2 parameters
+                NewSystem->AddEmitterHandle(*NewEmitter, FName(TEXT("DefaultEmitter")));
+#else
+                // UE 5.1-5.3 and 5.5+ - AddEmitterHandle takes 3 parameters: Emitter, Name, and Version GUID
+                NewSystem->AddEmitterHandle(*NewEmitter, FName(TEXT("DefaultEmitter")), FGuid::NewGuid());
+#endif
+            }
+        }
         if (!NewSystem)
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create Niagara System."), TEXT("CREATE_FAILED"));
@@ -179,7 +224,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             McpSafeAssetSave(NewSystem);
         }
 
-        Result->SetStringField(TEXT("assetPath"), NewSystem->GetPathName());
+        AddAssetVerification(Result, NewSystem);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Created Niagara System: %s"), *Name));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("System created."), Result);
         return true;
@@ -204,10 +249,9 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        UNiagaraEmitterFactoryNew* Factory = NewObject<UNiagaraEmitterFactoryNew>();
-        UNiagaraEmitter* NewEmitter = Cast<UNiagaraEmitter>(Factory->FactoryCreateNew(
-            UNiagaraEmitter::StaticClass(), Package, FName(*Name), RF_Public | RF_Standalone, nullptr, GWarn));
-
+        // Create NiagaraEmitter directly without factory (compatible with all UE versions)
+        // Note: Factories are editor-internal and not exported for plugin use
+        UNiagaraEmitter* NewEmitter = NewObject<UNiagaraEmitter>(Package, FName(*Name), RF_Public | RF_Standalone);
         if (!NewEmitter)
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create Niagara Emitter."), TEXT("CREATE_FAILED"));
@@ -221,7 +265,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             McpSafeAssetSave(NewEmitter);
         }
 
-        Result->SetStringField(TEXT("assetPath"), NewEmitter->GetPathName());
+        AddAssetVerification(Result, NewEmitter);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Created Niagara Emitter: %s"), *Name));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Emitter created."), Result);
         return true;
@@ -249,15 +293,21 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        // Add emitter to system - UE 5.7 requires version GUID
+        // Add emitter to system - UE 5.1+ requires version GUID
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
         FGuid EmitterVersion = Emitter->GetExposedVersion().VersionGuid;
         FNiagaraEmitterHandle NewHandle = System->AddEmitterHandle(*Emitter, FName(*Emitter->GetName()), EmitterVersion);
+#else
+        // UE 5.0 - no version GUID needed
+        FNiagaraEmitterHandle NewHandle = System->AddEmitterHandle(*Emitter, FName(*Emitter->GetName()));
+#endif
         
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("emitterName"), NewHandle.GetName().ToString());
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Added emitter '%s' to system."), *Emitter->GetName()));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Emitter added to system."), Result);
@@ -280,21 +330,21 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         }
 
         FNiagaraEmitterHandle* Handle = nullptr;
-        for (FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+        for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
         {
             if (H.GetName().ToString() == EmitterName)
             {
-                Handle = &H;
+                Handle = const_cast<FNiagaraEmitterHandle*>(&H);
                 break;
             }
         }
-
+        
         if (!Handle)
         {
             SendAutomationError(RequestingSocket, RequestId, FString::Printf(TEXT("Emitter '%s' not found in system."), *EmitterName), TEXT("EMITTER_NOT_FOUND"));
             return true;
         }
-
+        
         const TSharedPtr<FJsonObject>* PropsObj;
         if (Payload->TryGetObjectField(TEXT("emitterProperties"), PropsObj) && PropsObj->IsValid())
         {
@@ -310,6 +360,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Updated properties for emitter '%s'."), *EmitterName));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Emitter properties updated."), Result);
         return true;
@@ -330,7 +381,11 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         }
 
         // Get the versioned emitter data
-        FVersionedNiagaraEmitterData* EmitterData = Handle->GetEmitterData();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetEmitterData();
+#else
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetInstance();
+#endif
         if (!EmitterData)
         {
             return nullptr;
@@ -374,24 +429,30 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         }
 
         // Add the module to the stack using the Stack Graph Utilities
+        // Note: FNiagaraStackGraphUtilities is only available in UE 5.1+
+#if MCP_HAS_NIAGARA_STACK_GRAPH_UTILITIES
         UNiagaraNodeFunctionCall* NewModule = FNiagaraStackGraphUtilities::AddScriptModuleToStack(
             ModuleScript,
             *TargetOutput,
             INDEX_NONE, // Append to end
             SuggestedName.IsEmpty() ? ModuleScript->GetName() : SuggestedName
         );
-
         return NewModule;
+#else
+        // UE 5.0: Stack graph utilities not available
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Warning, TEXT("AddModule failed: FNiagaraStackGraphUtilities is not available in UE 5.0. Consider upgrading to UE 5.1+ for full Niagara stack graph support."));
+        return nullptr;
+#endif
     };
 
     // Helper lambda to find emitter handle
     auto FindEmitterHandle = [&](UNiagaraSystem* System, const FString& TargetEmitter) -> FNiagaraEmitterHandle*
     {
-        for (FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+        for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
         {
             if (H.GetName().ToString() == TargetEmitter)
             {
-                return &H;
+                return const_cast<FNiagaraEmitterHandle*>(&H);
             }
         }
         return nullptr;
@@ -420,7 +481,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        double SpawnRate = GetNumberField(Payload, TEXT("spawnRate"), 100.0);
+        double SpawnRate = GetNumberFieldNiagAuth(Payload, TEXT("spawnRate"), 100.0);
 
         // Add the SpawnRate module to the Emitter Update stage
         // SpawnRate modules belong in EmitterUpdateScript as they control emission rate over time
@@ -446,6 +507,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("SpawnRate"));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetNumberField(TEXT("spawnRate"), SpawnRate);
@@ -476,8 +538,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        double BurstCount = GetNumberField(Payload, TEXT("burstCount"), 10.0);
-        double BurstTime = GetNumberField(Payload, TEXT("burstTime"), 0.0);
+        double BurstCount = GetNumberFieldNiagAuth(Payload, TEXT("burstCount"), 10.0);
+        double BurstTime = GetNumberFieldNiagAuth(Payload, TEXT("burstTime"), 0.0);
 
         // Add the SpawnBurst_Instantaneous module to the Emitter Spawn stage
         // Burst modules belong in EmitterSpawnScript for instantaneous spawns
@@ -495,6 +557,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("SpawnBurst"));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetNumberField(TEXT("burstCount"), BurstCount);
@@ -526,7 +589,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        double SpawnPerUnit = GetNumberField(Payload, TEXT("spawnPerUnit"), 1.0);
+        double SpawnPerUnit = GetNumberFieldNiagAuth(Payload, TEXT("spawnPerUnit"), 1.0);
 
         // Add the SpawnPerUnit module to the Emitter Update stage
         UNiagaraNodeFunctionCall* NewModule = AddModuleToEmitterStack(
@@ -543,6 +606,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("SpawnPerUnit"));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetNumberField(TEXT("spawnPerUnit"), SpawnPerUnit);
@@ -573,8 +637,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        double Lifetime = GetNumberField(Payload, TEXT("lifetime"), 2.0);
-        double Mass = GetNumberField(Payload, TEXT("mass"), 1.0);
+        double Lifetime = GetNumberFieldNiagAuth(Payload, TEXT("lifetime"), 2.0);
+        double Mass = GetNumberFieldNiagAuth(Payload, TEXT("mass"), 1.0);
 
         // Add the InitializeParticle module to the Particle Spawn stage
         UNiagaraNodeFunctionCall* NewModule = AddModuleToEmitterStack(
@@ -591,6 +655,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("InitializeParticle"));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetNumberField(TEXT("lifetime"), Lifetime);
@@ -638,6 +703,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("ParticleState"));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetStringField(TEXT("message"), TEXT("Added particle state module."));
@@ -653,7 +719,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString ForceType = GetStringField(Payload, TEXT("forceType"), TEXT("Gravity"));
+        FString ForceType = GetStringFieldNiagAuth(Payload, TEXT("forceType"), TEXT("Gravity"));
 
         UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *SystemPath);
         if (!System)
@@ -669,13 +735,13 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        double ForceStrength = GetNumberField(Payload, TEXT("forceStrength"), 980.0);
+        double ForceStrength = GetNumberFieldNiagAuth(Payload, TEXT("forceStrength"), 980.0);
         
         const TSharedPtr<FJsonObject>* ForceVectorObj;
         FVector ForceVector = FVector(0, 0, -980);
         if (Payload->TryGetObjectField(TEXT("forceVector"), ForceVectorObj))
         {
-            ForceVector = GetVectorFromJson(*ForceVectorObj);
+            ForceVector = GetVectorFromJsonNiag(*ForceVectorObj);
         }
 
         // Determine the module path based on force type
@@ -726,6 +792,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), FString::Printf(TEXT("Force_%s"), *ForceType));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetStringField(TEXT("forceType"), ForceType);
@@ -761,10 +828,10 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         FVector Velocity = FVector(0, 0, 100);
         if (Payload->TryGetObjectField(TEXT("velocity"), VelObj))
         {
-            Velocity = GetVectorFromJson(*VelObj);
+            Velocity = GetVectorFromJsonNiag(*VelObj);
         }
 
-        FString VelocityMode = GetStringField(Payload, TEXT("velocityMode"), TEXT("Linear"));
+        FString VelocityMode = GetStringFieldNiagAuth(Payload, TEXT("velocityMode"), TEXT("Linear"));
 
         // Determine the module path based on velocity mode
         FString ModulePath;
@@ -798,6 +865,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("Velocity"));
         Result->SetBoolField(TEXT("moduleAdded"), bModuleAdded);
         Result->SetStringField(TEXT("velocityMode"), VelocityMode);
@@ -825,7 +893,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         FVector Acceleration = FVector(0, 0, -980);
         if (Payload->TryGetObjectField(TEXT("acceleration"), AccelObj))
         {
-            Acceleration = GetVectorFromJson(*AccelObj);
+            Acceleration = GetVectorFromJsonNiag(*AccelObj);
         }
 
         if (bSave)
@@ -833,6 +901,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("Acceleration"));
         Result->SetStringField(TEXT("message"), TEXT("Configured acceleration module."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Acceleration module configured."), Result);
@@ -854,14 +923,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString SizeMode = GetStringField(Payload, TEXT("sizeMode"), TEXT("Uniform"));
-        double UniformSize = GetNumberField(Payload, TEXT("uniformSize"), 10.0);
+        FString SizeMode = GetStringFieldNiagAuth(Payload, TEXT("sizeMode"), TEXT("Uniform"));
+        double UniformSize = GetNumberFieldNiagAuth(Payload, TEXT("uniformSize"), 10.0);
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("Size"));
         Result->SetStringField(TEXT("sizeMode"), SizeMode);
         Result->SetNumberField(TEXT("uniformSize"), UniformSize);
@@ -889,16 +959,17 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         FLinearColor Color = FLinearColor::White;
         if (Payload->TryGetObjectField(TEXT("color"), ColorObj))
         {
-            Color = GetColorFromJson(*ColorObj);
+            Color = GetColorFromJsonNiagara(*ColorObj);
         }
 
-        FString ColorMode = GetStringField(Payload, TEXT("colorMode"), TEXT("Direct"));
+        FString ColorMode = GetStringFieldNiagAuth(Payload, TEXT("colorMode"), TEXT("Direct"));
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("Color"));
         Result->SetStringField(TEXT("colorMode"), ColorMode);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Configured color module: mode=%s"), *ColorMode));
@@ -928,14 +999,20 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString MaterialPath = GetStringField(Payload, TEXT("materialPath"));
-        FString Alignment = GetStringField(Payload, TEXT("alignment"), TEXT("Unaligned"));
-        FString FacingMode = GetStringField(Payload, TEXT("facingMode"), TEXT("FaceCamera"));
+        FString MaterialPath = GetStringFieldNiagAuth(Payload, TEXT("materialPath"));
+        FString Alignment = GetStringFieldNiagAuth(Payload, TEXT("alignment"), TEXT("Unaligned"));
+        FString FacingMode = GetStringFieldNiagAuth(Payload, TEXT("facingMode"), TEXT("FaceCamera"));
 
         // Get the versioned emitter data for the specified emitter (UE 5.7+)
-        FVersionedNiagaraEmitterData* EmitterData = Handle->GetEmitterData();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetEmitterData();
         FVersionedNiagaraEmitter VersionedEmitter = Handle->GetInstance();
         UNiagaraEmitter* Emitter = VersionedEmitter.Emitter;
+#else
+        // UE 5.0: GetInstance() returns UNiagaraEmitter* directly
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetInstance();
+        UNiagaraEmitter* Emitter = Handle->GetInstance();
+#endif
         if (EmitterData && Emitter)
         {
             // Create sprite renderer if not exists
@@ -957,7 +1034,12 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                     SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create sprite renderer"), TEXT("CREATION_FAILED"));
                     return true;
                 }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 Emitter->AddRenderer(SpriteRenderer, VersionedEmitter.Version);
+#else
+                // UE 5.0: AddRenderer only takes the renderer
+                Emitter->AddRenderer(SpriteRenderer);
+#endif
             }
 
             if (!MaterialPath.IsEmpty())
@@ -975,6 +1057,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("SpriteRenderer"));
         Result->SetStringField(TEXT("message"), TEXT("Configured sprite renderer module."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Sprite renderer configured."), Result);
@@ -1003,12 +1086,18 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString MeshPath = GetStringField(Payload, TEXT("meshPath"));
+        FString MeshPath = GetStringFieldNiagAuth(Payload, TEXT("meshPath"));
 
         // Get the versioned emitter data (UE 5.7+)
-        FVersionedNiagaraEmitterData* EmitterData = Handle->GetEmitterData();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetEmitterData();
         FVersionedNiagaraEmitter VersionedEmitter = Handle->GetInstance();
         UNiagaraEmitter* Emitter = VersionedEmitter.Emitter;
+#else
+        // UE 5.0: GetInstance() returns UNiagaraEmitter* directly
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetInstance();
+        UNiagaraEmitter* Emitter = Handle->GetInstance();
+#endif
         if (EmitterData && Emitter)
         {
             UNiagaraMeshRendererProperties* MeshRenderer = nullptr;
@@ -1029,7 +1118,12 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                     SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create mesh renderer"), TEXT("CREATION_FAILED"));
                     return true;
                 }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 Emitter->AddRenderer(MeshRenderer, VersionedEmitter.Version);
+#else
+                // UE 5.0: AddRenderer only takes the renderer
+                Emitter->AddRenderer(MeshRenderer);
+#endif
             }
 
             if (!MeshPath.IsEmpty())
@@ -1050,6 +1144,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("MeshRenderer"));
         Result->SetStringField(TEXT("message"), TEXT("Configured mesh renderer module."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Mesh renderer configured."), Result);
@@ -1079,9 +1174,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         }
 
         // Get the versioned emitter data (UE 5.7+)
-        FVersionedNiagaraEmitterData* EmitterData = Handle->GetEmitterData();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetEmitterData();
         FVersionedNiagaraEmitter VersionedEmitter = Handle->GetInstance();
         UNiagaraEmitter* Emitter = VersionedEmitter.Emitter;
+#else
+        // UE 5.0: GetInstance() returns UNiagaraEmitter* directly
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetInstance();
+        UNiagaraEmitter* Emitter = Handle->GetInstance();
+#endif
         if (EmitterData && Emitter)
         {
             UNiagaraRibbonRendererProperties* RibbonRenderer = nullptr;
@@ -1102,10 +1203,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                     SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create ribbon renderer"), TEXT("CREATION_FAILED"));
                     return true;
                 }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 Emitter->AddRenderer(RibbonRenderer, VersionedEmitter.Version);
+#else
+                // UE 5.0: AddRenderer only takes the renderer
+                Emitter->AddRenderer(RibbonRenderer);
+#endif
             }
 
-            FString MaterialPath = GetStringField(Payload, TEXT("materialPath"));
+            FString MaterialPath = GetStringFieldNiagAuth(Payload, TEXT("materialPath"));
             if (!MaterialPath.IsEmpty())
             {
                 UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *MaterialPath);
@@ -1121,6 +1227,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("RibbonRenderer"));
         Result->SetStringField(TEXT("message"), TEXT("Configured ribbon renderer module."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Ribbon renderer configured."), Result);
@@ -1150,9 +1257,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
         }
 
         // Get the versioned emitter data (UE 5.7+)
-        FVersionedNiagaraEmitterData* EmitterData = Handle->GetEmitterData();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetEmitterData();
         FVersionedNiagaraEmitter VersionedEmitter = Handle->GetInstance();
         UNiagaraEmitter* Emitter = VersionedEmitter.Emitter;
+#else
+        // UE 5.0: GetInstance() returns UNiagaraEmitter* directly
+        MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle->GetInstance();
+        UNiagaraEmitter* Emitter = Handle->GetInstance();
+#endif
         if (EmitterData && Emitter)
         {
             UNiagaraLightRendererProperties* LightRenderer = nullptr;
@@ -1173,10 +1286,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                     SendAutomationError(RequestingSocket, RequestId, TEXT("Failed to create light renderer"), TEXT("CREATION_FAILED"));
                     return true;
                 }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 Emitter->AddRenderer(LightRenderer, VersionedEmitter.Version);
+#else
+                // UE 5.0: AddRenderer only takes the renderer
+                Emitter->AddRenderer(LightRenderer);
+#endif
             }
 
-            double LightRadius = GetNumberField(Payload, TEXT("lightRadius"), 100.0);
+            double LightRadius = GetNumberFieldNiagAuth(Payload, TEXT("lightRadius"), 100.0);
             LightRenderer->RadiusScale = static_cast<float>(LightRadius);
         }
 
@@ -1185,6 +1303,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("LightRenderer"));
         Result->SetStringField(TEXT("message"), TEXT("Configured light renderer module."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Light renderer configured."), Result);
@@ -1206,16 +1325,17 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString CollisionMode = GetStringField(Payload, TEXT("collisionMode"), TEXT("SceneDepth"));
-        double Restitution = GetNumberField(Payload, TEXT("restitution"), 0.3);
-        double Friction = GetNumberField(Payload, TEXT("friction"), 0.2);
-        bool bDieOnCollision = GetBoolField(Payload, TEXT("dieOnCollision"), false);
+        FString CollisionMode = GetStringFieldNiagAuth(Payload, TEXT("collisionMode"), TEXT("SceneDepth"));
+        double Restitution = GetNumberFieldNiagAuth(Payload, TEXT("restitution"), 0.3);
+        double Friction = GetNumberFieldNiagAuth(Payload, TEXT("friction"), 0.2);
+        bool bDieOnCollision = GetBoolFieldNiagAuth(Payload, TEXT("dieOnCollision"), false);
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("Collision"));
         Result->SetStringField(TEXT("collisionMode"), CollisionMode);
         Result->SetNumberField(TEXT("restitution"), Restitution);
@@ -1241,13 +1361,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString KillCondition = GetStringField(Payload, TEXT("killCondition"), TEXT("Age"));
+        FString KillCondition = GetStringFieldNiagAuth(Payload, TEXT("killCondition"), TEXT("Age"));
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("KillParticles"));
         Result->SetStringField(TEXT("killCondition"), KillCondition);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Configured kill particles module: condition=%s"), *KillCondition));
@@ -1270,13 +1391,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        double CameraOffset = GetNumberField(Payload, TEXT("cameraOffset"), 0.0);
+        double CameraOffset = GetNumberFieldNiagAuth(Payload, TEXT("cameraOffset"), 0.0);
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("moduleName"), TEXT("CameraOffset"));
         Result->SetNumberField(TEXT("cameraOffset"), CameraOffset);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Configured camera offset module: offset=%.1f"), CameraOffset));
@@ -1296,8 +1418,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString ParamName = GetStringField(Payload, TEXT("parameterName"));
-        FString ParamType = GetStringField(Payload, TEXT("parameterType"), TEXT("Float"));
+        FString ParamName = GetStringFieldNiagAuth(Payload, TEXT("parameterName"));
+        FString ParamType = GetStringFieldNiagAuth(Payload, TEXT("parameterType"), TEXT("Float"));
 
         if (ParamName.IsEmpty())
         {
@@ -1348,6 +1470,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("parameterName"), ParamName);
         Result->SetStringField(TEXT("parameterType"), ParamType);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Added user parameter '%s' of type %s."), *ParamName, *ParamType));
@@ -1363,7 +1486,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString ParamName = GetStringField(Payload, TEXT("parameterName"));
+        FString ParamName = GetStringFieldNiagAuth(Payload, TEXT("parameterName"));
         if (ParamName.IsEmpty())
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'parameterName'."), TEXT("INVALID_ARGUMENT"));
@@ -1407,7 +1530,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             const TSharedPtr<FJsonObject>* ValObj;
             if (Payload->TryGetObjectField(TEXT("parameterValue"), ValObj))
             {
-                FVector Vec = GetVectorFromJson(*ValObj);
+                FVector Vec = GetVectorFromJsonNiag(*ValObj);
                 UserStore.SetParameterValue(Vec, VecVar);
             }
         }
@@ -1422,6 +1545,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("parameterName"), ParamName);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Set parameter '%s' value."), *ParamName));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Parameter value set."), Result);
@@ -1436,8 +1560,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString ParamName = GetStringField(Payload, TEXT("parameterName"));
-        FString SourceBinding = GetStringField(Payload, TEXT("sourceBinding"));
+        FString ParamName = GetStringFieldNiagAuth(Payload, TEXT("parameterName"));
+        FString SourceBinding = GetStringFieldNiagAuth(Payload, TEXT("sourceBinding"));
 
         if (ParamName.IsEmpty() || SourceBinding.IsEmpty())
         {
@@ -1459,6 +1583,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("parameterName"), ParamName);
         Result->SetStringField(TEXT("sourceBinding"), SourceBinding);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Bound parameter '%s' to source '%s'."), *ParamName, *SourceBinding));
@@ -1481,13 +1606,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString SkeletalMeshPath = GetStringField(Payload, TEXT("skeletalMeshPath"));
+        FString SkeletalMeshPath = GetStringFieldNiagAuth(Payload, TEXT("skeletalMeshPath"));
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("dataInterface"), TEXT("SkeletalMesh"));
         Result->SetStringField(TEXT("message"), TEXT("Added Skeletal Mesh data interface."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Skeletal Mesh DI added."), Result);
@@ -1509,13 +1635,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString StaticMeshPath = GetStringField(Payload, TEXT("staticMeshPath"));
+        FString StaticMeshPath = GetStringFieldNiagAuth(Payload, TEXT("staticMeshPath"));
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("dataInterface"), TEXT("StaticMesh"));
         Result->SetStringField(TEXT("message"), TEXT("Added Static Mesh data interface."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Static Mesh DI added."), Result);
@@ -1542,6 +1669,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("dataInterface"), TEXT("Spline"));
         Result->SetStringField(TEXT("message"), TEXT("Added Spline data interface."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Spline DI added."), Result);
@@ -1568,6 +1696,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("dataInterface"), TEXT("AudioSpectrum"));
         Result->SetStringField(TEXT("message"), TEXT("Added Audio Spectrum data interface."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Audio Spectrum DI added."), Result);
@@ -1594,6 +1723,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("dataInterface"), TEXT("CollisionQuery"));
         Result->SetStringField(TEXT("message"), TEXT("Added Collision Query data interface."));
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Collision Query DI added."), Result);
@@ -1612,7 +1742,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString EventName = GetStringField(Payload, TEXT("eventName"));
+        FString EventName = GetStringFieldNiagAuth(Payload, TEXT("eventName"));
         if (EventName.IsEmpty())
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'eventName'."), TEXT("INVALID_ARGUMENT"));
@@ -1631,6 +1761,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("eventName"), EventName);
         Result->SetStringField(TEXT("eventType"), TEXT("Generator"));
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Added event generator '%s'."), *EventName));
@@ -1646,7 +1777,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString EventName = GetStringField(Payload, TEXT("eventName"));
+        FString EventName = GetStringFieldNiagAuth(Payload, TEXT("eventName"));
         if (EventName.IsEmpty())
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'eventName'."), TEXT("INVALID_ARGUMENT"));
@@ -1660,14 +1791,15 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        bool bSpawnOnEvent = GetBoolField(Payload, TEXT("spawnOnEvent"), false);
-        double EventSpawnCount = GetNumberField(Payload, TEXT("eventSpawnCount"), 1.0);
+        bool bSpawnOnEvent = GetBoolFieldNiagAuth(Payload, TEXT("spawnOnEvent"), false);
+        double EventSpawnCount = GetNumberFieldNiagAuth(Payload, TEXT("eventSpawnCount"), 1.0);
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("eventName"), EventName);
         Result->SetStringField(TEXT("eventType"), TEXT("Receiver"));
         Result->SetBoolField(TEXT("spawnOnEvent"), bSpawnOnEvent);
@@ -1684,7 +1816,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString EventName = GetStringField(Payload, TEXT("eventName"));
+        FString EventName = GetStringFieldNiagAuth(Payload, TEXT("eventName"));
         if (EventName.IsEmpty())
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'eventName'."), TEXT("INVALID_ARGUMENT"));
@@ -1708,8 +1840,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                 const TSharedPtr<FJsonObject>* AttrObj;
                 if (Item->TryGetObject(AttrObj) && AttrObj->IsValid())
                 {
-                    FString AttrName = GetStringField(*AttrObj, TEXT("name"));
-                    FString AttrType = GetStringField(*AttrObj, TEXT("type"));
+                    FString AttrName = GetStringFieldNiagAuth(*AttrObj, TEXT("name"));
+                    FString AttrType = GetStringFieldNiagAuth(*AttrObj, TEXT("type"));
                     PayloadAttributes.Add(FString::Printf(TEXT("%s:%s"), *AttrName, *AttrType));
                 }
             }
@@ -1720,6 +1852,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("eventName"), EventName);
         Result->SetNumberField(TEXT("payloadAttributeCount"), PayloadAttributes.Num());
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Configured event payload for '%s' with %d attributes."), *EventName, PayloadAttributes.Num()));
@@ -1749,26 +1882,36 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
         UNiagaraEmitter* Emitter = Handle->GetInstance().Emitter;
         if (Emitter)
         {
             // Enable GPU simulation by setting simulation target
             // This requires accessing the versioned emitter data
-            FVersionedNiagaraEmitterData* EmitterData = Emitter->GetLatestEmitterData();
+            MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = MCP_GET_LATEST_EMITTER_DATA(Emitter);
             if (EmitterData)
             {
                 EmitterData->SimTarget = ENiagaraSimTarget::GPUComputeSim;
             }
         }
+#else
+        // UE 5.0: GetInstance() returns UNiagaraEmitter* directly
+        UNiagaraEmitter* Emitter = Handle->GetInstance();
+        if (Emitter)
+        {
+            Emitter->SimTarget = ENiagaraSimTarget::GPUComputeSim;
+        }
+#endif
 
-        bool bFixedBounds = GetBoolField(Payload, TEXT("fixedBoundsEnabled"), false);
-        bool bDeterministic = GetBoolField(Payload, TEXT("deterministicEnabled"), false);
+        bool bFixedBounds = GetBoolFieldNiagAuth(Payload, TEXT("fixedBoundsEnabled"), false);
+        bool bDeterministic = GetBoolFieldNiagAuth(Payload, TEXT("deterministicEnabled"), false);
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetBoolField(TEXT("gpuEnabled"), true);
         Result->SetBoolField(TEXT("fixedBoundsEnabled"), bFixedBounds);
         Result->SetBoolField(TEXT("deterministicEnabled"), bDeterministic);
@@ -1785,7 +1928,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString StageName = GetStringField(Payload, TEXT("stageName"));
+        FString StageName = GetStringFieldNiagAuth(Payload, TEXT("stageName"));
         if (StageName.IsEmpty())
         {
             SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'stageName'."), TEXT("INVALID_ARGUMENT"));
@@ -1799,13 +1942,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             return true;
         }
 
-        FString IterationSource = GetStringField(Payload, TEXT("stageIterationSource"), TEXT("Particles"));
+        FString IterationSource = GetStringFieldNiagAuth(Payload, TEXT("stageIterationSource"), TEXT("Particles"));
 
         if (bSave)
         {
             System->MarkPackageDirty();
         }
 
+        AddAssetVerification(Result, System);
         Result->SetStringField(TEXT("stageName"), StageName);
         Result->SetStringField(TEXT("iterationSource"), IterationSource);
         Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Added simulation stage '%s'."), *StageName));
@@ -1855,10 +1999,14 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                 EmitterObj->SetStringField(TEXT("name"), Handle.GetName().ToString());
                 EmitterObj->SetBoolField(TEXT("enabled"), Handle.GetIsEnabled());
                 
+                #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 UNiagaraEmitter* Em = Handle.GetInstance().Emitter;
+                #else
+                UNiagaraEmitter* Em = Handle.GetInstance();
+                #endif
                 if (Em)
                 {
-                    FVersionedNiagaraEmitterData* EmData = Em->GetLatestEmitterData();
+                    MCP_NIAGARA_EMITTER_DATA_TYPE* EmData = MCP_GET_LATEST_EMITTER_DATA(Em);
                     if (EmData)
                     {
                         EmitterObj->SetStringField(TEXT("simulationTarget"), EmData->SimTarget == ENiagaraSimTarget::GPUComputeSim ? TEXT("GPU") : TEXT("CPU"));
@@ -1890,8 +2038,12 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             bool bHasGPU = false;
             for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
             {
+                #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 UNiagaraEmitter* Em = Handle.GetInstance().Emitter;
-                if (Em && Em->GetLatestEmitterData() && Em->GetLatestEmitterData()->SimTarget == ENiagaraSimTarget::GPUComputeSim)
+                #else
+                UNiagaraEmitter* Em = Handle.GetInstance();
+                #endif
+                if (Em && MCP_GET_LATEST_EMITTER_DATA(Em) && MCP_GET_LATEST_EMITTER_DATA(Em)->SimTarget == ENiagaraSimTarget::GPUComputeSim)
                 {
                     bHasGPU = true;
                     break;
@@ -1904,7 +2056,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
             InfoObj->SetStringField(TEXT("assetType"), TEXT("Emitter"));
             InfoObj->SetStringField(TEXT("name"), Emitter->GetName());
             
-            FVersionedNiagaraEmitterData* EmData = Emitter->GetLatestEmitterData();
+            MCP_NIAGARA_EMITTER_DATA_TYPE* EmData = MCP_GET_LATEST_EMITTER_DATA(Emitter);
             if (EmData)
             {
                 InfoObj->SetStringField(TEXT("simulationTarget"), EmData->SimTarget == ENiagaraSimTarget::GPUComputeSim ? TEXT("GPU") : TEXT("CPU"));
@@ -1953,7 +2105,12 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
                     FString::Printf(TEXT("Emitter '%s' is disabled."), *Handle.GetName().ToString()))));
             }
 
-            FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+            // Get emitter data - UE 5.1+ uses GetEmitterData(), UE 5.0 uses GetInstance()
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+            MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle.GetEmitterData();
+#else
+            MCP_NIAGARA_EMITTER_DATA_TYPE* EmitterData = Handle.GetInstance();
+#endif
             if (EmitterData)
             {
                 // Check for renderers (UE 5.7+)
@@ -1982,5 +2139,10 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNiagaraAuthoringAction(
 #else
     SendAutomationError(RequestingSocket, RequestId, TEXT("Editor only."), TEXT("EDITOR_ONLY"));
     return true;
-#endif
+#endif // WITH_EDITOR
 }
+
+#undef GetStringFieldNiagAuth
+#undef GetNumberFieldNiagAuth
+#undef GetBoolFieldNiagAuth
+

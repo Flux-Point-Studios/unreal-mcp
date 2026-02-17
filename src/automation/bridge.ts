@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import net from 'node:net';
 import { WebSocket } from 'ws';
 import { Logger } from '../utils/logger.js';
 import {
@@ -8,6 +9,8 @@ import {
     DEFAULT_HEARTBEAT_INTERVAL_MS,
     DEFAULT_MAX_PENDING_REQUESTS,
     DEFAULT_MAX_QUEUED_REQUESTS,
+    DEFAULT_MAX_INBOUND_MESSAGES_PER_MINUTE,
+    DEFAULT_MAX_INBOUND_AUTOMATION_REQUESTS_PER_MINUTE,
     MAX_WS_MESSAGE_SIZE_BYTES
 } from '../constants.js';
 import { createRequire } from 'node:module';
@@ -29,6 +32,7 @@ import {
     type LaunchOptions,
     type LaunchMode
 } from '../utils/editor-launch.js';
+import { automationMessageSchema } from './message-schema.js';
 
 const require = createRequire(import.meta.url);
 const packageInfo: { name?: string; version?: string } = (() => {
@@ -55,6 +59,7 @@ export class AutomationBridge extends EventEmitter {
     private readonly serverLegacyEnabled: boolean;
     private readonly maxConcurrentConnections: number;
     private readonly maxQueuedRequests: number;
+    private readonly useTls: boolean;
 
     private connectionManager: ConnectionManager;
     private requestTracker: RequestTracker;
@@ -82,7 +87,101 @@ export class AutomationBridge extends EventEmitter {
 
     constructor(options: AutomationBridgeOptions = {}) {
         super();
-        this.host = options.host ?? process.env.MCP_AUTOMATION_WS_HOST ?? DEFAULT_AUTOMATION_HOST;
+        
+        // Check if non-loopback binding is allowed (opt-in for LAN access)
+        const allowNonLoopback = options.allowNonLoopback
+            ?? (process.env.MCP_AUTOMATION_ALLOW_NON_LOOPBACK?.toLowerCase() === 'true');
+
+        const normalizeHost = (value: unknown, label: string): string => {
+            const stringValue = typeof value === 'string'
+                ? value
+                : value === undefined || value === null
+                    ? ''
+                    : String(value);
+
+            const trimmed = stringValue.trim();
+            if (trimmed.length === 0) {
+                return DEFAULT_AUTOMATION_HOST;
+            }
+
+            const lower = trimmed.toLowerCase();
+            
+            // Always allow loopback addresses
+            if (lower === 'localhost' || lower === '127.0.0.1') {
+                return '127.0.0.1';
+            }
+            if (lower === '::1' || lower === '[::1]') {
+                return '::1';
+            }
+
+            // Non-loopback: check if allowed
+            if (allowNonLoopback) {
+                // Strip brackets from IPv6 if present
+                let addressToValidate = trimmed;
+                if (addressToValidate.startsWith('[') && addressToValidate.endsWith(']')) {
+                    addressToValidate = addressToValidate.slice(1, -1);
+                }
+                
+                // Strip zone ID if present (e.g., fe80::1%eth0 -> fe80::1)
+                const zoneIndex = addressToValidate.indexOf('%');
+                const addressWithoutZone = zoneIndex >= 0 
+                    ? addressToValidate.slice(0, zoneIndex) 
+                    : addressToValidate;
+                
+                // Use Node.js net module for validation (IPv4 and IPv6)
+                const ipVersion = net.isIP(addressWithoutZone);
+                
+                if (ipVersion === 4 || ipVersion === 6) {
+                    this.log.warn(
+                        `SECURITY: ${label} set to non-loopback address '${trimmed}'. ` +
+                        'The automation bridge will be accessible from your local network.'
+                    );
+                    // Return address without brackets (consistent with loopback handling)
+                    // Brackets will be re-added by formatHostForUrl if needed
+                    return addressToValidate;
+                }
+                
+                // Check if it's a valid hostname (domain name)
+                // Allow hostnames like "example.com", "server.local", "unreal-pc"
+                // Must contain at least one letter (to distinguish from IPs)
+                const hasLetters = /[a-zA-Z]/.test(trimmed);
+                if (hasLetters) {
+                    // Robust hostname validation: split into labels and validate each
+                    // Each label must: not be empty, start/end with alphanumeric, allow hyphens in middle
+                    const labels = trimmed.split('.');
+                    const isValidHostname = labels.every(
+                        (label) => label.length > 0 && /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label)
+                    );
+                    if (isValidHostname) {
+                        this.log.warn(
+                            `SECURITY: ${label} set to hostname '${trimmed}'. ` +
+                            'The automation bridge will be accessible from your local network.'
+                        );
+                        return trimmed;
+                    }
+                }
+                
+                // Invalid IP format or hostname
+                this.log.error(
+                    `${label} '${trimmed}' is not a valid IPv4/IPv6 address or hostname. ` +
+                    `Falling back to ${DEFAULT_AUTOMATION_HOST}.`
+                );
+                return DEFAULT_AUTOMATION_HOST;
+            }
+
+            // Default: loopback-only mode
+            this.log.warn(
+                `${label} '${trimmed}' is not a loopback address and MCP_AUTOMATION_ALLOW_NON_LOOPBACK is not set. ` +
+                `Falling back to ${DEFAULT_AUTOMATION_HOST}. Set MCP_AUTOMATION_ALLOW_NON_LOOPBACK=true for LAN access.`
+            );
+            return DEFAULT_AUTOMATION_HOST;
+        };
+
+        const rawHost = options.host
+            ?? process.env.MCP_AUTOMATION_WS_HOST
+            ?? process.env.MCP_AUTOMATION_HOST
+            ?? DEFAULT_AUTOMATION_HOST;
+        this.host = normalizeHost(rawHost, 'Automation bridge host');
 
         const sanitizePort = (value: unknown): number | null => {
             if (typeof value === 'number' && Number.isInteger(value)) {
@@ -147,16 +246,58 @@ export class AutomationBridge extends EventEmitter {
             ? (options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS)
             : 0;
 
+        const parseNonNegativeInt = (value: unknown, fallback: number): number => {
+            if (typeof value === 'number' && Number.isInteger(value)) {
+                return value >= 0 ? value : fallback;
+            }
+            if (typeof value === 'string' && value.trim().length > 0) {
+                const parsed = Number.parseInt(value.trim(), 10);
+                return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+            }
+            return fallback;
+        };
+
+        const parseBoolean = (value: unknown, defaultValue: boolean): boolean => {
+            if (typeof value === 'boolean') {
+                return value;
+            }
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                if (normalized === 'true') return true;
+                if (normalized === 'false') return false;
+            }
+            return defaultValue;
+        };
+
         const maxPendingRequests = Math.max(1, options.maxPendingRequests ?? DEFAULT_MAX_PENDING_REQUESTS);
         const maxConcurrentConnections = Math.max(1, options.maxConcurrentConnections ?? 10);
         this.maxQueuedRequests = Math.max(0, options.maxQueuedRequests ?? DEFAULT_MAX_QUEUED_REQUESTS);
+        this.useTls = parseBoolean(options.useTls ?? process.env.MCP_AUTOMATION_USE_TLS, false);
+        const maxInboundMessagesPerMinute = parseNonNegativeInt(
+            options.maxInboundMessagesPerMinute
+                ?? process.env.MCP_AUTOMATION_MAX_MESSAGES_PER_MINUTE,
+            DEFAULT_MAX_INBOUND_MESSAGES_PER_MINUTE
+        );
+        const maxInboundAutomationRequestsPerMinute = parseNonNegativeInt(
+            options.maxInboundAutomationRequestsPerMinute
+                ?? process.env.MCP_AUTOMATION_MAX_AUTOMATION_REQUESTS_PER_MINUTE,
+            DEFAULT_MAX_INBOUND_AUTOMATION_REQUESTS_PER_MINUTE
+        );
 
-        this.clientHost = options.clientHost ?? process.env.MCP_AUTOMATION_CLIENT_HOST ?? DEFAULT_AUTOMATION_HOST;
+        const rawClientHost = options.clientHost
+            ?? process.env.MCP_AUTOMATION_CLIENT_HOST
+            ?? process.env.MCP_AUTOMATION_HOST
+            ?? DEFAULT_AUTOMATION_HOST;
+        this.clientHost = normalizeHost(rawClientHost, 'Automation bridge client host');
         this.clientPort = options.clientPort ?? sanitizePort(process.env.MCP_AUTOMATION_CLIENT_PORT) ?? DEFAULT_AUTOMATION_PORT;
         this.maxConcurrentConnections = maxConcurrentConnections;
 
         // Initialize components
-        this.connectionManager = new ConnectionManager(heartbeatIntervalMs);
+        this.connectionManager = new ConnectionManager(
+            heartbeatIntervalMs,
+            maxInboundMessagesPerMinute,
+            maxInboundAutomationRequestsPerMinute
+        );
         this.requestTracker = new RequestTracker(maxPendingRequests);
         this.handshakeHandler = new HandshakeHandler(this.capabilityToken);
         this.messageHandler = new MessageHandler(this.requestTracker);
@@ -193,13 +334,14 @@ export class AutomationBridge extends EventEmitter {
             return;
         }
 
-        this.log.info(`Automation bridge connecting to Unreal server at ws://${this.clientHost}:${this.clientPort}`);
+        const url = this.getClientUrl();
+        this.log.info(`Automation bridge connecting to Unreal server at ${url}`);
         this.startClient();
     }
 
     private startClient(): void {
         try {
-            const url = `ws://${this.clientHost}:${this.clientPort}`;
+            const url = this.getClientUrl();
             this.log.info(`Connecting to Unreal Engine automation server at ${url}`);
 
             this.log.debug(`Negotiated protocols: ${JSON.stringify(this.negotiatedProtocols)}`);
@@ -312,7 +454,7 @@ export class AutomationBridge extends EventEmitter {
                     return '';
                 };
 
-                socket.on('message', (data) => {
+                        socket.on('message', (data) => {
                     try {
                         const byteLength = getRawDataByteLength(data);
                         if (byteLength > MAX_WS_MESSAGE_SIZE_BYTES) {
@@ -325,9 +467,23 @@ export class AutomationBridge extends EventEmitter {
                         const text = rawDataToUtf8String(data, byteLength);
                         this.log.debug(`[AutomationBridge Client] Received message: ${text.substring(0, 1000)}`);
                         const parsed = JSON.parse(text) as AutomationBridgeMessage;
+                        
+                        // Check rate limit BEFORE schema validation to prevent DoS via invalid messages
+                        if (!this.connectionManager.recordInboundMessage(socket, false)) {
+                            this.log.warn('Inbound message rate limit exceeded; closing connection.');
+                            socket.close(4008, 'Rate limit exceeded');
+                            return;
+                        }
+                        
+                        const validation = automationMessageSchema.safeParse(parsed);
+                        if (!validation.success) {
+                            this.log.warn('Dropped invalid automation message', validation.error.format());
+                            return;
+                        }
+
                         this.connectionManager.updateLastMessageTime();
-                        this.messageHandler.handleMessage(parsed);
-                        this.emitAutomation('message', parsed);
+                        this.messageHandler.handleMessage(validation.data);
+                        this.emitAutomation('message', validation.data);
                     } catch (error) {
                         this.log.error('Error handling message', error);
                     }
@@ -367,6 +523,23 @@ export class AutomationBridge extends EventEmitter {
                 }
             }
         });
+    }
+
+    private formatHostForUrl(host: string): string {
+        if (!host.includes(':')) {
+            return host;
+        }
+        // Strip zone ID if present (e.g., fe80::1%eth0 -> fe80::1)
+        // Zone IDs are not supported by Node.js URL parser and are only
+        // meaningful for link-local addresses on the local machine
+        const zoneIndex = host.indexOf('%');
+        const hostWithoutZone = zoneIndex >= 0 ? host.slice(0, zoneIndex) : host;
+        return `[${hostWithoutZone}]`;
+    }
+
+    private getClientUrl(): string {
+        const scheme = this.useTls ? 'wss' : 'ws';
+        return `${scheme}://${this.formatHostForUrl(this.clientHost)}:${this.clientPort}`;
     }
 
     stop(): void {
@@ -728,7 +901,8 @@ export class AutomationBridge extends EventEmitter {
         payload: Record<string, unknown>,
         options: { timeoutMs?: number }
     ): Promise<T> {
-        const timeoutMs = options.timeoutMs ?? 60000; // Increased default timeout to 60s
+        // Default timeout reduced to 30s - timeout extensions via progress updates keep long operations alive
+        const timeoutMs = options.timeoutMs ?? 30000;
 
         // Check for coalescing
         const coalesceKey = this.requestTracker.createCoalesceKey(action, payload);

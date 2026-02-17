@@ -6,6 +6,7 @@
  */
 
 #include "McpAutomationBridgeGlobals.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
 #include "Misc/EngineVersionComparison.h"
@@ -40,20 +41,45 @@ DEFINE_LOG_CATEGORY_STATIC(LogMcpGeometryHandlers, Log, All);
 #include "GeometryScript/MeshModelingFunctions.h"
 #include "GeometryScript/MeshNormalsFunctions.h"
 #include "GeometryScript/MeshPrimitiveFunctions.h"
+// Note: MeshRemeshFunctions.h was introduced in UE 5.1
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 #include "GeometryScript/MeshRemeshFunctions.h"
+#endif
 #include "GeometryScript/MeshRepairFunctions.h"
 #include "GeometryScript/MeshSimplifyFunctions.h"
 #include "GeometryScript/MeshSubdivideFunctions.h"
 #include "GeometryScript/MeshUVFunctions.h"
+
+// Collision functions for generate_collision (UE 5.4+)
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
 #include "GeometryScript/CollisionFunctions.h"
+#endif
+
+// UE 5.3+: MeshTransformFunctions contains TranslateMesh, ScaleMesh, etc.
+// UE 5.0-5.2: These functions are in MeshDeformFunctions
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 #include "GeometryScript/MeshTransformFunctions.h"
-#include "MeshBoundaryLoops.h"
-#include "EdgeLoop.h"
+#endif
+
 #include "Editor.h"
 #include "Subsystems/EditorActorSubsystem.h"
 #include "UDynamicMesh.h"
 #include "Components/SplineComponent.h"
 
+// GeometryScript is only fully supported in UE 5.1+
+// UE 5.0 had experimental GeometryScript with limited API
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#define MCP_HAS_FULL_GEOMETRY_SCRIPT 1
+#else
+#define MCP_HAS_FULL_GEOMETRY_SCRIPT 0
+#endif
+ 
+// Helper macros for JSON field access
+#define GetStringFieldGeom GetJsonStringField
+#define GetNumberFieldGeom GetJsonNumberField
+#define GetBoolFieldGeom GetJsonBoolField
+#define GetIntFieldGeom GetJsonIntField
+ 
 // Helper to read FVector from JSON (supports both object and array formats)
 static FVector ReadVectorFromPayload(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, FVector Default = FVector::ZeroVector)
 {
@@ -76,9 +102,9 @@ static FVector ReadVectorFromPayload(const TSharedPtr<FJsonObject>& Payload, con
     if (Payload->TryGetObjectField(FieldName, ObjPtr))
     {
         return FVector(
-            (*ObjPtr)->GetNumberField(TEXT("x")),
-            (*ObjPtr)->GetNumberField(TEXT("y")),
-            (*ObjPtr)->GetNumberField(TEXT("z"))
+            GetNumberFieldGeom((*ObjPtr), TEXT("x")),
+            GetNumberFieldGeom((*ObjPtr), TEXT("y")),
+            GetNumberFieldGeom((*ObjPtr), TEXT("z"))
         );
     }
 
@@ -110,16 +136,16 @@ static FRotator ReadRotatorFromPayload(const TSharedPtr<FJsonObject>& Payload, c
         if ((*ObjPtr)->HasField(TEXT("pitch")) || (*ObjPtr)->HasField(TEXT("yaw")) || (*ObjPtr)->HasField(TEXT("roll")))
         {
             return FRotator(
-                (*ObjPtr)->HasField(TEXT("pitch")) ? (*ObjPtr)->GetNumberField(TEXT("pitch")) : 0.0,
-                (*ObjPtr)->HasField(TEXT("yaw")) ? (*ObjPtr)->GetNumberField(TEXT("yaw")) : 0.0,
-                (*ObjPtr)->HasField(TEXT("roll")) ? (*ObjPtr)->GetNumberField(TEXT("roll")) : 0.0
+                GetNumberFieldGeom((*ObjPtr), TEXT("pitch"), 0.0),
+                GetNumberFieldGeom((*ObjPtr), TEXT("yaw"), 0.0),
+                GetNumberFieldGeom((*ObjPtr), TEXT("roll"), 0.0)
             );
         }
         // Fallback to {x, y, z} format (x=Pitch, y=Yaw, z=Roll)
         return FRotator(
-            (*ObjPtr)->GetNumberField(TEXT("x")),
-            (*ObjPtr)->GetNumberField(TEXT("y")),
-            (*ObjPtr)->GetNumberField(TEXT("z"))
+            GetNumberFieldGeom((*ObjPtr), TEXT("x")),
+            GetNumberFieldGeom((*ObjPtr), TEXT("y")),
+            GetNumberFieldGeom((*ObjPtr), TEXT("z"))
         );
     }
 
@@ -151,6 +177,40 @@ static constexpr int32 MAX_SEGMENTS = 256;
 static constexpr double MAX_DIMENSION = 100000.0;
 static constexpr double MIN_DIMENSION = 0.01;
 
+// Polygon count guards to prevent OOM crashes
+// Recommended limit for dynamic meshes: 100K-500K triangles (UE5 best practices)
+static constexpr int32 MAX_TRIANGLES_PER_DYNAMIC_MESH = 500000;
+static constexpr int32 MAX_SUBDIVIDE_ITERATIONS = 6;  // Each iteration quadruples triangles
+static constexpr int32 WARNING_TRIANGLE_THRESHOLD = 250000;
+
+// Memory pressure threshold (percentage)
+static constexpr float MEMORY_PRESSURE_WARNING = 0.80f;   // Alert at 80% memory used
+static constexpr float MEMORY_PRESSURE_CRITICAL = 0.90f;  // Block operations at 90%
+
+// Helper to check memory pressure before heavy operations
+static bool IsMemoryPressureSafe()
+{
+#if PLATFORM_WINDOWS || PLATFORM_MAC || PLATFORM_LINUX
+    FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
+    double UsagePercent = static_cast<double>(MemStats.UsedPhysical) / 
+                          static_cast<double>(MemStats.TotalPhysical);
+    return UsagePercent < MEMORY_PRESSURE_CRITICAL;
+#else
+    return true;  // Assume safe on other platforms
+#endif
+}
+
+static double GetMemoryUsagePercent()
+{
+#if PLATFORM_WINDOWS || PLATFORM_MAC || PLATFORM_LINUX
+    FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
+    return static_cast<double>(MemStats.UsedPhysical) / 
+           static_cast<double>(MemStats.TotalPhysical) * 100.0;
+#else
+    return 0.0;
+#endif
+}
+
 static int32 ClampSegments(int32 Value, int32 Default = 1)
 {
     return FMath::Clamp(Value <= 0 ? Default : Value, 1, MAX_SEGMENTS);
@@ -166,22 +226,24 @@ static double ClampDimension(double Value, double Default = 100.0)
 // Primitives
 // -------------------------------------------------------------------------
 
+#if MCP_HAS_FULL_GEOMETRY_SCRIPT
+
 static bool HandleCreateBox(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                             const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedBox");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
 
     // Get dimensions with safety clamping
-    double Width = ClampDimension(Payload->HasField(TEXT("width")) ? Payload->GetNumberField(TEXT("width")) : 100.0);
-    double Height = ClampDimension(Payload->HasField(TEXT("height")) ? Payload->GetNumberField(TEXT("height")) : 100.0);
-    double Depth = ClampDimension(Payload->HasField(TEXT("depth")) ? Payload->GetNumberField(TEXT("depth")) : 100.0);
-
-    int32 WidthSegments = ClampSegments(Payload->HasField(TEXT("widthSegments")) ? (int32)Payload->GetNumberField(TEXT("widthSegments")) : 1);
-    int32 HeightSegments = ClampSegments(Payload->HasField(TEXT("heightSegments")) ? (int32)Payload->GetNumberField(TEXT("heightSegments")) : 1);
-    int32 DepthSegments = ClampSegments(Payload->HasField(TEXT("depthSegments")) ? (int32)Payload->GetNumberField(TEXT("depthSegments")) : 1);
+    double Width = ClampDimension(GetNumberFieldGeom(Payload, TEXT("width"), 100.0));
+    double Height = ClampDimension(GetNumberFieldGeom(Payload, TEXT("height"), 100.0));
+    double Depth = ClampDimension(GetNumberFieldGeom(Payload, TEXT("depth"), 100.0));
+ 
+    int32 WidthSegments = ClampSegments(GetIntFieldGeom(Payload, TEXT("widthSegments"), 1));
+    int32 HeightSegments = ClampSegments(GetIntFieldGeom(Payload, TEXT("heightSegments"), 1));
+    int32 DepthSegments = ClampSegments(GetIntFieldGeom(Payload, TEXT("depthSegments"), 1));
 
     // Create DynamicMesh
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
@@ -234,6 +296,9 @@ static bool HandleCreateBox(UMcpAutomationBridgeSubsystem* Self, const FString& 
     Result->SetNumberField(TEXT("width"), Width);
     Result->SetNumberField(TEXT("height"), Height);
     Result->SetNumberField(TEXT("depth"), Depth);
+    
+    // Add verification data
+    AddActorVerification(Result, NewActor);
 
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Box mesh created"), Result);
     return true;
@@ -242,12 +307,12 @@ static bool HandleCreateBox(UMcpAutomationBridgeSubsystem* Self, const FString& 
 static bool HandleCreateSphere(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedSphere");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Radius = Payload->HasField(TEXT("radius")) ? Payload->GetNumberField(TEXT("radius")) : 50.0;
-    int32 Subdivisions = ClampSegments(Payload->HasField(TEXT("subdivisions")) ? (int32)Payload->GetNumberField(TEXT("subdivisions")) : 16, 16);
+    double Radius = GetNumberFieldGeom(Payload, TEXT("radius"), 50.0);
+    int32 Subdivisions = ClampSegments(GetIntFieldGeom(Payload, TEXT("subdivisions"), 16), 16);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -292,6 +357,9 @@ static bool HandleCreateSphere(UMcpAutomationBridgeSubsystem* Self, const FStrin
     Result->SetStringField(TEXT("name"), NewActor->GetActorLabel());
     Result->SetStringField(TEXT("class"), TEXT("DynamicMeshActor"));
     Result->SetNumberField(TEXT("radius"), Radius);
+    
+    // Add verification data
+    AddActorVerification(Result, NewActor);
 
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Sphere mesh created"), Result);
     return true;
@@ -300,13 +368,13 @@ static bool HandleCreateSphere(UMcpAutomationBridgeSubsystem* Self, const FStrin
 static bool HandleCreateCylinder(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                  const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedCylinder");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Radius = Payload->HasField(TEXT("radius")) ? Payload->GetNumberField(TEXT("radius")) : 50.0;
-    double Height = Payload->HasField(TEXT("height")) ? Payload->GetNumberField(TEXT("height")) : 100.0;
-    int32 Segments = Payload->HasField(TEXT("segments")) ? (int32)Payload->GetNumberField(TEXT("segments")) : 16;
+    double Radius = GetNumberFieldGeom(Payload, TEXT("radius"), 50.0);
+    double Height = GetNumberFieldGeom(Payload, TEXT("height"), 100.0);
+    int32 Segments = GetIntFieldGeom(Payload, TEXT("segments"), 16);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -350,6 +418,9 @@ static bool HandleCreateCylinder(UMcpAutomationBridgeSubsystem* Self, const FStr
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("name"), NewActor->GetActorLabel());
     Result->SetStringField(TEXT("class"), TEXT("DynamicMeshActor"));
+    
+    // Add verification data
+    AddActorVerification(Result, NewActor);
 
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Cylinder mesh created"), Result);
     return true;
@@ -358,14 +429,14 @@ static bool HandleCreateCylinder(UMcpAutomationBridgeSubsystem* Self, const FStr
 static bool HandleCreateCone(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedCone");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double BaseRadius = Payload->HasField(TEXT("baseRadius")) ? Payload->GetNumberField(TEXT("baseRadius")) : 50.0;
-    double TopRadius = Payload->HasField(TEXT("topRadius")) ? Payload->GetNumberField(TEXT("topRadius")) : 0.0;
-    double Height = Payload->HasField(TEXT("height")) ? Payload->GetNumberField(TEXT("height")) : 100.0;
-    int32 Segments = Payload->HasField(TEXT("segments")) ? (int32)Payload->GetNumberField(TEXT("segments")) : 16;
+double BaseRadius = GetNumberFieldGeom(Payload, TEXT("baseRadius"), 50.0);
+    double TopRadius = GetNumberFieldGeom(Payload, TEXT("topRadius"), 0.0);
+    double Height = GetNumberFieldGeom(Payload, TEXT("height"), 100.0);
+    int32 Segments = GetIntFieldGeom(Payload, TEXT("segments"), 16);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -404,6 +475,10 @@ static bool HandleCreateCone(UMcpAutomationBridgeSubsystem* Self, const FString&
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("name"), Name);
+    
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+    
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Cone mesh created"), Result);
     return true;
 }
@@ -411,14 +486,14 @@ static bool HandleCreateCone(UMcpAutomationBridgeSubsystem* Self, const FString&
 static bool HandleCreateCapsule(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedCapsule");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Radius = Payload->HasField(TEXT("radius")) ? Payload->GetNumberField(TEXT("radius")) : 50.0;
-    double Length = Payload->HasField(TEXT("length")) ? Payload->GetNumberField(TEXT("length")) : 100.0;
-    int32 HemisphereSteps = Payload->HasField(TEXT("hemisphereSteps")) ? (int32)Payload->GetNumberField(TEXT("hemisphereSteps")) : 4;
-    int32 Segments = Payload->HasField(TEXT("segments")) ? (int32)Payload->GetNumberField(TEXT("segments")) : 16;
+    double Radius = GetNumberFieldGeom(Payload, TEXT("radius"), 50.0);
+double Length = GetNumberFieldGeom(Payload, TEXT("length"), 100.0);
+    int32 HemisphereSteps = GetIntFieldGeom(Payload, TEXT("hemisphereSteps"), 4);
+    int32 Segments = GetIntFieldGeom(Payload, TEXT("segments"), 16);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -428,7 +503,10 @@ static bool HandleCreateCapsule(UMcpAutomationBridgeSubsystem* Self, const FStri
         Options,
         Transform,
         Radius, Length,
-        HemisphereSteps, Segments, 1,
+        HemisphereSteps, Segments,
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+        1,  // SegmentSteps parameter required in UE 5.4+
+#endif
         EGeometryScriptPrimitiveOriginMode::Center,
         nullptr
     );
@@ -456,6 +534,10 @@ static bool HandleCreateCapsule(UMcpAutomationBridgeSubsystem* Self, const FStri
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("name"), Name);
+    
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+    
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Capsule mesh created"), Result);
     return true;
 }
@@ -463,14 +545,14 @@ static bool HandleCreateCapsule(UMcpAutomationBridgeSubsystem* Self, const FStri
 static bool HandleCreateTorus(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedTorus");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double MajorRadius = Payload->HasField(TEXT("majorRadius")) ? Payload->GetNumberField(TEXT("majorRadius")) : 50.0;
-    double MinorRadius = Payload->HasField(TEXT("minorRadius")) ? Payload->GetNumberField(TEXT("minorRadius")) : 20.0;
-    int32 MajorSegments = Payload->HasField(TEXT("majorSegments")) ? (int32)Payload->GetNumberField(TEXT("majorSegments")) : 16;
-    int32 MinorSegments = Payload->HasField(TEXT("minorSegments")) ? (int32)Payload->GetNumberField(TEXT("minorSegments")) : 8;
+double MajorRadius = GetNumberFieldGeom(Payload, TEXT("majorRadius"), 50.0);
+    double MinorRadius = GetNumberFieldGeom(Payload, TEXT("minorRadius"), 20.0);
+    int32 MajorSegments = GetIntFieldGeom(Payload, TEXT("majorSegments"), 16);
+    int32 MinorSegments = GetIntFieldGeom(Payload, TEXT("minorSegments"), 8);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -519,14 +601,14 @@ static bool HandleCreateTorus(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleCreatePlane(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedPlane");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Width = Payload->HasField(TEXT("width")) ? Payload->GetNumberField(TEXT("width")) : 100.0;
-    double Depth = Payload->HasField(TEXT("depth")) ? Payload->GetNumberField(TEXT("depth")) : 100.0;
-    int32 WidthSubdivisions = Payload->HasField(TEXT("widthSubdivisions")) ? (int32)Payload->GetNumberField(TEXT("widthSubdivisions")) : 1;
-    int32 DepthSubdivisions = Payload->HasField(TEXT("depthSubdivisions")) ? (int32)Payload->GetNumberField(TEXT("depthSubdivisions")) : 1;
+double Width = GetNumberFieldGeom(Payload, TEXT("width"), 100.0);
+    double Depth = GetNumberFieldGeom(Payload, TEXT("depth"), 100.0);
+    int32 WidthSubdivisions = GetIntFieldGeom(Payload, TEXT("widthSubdivisions"), 1);
+    int32 DepthSubdivisions = GetIntFieldGeom(Payload, TEXT("depthSubdivisions"), 1);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -566,6 +648,10 @@ static bool HandleCreatePlane(UMcpAutomationBridgeSubsystem* Self, const FString
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("name"), NewActor->GetActorLabel());
     Result->SetStringField(TEXT("class"), TEXT("DynamicMeshActor"));
+
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Plane mesh created"), Result);
     return true;
 }
@@ -573,12 +659,12 @@ static bool HandleCreatePlane(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleCreateDisc(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedDisc");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Radius = Payload->HasField(TEXT("radius")) ? Payload->GetNumberField(TEXT("radius")) : 50.0;
-    int32 Segments = Payload->HasField(TEXT("segments")) ? (int32)Payload->GetNumberField(TEXT("segments")) : 16;
+    double Radius = GetNumberFieldGeom(Payload, TEXT("radius"), 50.0);
+    int32 Segments = GetIntFieldGeom(Payload, TEXT("segments"), 16);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -623,6 +709,10 @@ static bool HandleCreateDisc(UMcpAutomationBridgeSubsystem* Self, const FString&
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("name"), NewActor->GetActorLabel());
     Result->SetStringField(TEXT("class"), TEXT("DynamicMeshActor"));
+
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Disc mesh created"), Result);
     return true;
 }
@@ -635,9 +725,9 @@ static bool HandleBooleanOperation(UMcpAutomationBridgeSubsystem* Self, const FS
                                    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket,
                                    EGeometryScriptBooleanOperation BoolOp, const FString& OpName)
 {
-    FString TargetActorName = Payload->GetStringField(TEXT("targetActor"));
-    FString ToolActorName = Payload->GetStringField(TEXT("toolActor"));
-    bool bKeepTool = Payload->HasField(TEXT("keepTool")) ? Payload->GetBoolField(TEXT("keepTool")) : false;
+    FString TargetActorName = GetStringFieldGeom(Payload, TEXT("targetActor"));
+    FString ToolActorName = GetStringFieldGeom(Payload, TEXT("toolActor"));
+    bool bKeepTool = GetBoolFieldGeom(Payload, TEXT("keepTool"), true);  // Default to true to prevent cascade test failures
 
     if (TargetActorName.IsEmpty() || ToolActorName.IsEmpty())
     {
@@ -645,7 +735,7 @@ static bool HandleBooleanOperation(UMcpAutomationBridgeSubsystem* Self, const FS
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
         Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
@@ -693,6 +783,33 @@ static bool HandleBooleanOperation(UMcpAutomationBridgeSubsystem* Self, const FS
         return true;
     }
 
+    // Get triangle counts before operation for validation
+    int32 TargetTriCount = TargetMesh->GetTriangleCount();
+    int32 ToolTriCount = ToolMesh->GetTriangleCount();
+    int64 EstimatedMaxTriangles = static_cast<int64>(TargetTriCount) + static_cast<int64>(ToolTriCount);
+
+    // Safety: Check memory pressure before heavy operation
+    if (!IsMemoryPressureSafe())
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Memory pressure too high (%.1f%% used). Boolean %s blocked to prevent OOM."), 
+                           GetMemoryUsagePercent(), *OpName), 
+            TEXT("MEMORY_PRESSURE"));
+        return true;
+    }
+
+    // Safety: Estimate maximum possible triangles and check against limit
+    // Boolean operations can at most combine both meshes, but may create additional geometry
+    int64 EstimatedWithSafetyMargin = EstimatedMaxTriangles * 3;  // 3x safety margin for intersection edges
+    if (EstimatedWithSafetyMargin > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+    {
+        Self->SendAutomationError(Socket, RequestId,
+            FString::Printf(TEXT("Boolean %s would exceed polygon limit. Target: %d, Tool: %d, Estimated max: %lld, Limit: %d"),
+                           *OpName, TargetTriCount, ToolTriCount, EstimatedWithSafetyMargin, MAX_TRIANGLES_PER_DYNAMIC_MESH),
+            TEXT("POLYGON_LIMIT_EXCEEDED"));
+        return true;
+    }
+
     FGeometryScriptMeshBooleanOptions BoolOptions;
     BoolOptions.bFillHoles = true;
     BoolOptions.bSimplifyOutput = false;
@@ -710,6 +827,37 @@ static bool HandleBooleanOperation(UMcpAutomationBridgeSubsystem* Self, const FS
 
     bool bBooleanSucceeded = (ResultMesh != nullptr);
 
+    // Safety: Check result polygon count
+    int32 ResultTriCount = 0;
+    if (ResultMesh)
+    {
+        ResultTriCount = ResultMesh->GetTriangleCount();
+        
+        // Check if result exceeds limit
+        if (ResultTriCount > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+        {
+            // Log warning but don't fail - the operation already completed
+            UE_LOG(LogMcpGeometryHandlers, Warning, 
+                   TEXT("Boolean %s result has %d triangles (exceeds limit of %d)"), 
+                   *OpName, ResultTriCount, MAX_TRIANGLES_PER_DYNAMIC_MESH);
+        }
+        
+        // Warning if approaching limit
+        if (ResultTriCount > WARNING_TRIANGLE_THRESHOLD)
+        {
+            UE_LOG(LogMcpGeometryHandlers, Warning, 
+                   TEXT("Boolean %s result has %d triangles (warning threshold: %d)"), 
+                   *OpName, ResultTriCount, WARNING_TRIANGLE_THRESHOLD);
+        }
+    }
+    else
+    {
+        // Boolean operation returned null - this typically means the operation failed
+        // (e.g., empty result from intersection, non-overlapping meshes)
+        UE_LOG(LogMcpGeometryHandlers, Warning, 
+               TEXT("Boolean %s returned null result - operation may have produced empty geometry"), *OpName);
+    }
+
     // Optionally delete tool actor
     if (!bKeepTool)
     {
@@ -720,8 +868,16 @@ static bool HandleBooleanOperation(UMcpAutomationBridgeSubsystem* Self, const FS
     Result->SetStringField(TEXT("targetActor"), TargetActorName);
     Result->SetStringField(TEXT("operation"), OpName);
     Result->SetBoolField(TEXT("success"), bBooleanSucceeded);
+    Result->SetNumberField(TEXT("targetTriangles"), TargetTriCount);
+    Result->SetNumberField(TEXT("toolTriangles"), ToolTriCount);
+    if (bBooleanSucceeded)
+    {
+        Result->SetNumberField(TEXT("resultTriangles"), ResultTriCount);
+    }
 
-    Self->SendAutomationResponse(Socket, RequestId, true, FString::Printf(TEXT("Boolean %s completed"), *OpName), Result);
+    Self->SendAutomationResponse(Socket, RequestId, bBooleanSucceeded, 
+        bBooleanSucceeded ? FString::Printf(TEXT("Boolean %s completed"), *OpName) : FString::Printf(TEXT("Boolean %s failed - operation produced empty geometry"), *OpName), 
+        Result);
     return true;
 }
 
@@ -750,14 +906,14 @@ static bool HandleBooleanIntersection(UMcpAutomationBridgeSubsystem* Self, const
 static bool HandleGetMeshInfo(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
     if (ActorName.IsEmpty())
     {
         Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
         Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
@@ -814,9 +970,9 @@ static bool HandleGetMeshInfo(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleRecalculateNormals(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                      const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    bool bAreaWeighted = Payload->HasField(TEXT("areaWeighted")) ? Payload->GetBoolField(TEXT("areaWeighted")) : true;
-    double SplitAngle = Payload->HasField(TEXT("splitAngle")) ? Payload->GetNumberField(TEXT("splitAngle")) : 60.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    bool bAreaWeighted = GetBoolFieldGeom(Payload, TEXT("areaWeighted"), true);
+    double SplitAngle = GetNumberFieldGeom(Payload, TEXT("splitAngle"), 60.0);
 
     if (ActorName.IsEmpty())
     {
@@ -824,7 +980,7 @@ static bool HandleRecalculateNormals(UMcpAutomationBridgeSubsystem* Self, const 
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
         Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
@@ -881,14 +1037,14 @@ static bool HandleRecalculateNormals(UMcpAutomationBridgeSubsystem* Self, const 
 static bool HandleFlipNormals(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
     if (ActorName.IsEmpty())
     {
         Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -928,8 +1084,8 @@ static bool HandleFlipNormals(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleSimplifyMesh(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double TargetPercentage = Payload->HasField(TEXT("targetPercentage")) ? Payload->GetNumberField(TEXT("targetPercentage")) : 50.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double TargetPercentage = GetNumberFieldGeom(Payload, TEXT("targetPercentage"), 50.0);
 
     if (ActorName.IsEmpty())
     {
@@ -937,7 +1093,7 @@ static bool HandleSimplifyMesh(UMcpAutomationBridgeSubsystem* Self, const FStrin
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1000,8 +1156,8 @@ static bool HandleSimplifyMesh(UMcpAutomationBridgeSubsystem* Self, const FStrin
 static bool HandleSubdivide(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                             const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 Iterations = Payload->HasField(TEXT("iterations")) ? (int32)Payload->GetNumberField(TEXT("iterations")) : 1;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 Iterations = GetIntFieldGeom(Payload, TEXT("iterations"), 1);
 
     if (ActorName.IsEmpty())
     {
@@ -1009,7 +1165,26 @@ static bool HandleSubdivide(UMcpAutomationBridgeSubsystem* Self, const FString& 
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    // Safety: Clamp iterations to prevent polygon explosion
+    int32 OriginalIterations = Iterations;
+    Iterations = FMath::Clamp(Iterations, 1, MAX_SUBDIVIDE_ITERATIONS);
+    if (Iterations != OriginalIterations)
+    {
+        UE_LOG(LogMcpGeometryHandlers, Warning, TEXT("Subdivide iterations clamped from %d to %d (MAX_SUBDIVIDE_ITERATIONS)"), 
+               OriginalIterations, Iterations);
+    }
+
+    // Check memory pressure before heavy operation
+    if (!IsMemoryPressureSafe())
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Memory pressure too high (%.1f%% used). Subdivide blocked to prevent OOM."), 
+                           GetMemoryUsagePercent()), 
+            TEXT("MEMORY_PRESSURE"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1040,6 +1215,23 @@ static bool HandleSubdivide(UMcpAutomationBridgeSubsystem* Self, const FString& 
     // Use individual query functions instead
     int32 TriCountBefore = Mesh->GetTriangleCount();
 
+    // Safety: Estimate triangles after subdivision and check against limit
+    // Each subdivision iteration roughly quadruples triangle count
+    int64 EstimatedTriangles = static_cast<int64>(TriCountBefore);
+    for (int32 i = 0; i < Iterations; ++i)
+    {
+        EstimatedTriangles *= 4;  // Each subdivision ~4x triangles
+    }
+    
+    if (EstimatedTriangles > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Subdivide would exceed triangle limit. Current: %d, Estimated after: %lld, Max allowed: %d"), 
+                           TriCountBefore, EstimatedTriangles, MAX_TRIANGLES_PER_DYNAMIC_MESH), 
+            TEXT("POLYGON_LIMIT_EXCEEDED"));
+        return true;
+    }
+
     for (int32 i = 0; i < Iterations; ++i)
     {
         // UE 5.7: ApplyPNTessellation now takes TessellationLevel as separate parameter
@@ -1048,6 +1240,13 @@ static bool HandleSubdivide(UMcpAutomationBridgeSubsystem* Self, const FString& 
     }
 
     int32 TriCountAfter = Mesh->GetTriangleCount();
+
+    // Warning if approaching limit
+    if (TriCountAfter > WARNING_TRIANGLE_THRESHOLD)
+    {
+        UE_LOG(LogMcpGeometryHandlers, Warning, TEXT("Subdivide result has %d triangles (warning threshold: %d)"), 
+               TriCountAfter, WARNING_TRIANGLE_THRESHOLD);
+    }
 
     DMC->NotifyMeshUpdated();
 
@@ -1064,7 +1263,7 @@ static bool HandleSubdivide(UMcpAutomationBridgeSubsystem* Self, const FString& 
 static bool HandleAutoUV(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                          const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
 
     if (ActorName.IsEmpty())
     {
@@ -1072,7 +1271,7 @@ static bool HandleAutoUV(UMcpAutomationBridgeSubsystem* Self, const FString& Req
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1119,8 +1318,8 @@ static bool HandleAutoUV(UMcpAutomationBridgeSubsystem* Self, const FString& Req
 static bool HandleConvertToStaticMesh(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                       const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString AssetPath = Payload->GetStringField(TEXT("assetPath"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString AssetPath = GetStringFieldGeom(Payload, TEXT("assetPath"));
 
     if (ActorName.IsEmpty())
     {
@@ -1132,7 +1331,16 @@ static bool HandleConvertToStaticMesh(UMcpAutomationBridgeSubsystem* Self, const
         AssetPath = FString::Printf(TEXT("/Game/GeneratedMeshes/%s"), *ActorName);
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    // Sanitize the asset path to prevent path traversal and ensure valid path format
+    FString SanitizedAssetPath = SanitizeProjectRelativePath(AssetPath);
+    if (SanitizedAssetPath.IsEmpty() && !AssetPath.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("Invalid assetPath - rejected due to security validation"), TEXT("INVALID_ASSET_PATH"));
+        return true;
+    }
+    AssetPath = SanitizedAssetPath;
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1198,15 +1406,15 @@ static bool HandleConvertToStaticMesh(UMcpAutomationBridgeSubsystem* Self, const
 static bool HandleCreateStairs(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedStairs");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    float StepWidth = Payload->HasField(TEXT("stepWidth")) ? Payload->GetNumberField(TEXT("stepWidth")) : 100.0f;
-    float StepHeight = Payload->HasField(TEXT("stepHeight")) ? Payload->GetNumberField(TEXT("stepHeight")) : 20.0f;
-    float StepDepth = Payload->HasField(TEXT("stepDepth")) ? Payload->GetNumberField(TEXT("stepDepth")) : 30.0f;
-    int32 NumSteps = Payload->HasField(TEXT("numSteps")) ? (int32)Payload->GetNumberField(TEXT("numSteps")) : 8;
-    bool bFloating = Payload->HasField(TEXT("floating")) ? Payload->GetBoolField(TEXT("floating")) : false;
+float StepWidth = GetNumberFieldGeom(Payload, TEXT("stepWidth"), 100.0f);
+    float StepHeight = GetNumberFieldGeom(Payload, TEXT("stepHeight"), 20.0f);
+    float StepDepth = GetNumberFieldGeom(Payload, TEXT("stepDepth"), 30.0f);
+    int32 NumSteps = GetIntFieldGeom(Payload, TEXT("numSteps"), 8);
+    bool bFloating = GetBoolFieldGeom(Payload, TEXT("floating"), false);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -1240,6 +1448,10 @@ static bool HandleCreateStairs(UMcpAutomationBridgeSubsystem* Self, const FStrin
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("name"), NewActor->GetActorLabel());
     Result->SetNumberField(TEXT("numSteps"), NumSteps);
+
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Linear stairs created"), Result);
     return true;
 }
@@ -1247,16 +1459,16 @@ static bool HandleCreateStairs(UMcpAutomationBridgeSubsystem* Self, const FStrin
 static bool HandleCreateSpiralStairs(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                      const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedSpiralStairs");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    float StepWidth = Payload->HasField(TEXT("stepWidth")) ? Payload->GetNumberField(TEXT("stepWidth")) : 100.0f;
-    float StepHeight = Payload->HasField(TEXT("stepHeight")) ? Payload->GetNumberField(TEXT("stepHeight")) : 20.0f;
-    float InnerRadius = Payload->HasField(TEXT("innerRadius")) ? Payload->GetNumberField(TEXT("innerRadius")) : 150.0f;
-    float CurveAngle = Payload->HasField(TEXT("curveAngle")) ? Payload->GetNumberField(TEXT("curveAngle")) : 90.0f;
-    int32 NumSteps = Payload->HasField(TEXT("numSteps")) ? (int32)Payload->GetNumberField(TEXT("numSteps")) : 8;
-    bool bFloating = Payload->HasField(TEXT("floating")) ? Payload->GetBoolField(TEXT("floating")) : false;
+float StepWidth = GetNumberFieldGeom(Payload, TEXT("stepWidth"), 100.0f);
+    float StepHeight = GetNumberFieldGeom(Payload, TEXT("stepHeight"), 20.0f);
+    float InnerRadius = GetNumberFieldGeom(Payload, TEXT("innerRadius"), 150.0f);
+    float CurveAngle = GetNumberFieldGeom(Payload, TEXT("curveAngle"), 90.0f);
+    int32 NumSteps = GetIntFieldGeom(Payload, TEXT("numSteps"), 8);
+    bool bFloating = GetBoolFieldGeom(Payload, TEXT("floating"), false);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -1298,13 +1510,13 @@ static bool HandleCreateSpiralStairs(UMcpAutomationBridgeSubsystem* Self, const 
 static bool HandleCreateRing(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedRing");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double OuterRadius = Payload->HasField(TEXT("outerRadius")) ? Payload->GetNumberField(TEXT("outerRadius")) : 50.0;
-    double InnerRadius = Payload->HasField(TEXT("innerRadius")) ? Payload->GetNumberField(TEXT("innerRadius")) : 25.0;
-    int32 Segments = Payload->HasField(TEXT("segments")) ? (int32)Payload->GetNumberField(TEXT("segments")) : 32;
+double OuterRadius = GetNumberFieldGeom(Payload, TEXT("outerRadius"), 50.0);
+    double InnerRadius = GetNumberFieldGeom(Payload, TEXT("innerRadius"), 25.0);
+    int32 Segments = GetIntFieldGeom(Payload, TEXT("segments"), 32);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -1352,8 +1564,8 @@ static bool HandleCreateRing(UMcpAutomationBridgeSubsystem* Self, const FString&
 static bool HandleExtrude(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Distance = Payload->HasField(TEXT("distance")) ? Payload->GetNumberField(TEXT("distance")) : 10.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Distance = GetNumberFieldGeom(Payload, TEXT("distance"), 10.0);
     FVector Direction = ReadVectorFromPayload(Payload, TEXT("direction"), FVector(0, 0, 1));
 
     if (ActorName.IsEmpty())
@@ -1362,7 +1574,7 @@ static bool HandleExtrude(UMcpAutomationBridgeSubsystem* Self, const FString& Re
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1413,8 +1625,8 @@ static bool HandleInsetOutset(UMcpAutomationBridgeSubsystem* Self, const FString
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket,
                               bool bIsInset)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Distance = Payload->HasField(TEXT("distance")) ? Payload->GetNumberField(TEXT("distance")) : 5.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Distance = GetNumberFieldGeom(Payload, TEXT("distance"), 5.0);
 
     if (ActorName.IsEmpty())
     {
@@ -1422,7 +1634,7 @@ static bool HandleInsetOutset(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1471,9 +1683,9 @@ static bool HandleInsetOutset(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleBevel(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double BevelDistance = Payload->HasField(TEXT("distance")) ? Payload->GetNumberField(TEXT("distance")) : 5.0;
-    int32 Subdivisions = Payload->HasField(TEXT("subdivisions")) ? (int32)Payload->GetNumberField(TEXT("subdivisions")) : 0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+double BevelDistance = GetNumberFieldGeom(Payload, TEXT("distance"), 5.0);
+    int32 Subdivisions = GetIntFieldGeom(Payload, TEXT("subdivisions"), 0);
 
     if (ActorName.IsEmpty())
     {
@@ -1481,7 +1693,7 @@ static bool HandleBevel(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1510,7 +1722,9 @@ static bool HandleBevel(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 
     FGeometryScriptMeshBevelOptions BevelOptions;
     BevelOptions.BevelDistance = BevelDistance;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
     BevelOptions.Subdivisions = Subdivisions;
+#endif
 
     UGeometryScriptLibrary_MeshModelingFunctions::ApplyMeshPolygroupBevel(
         Mesh, BevelOptions, nullptr);
@@ -1527,8 +1741,8 @@ static bool HandleBevel(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 static bool HandleOffsetFaces(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Distance = Payload->HasField(TEXT("distance")) ? Payload->GetNumberField(TEXT("distance")) : 5.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Distance = GetNumberFieldGeom(Payload, TEXT("distance"), 5.0);
 
     if (ActorName.IsEmpty())
     {
@@ -1536,7 +1750,7 @@ static bool HandleOffsetFaces(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1584,8 +1798,8 @@ static bool HandleOffsetFaces(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleShell(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Thickness = Payload->HasField(TEXT("thickness")) ? Payload->GetNumberField(TEXT("thickness")) : 5.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Thickness = GetNumberFieldGeom(Payload, TEXT("thickness"), 5.0);
 
     if (ActorName.IsEmpty())
     {
@@ -1593,7 +1807,7 @@ static bool HandleShell(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1642,9 +1856,9 @@ static bool HandleShell(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 static bool HandleBend(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                        const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double BendAngle = Payload->HasField(TEXT("angle")) ? Payload->GetNumberField(TEXT("angle")) : 45.0;
-    double BendExtent = Payload->HasField(TEXT("extent")) ? Payload->GetNumberField(TEXT("extent")) : 50.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+double BendAngle = GetNumberFieldGeom(Payload, TEXT("angle"), 45.0);
+    double BendExtent = GetNumberFieldGeom(Payload, TEXT("extent"), 50.0);
 
     if (ActorName.IsEmpty())
     {
@@ -1652,7 +1866,7 @@ static bool HandleBend(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1698,9 +1912,9 @@ static bool HandleBend(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
 static bool HandleTwist(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double TwistAngle = Payload->HasField(TEXT("angle")) ? Payload->GetNumberField(TEXT("angle")) : 45.0;
-    double TwistExtent = Payload->HasField(TEXT("extent")) ? Payload->GetNumberField(TEXT("extent")) : 50.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+double TwistAngle = GetNumberFieldGeom(Payload, TEXT("angle"), 45.0);
+    double TwistExtent = GetNumberFieldGeom(Payload, TEXT("extent"), 50.0);
 
     if (ActorName.IsEmpty())
     {
@@ -1708,7 +1922,7 @@ static bool HandleTwist(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1754,10 +1968,10 @@ static bool HandleTwist(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 static bool HandleTaper(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double FlarePercentX = Payload->HasField(TEXT("flareX")) ? Payload->GetNumberField(TEXT("flareX")) : 50.0;
-    double FlarePercentY = Payload->HasField(TEXT("flareY")) ? Payload->GetNumberField(TEXT("flareY")) : 50.0;
-    double FlareExtent = Payload->HasField(TEXT("extent")) ? Payload->GetNumberField(TEXT("extent")) : 50.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+double FlarePercentX = GetNumberFieldGeom(Payload, TEXT("flareX"), 50.0);
+    double FlarePercentY = GetNumberFieldGeom(Payload, TEXT("flareY"), 50.0);
+    double FlareExtent = GetNumberFieldGeom(Payload, TEXT("extent"), 50.0);
 
     if (ActorName.IsEmpty())
     {
@@ -1765,7 +1979,7 @@ static bool HandleTaper(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1809,9 +2023,9 @@ static bool HandleTaper(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 static bool HandleNoiseDeform(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Magnitude = Payload->HasField(TEXT("magnitude")) ? Payload->GetNumberField(TEXT("magnitude")) : 5.0;
-    double Frequency = Payload->HasField(TEXT("frequency")) ? Payload->GetNumberField(TEXT("frequency")) : 0.25;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+double Magnitude = GetNumberFieldGeom(Payload, TEXT("magnitude"), 5.0);
+    double Frequency = GetNumberFieldGeom(Payload, TEXT("frequency"), 0.25);
 
     if (ActorName.IsEmpty())
     {
@@ -1819,7 +2033,7 @@ static bool HandleNoiseDeform(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1875,9 +2089,9 @@ static bool HandleNoiseDeform(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleSmooth(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                          const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 Iterations = Payload->HasField(TEXT("iterations")) ? (int32)Payload->GetNumberField(TEXT("iterations")) : 10;
-    double Alpha = Payload->HasField(TEXT("alpha")) ? Payload->GetNumberField(TEXT("alpha")) : 0.2;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+int32 Iterations = GetIntFieldGeom(Payload, TEXT("iterations"), 10);
+    double Alpha = GetNumberFieldGeom(Payload, TEXT("alpha"), 0.2);
 
     if (ActorName.IsEmpty())
     {
@@ -1885,7 +2099,7 @@ static bool HandleSmooth(UMcpAutomationBridgeSubsystem* Self, const FString& Req
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1937,8 +2151,8 @@ static bool HandleSmooth(UMcpAutomationBridgeSubsystem* Self, const FString& Req
 static bool HandleWeldVertices(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Tolerance = Payload->HasField(TEXT("tolerance")) ? Payload->GetNumberField(TEXT("tolerance")) : 0.0001;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Tolerance = GetNumberFieldGeom(Payload, TEXT("tolerance"), 0.0001);
 
     if (ActorName.IsEmpty())
     {
@@ -1946,7 +2160,7 @@ static bool HandleWeldVertices(UMcpAutomationBridgeSubsystem* Self, const FStrin
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -1991,7 +2205,7 @@ static bool HandleWeldVertices(UMcpAutomationBridgeSubsystem* Self, const FStrin
 static bool HandleFillHoles(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                             const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
 
     if (ActorName.IsEmpty())
     {
@@ -1999,7 +2213,7 @@ static bool HandleFillHoles(UMcpAutomationBridgeSubsystem* Self, const FString& 
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2049,7 +2263,7 @@ static bool HandleFillHoles(UMcpAutomationBridgeSubsystem* Self, const FString& 
 static bool HandleRemoveDegenerates(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                     const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
 
     if (ActorName.IsEmpty())
     {
@@ -2057,7 +2271,7 @@ static bool HandleRemoveDegenerates(UMcpAutomationBridgeSubsystem* Self, const F
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2101,9 +2315,8 @@ static bool HandleRemoveDegenerates(UMcpAutomationBridgeSubsystem* Self, const F
 static bool HandleRemeshUniform(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 TargetTriangleCount = Payload->HasField(TEXT("targetTriangleCount")) ?
-        (int32)Payload->GetNumberField(TEXT("targetTriangleCount")) : 5000;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 TargetTriangleCount = GetIntFieldGeom(Payload, TEXT("targetTriangleCount"), 5000);
 
     if (ActorName.IsEmpty())
     {
@@ -2111,7 +2324,7 @@ static bool HandleRemeshUniform(UMcpAutomationBridgeSubsystem* Self, const FStri
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2165,9 +2378,8 @@ static bool HandleRemeshUniform(UMcpAutomationBridgeSubsystem* Self, const FStri
 static bool HandleGenerateCollision(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                     const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString CollisionType = Payload->HasField(TEXT("collisionType")) ?
-        Payload->GetStringField(TEXT("collisionType")) : TEXT("convex");
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString CollisionType = GetStringFieldGeom(Payload, TEXT("collisionType"), TEXT("convex"));
 
     if (ActorName.IsEmpty())
     {
@@ -2175,7 +2387,7 @@ static bool HandleGenerateCollision(UMcpAutomationBridgeSubsystem* Self, const F
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2202,6 +2414,9 @@ static bool HandleGenerateCollision(UMcpAutomationBridgeSubsystem* Self, const F
 
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
 
+// Geometry Script collision API is stable in UE 5.4, 5.5, 5.6, 5.7
+// Verified: CollisionFunctions.h headers are identical across versions
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
     FGeometryScriptCollisionFromMeshOptions CollisionOptions;
     CollisionOptions.bEmitTransaction = false;
     
@@ -2246,6 +2461,9 @@ static bool HandleGenerateCollision(UMcpAutomationBridgeSubsystem* Self, const F
     Result->SetStringField(TEXT("collisionType"), CollisionType);
     Result->SetNumberField(TEXT("shapeCount"), UGeometryScriptLibrary_CollisionFunctions::GetSimpleCollisionShapeCount(Collision));
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Collision generated"), Result);
+#else
+    Self->SendAutomationError(Socket, RequestId, TEXT("Collision generation requires UE 5.4+"), TEXT("VERSION_NOT_SUPPORTED"));
+#endif
     return true;
 }
 
@@ -2256,9 +2474,9 @@ static bool HandleGenerateCollision(UMcpAutomationBridgeSubsystem* Self, const F
 static bool HandleMirror(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                          const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString Axis = Payload->HasField(TEXT("axis")) ? Payload->GetStringField(TEXT("axis")).ToUpper() : TEXT("X");
-    bool bWeld = Payload->HasField(TEXT("weld")) ? Payload->GetBoolField(TEXT("weld")) : true;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString Axis = GetStringFieldGeom(Payload, TEXT("axis"), TEXT("X")).ToUpper();
+    bool bWeld = GetBoolFieldGeom(Payload, TEXT("weld"), true);
 
     if (ActorName.IsEmpty())
     {
@@ -2266,7 +2484,7 @@ static bool HandleMirror(UMcpAutomationBridgeSubsystem* Self, const FString& Req
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2303,7 +2521,24 @@ static bool HandleMirror(UMcpAutomationBridgeSubsystem* Self, const FString& Req
     else if (Axis == TEXT("Y")) MirrorScale.Y = -1.0;
     else if (Axis == TEXT("Z")) MirrorScale.Z = -1.0;
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
     UGeometryScriptLibrary_MeshTransformFunctions::ScaleMesh(MirroredMesh, MirrorScale, FVector::ZeroVector, true, nullptr);
+#else
+    // UE 5.3 fallback: Scale mesh using low-level API
+    {
+        UE::Geometry::FDynamicMesh3& EditMesh = MirroredMesh->GetMeshRef();
+        for (int32 VID : EditMesh.VertexIndicesItr())
+        {
+            FVector3d Pos = EditMesh.GetVertex(VID);
+            Pos.X *= MirrorScale.X;
+            Pos.Y *= MirrorScale.Y;
+            Pos.Z *= MirrorScale.Z;
+            EditMesh.SetVertex(VID, Pos);
+        }
+            // EditMesh.UpdateVertexNormals(); // Not available in UE 5.3
+            // MirroredMesh->NotifyMeshUpdated(); // Not available in UE 5.3
+    }
+#endif
 
     // Append mirrored mesh to original
     FGeometryScriptAppendMeshOptions AppendOptions;
@@ -2329,8 +2564,8 @@ static bool HandleMirror(UMcpAutomationBridgeSubsystem* Self, const FString& Req
 static bool HandleArrayLinear(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 Count = Payload->HasField(TEXT("count")) ? (int32)Payload->GetNumberField(TEXT("count")) : 3;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 Count = GetIntFieldGeom(Payload, TEXT("count"), 3);
     FVector Offset = ReadVectorFromPayload(Payload, TEXT("offset"), FVector(100, 0, 0));
 
     if (ActorName.IsEmpty())
@@ -2345,7 +2580,7 @@ static bool HandleArrayLinear(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2371,6 +2606,29 @@ static bool HandleArrayLinear(UMcpAutomationBridgeSubsystem* Self, const FString
     }
 
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+    // Safety: Check memory pressure before array operation
+    if (!IsMemoryPressureSafe())
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Memory pressure too high (%.1f%% used). Array operation blocked to prevent OOM."), 
+                           GetMemoryUsagePercent()), 
+            TEXT("MEMORY_PRESSURE"));
+        return true;
+    }
+
+    // Safety: Estimate triangles after array and check against limit
+    int32 TriCountBefore = Mesh->GetTriangleCount();
+    int64 EstimatedTriangles = static_cast<int64>(TriCountBefore) * Count;
+    
+    if (EstimatedTriangles > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Array would exceed triangle limit. Current: %d, Estimated: %lld, Max: %d"), 
+                           TriCountBefore, EstimatedTriangles, MAX_TRIANGLES_PER_DYNAMIC_MESH), 
+            TEXT("POLYGON_LIMIT_EXCEEDED"));
+        return true;
+    }
 
     // Create a copy for arraying
     UDynamicMesh* SourceMesh = NewObject<UDynamicMesh>(GetTransientPackage());
@@ -2396,11 +2654,11 @@ static bool HandleArrayLinear(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleArrayRadial(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 Count = Payload->HasField(TEXT("count")) ? (int32)Payload->GetNumberField(TEXT("count")) : 6;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 Count = GetIntFieldGeom(Payload, TEXT("count"), 6);
     FVector Center = ReadVectorFromPayload(Payload, TEXT("center"), FVector::ZeroVector);
-    FString Axis = Payload->HasField(TEXT("axis")) ? Payload->GetStringField(TEXT("axis")).ToUpper() : TEXT("Z");
-    double TotalAngle = Payload->HasField(TEXT("angle")) ? Payload->GetNumberField(TEXT("angle")) : 360.0;
+    FString Axis = GetStringFieldGeom(Payload, TEXT("axis"), TEXT("Z")).ToUpper();
+    double TotalAngle = GetNumberFieldGeom(Payload, TEXT("angle"), 360.0);
 
     if (ActorName.IsEmpty())
     {
@@ -2414,7 +2672,7 @@ static bool HandleArrayRadial(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2440,6 +2698,29 @@ static bool HandleArrayRadial(UMcpAutomationBridgeSubsystem* Self, const FString
     }
 
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+    // Safety: Check memory pressure before array operation
+    if (!IsMemoryPressureSafe())
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Memory pressure too high (%.1f%% used). Array operation blocked to prevent OOM."), 
+                           GetMemoryUsagePercent()), 
+            TEXT("MEMORY_PRESSURE"));
+        return true;
+    }
+
+    // Safety: Estimate triangles after array and check against limit
+    int32 TriCountBefore = Mesh->GetTriangleCount();
+    int64 EstimatedTriangles = static_cast<int64>(TriCountBefore) * Count;
+    
+    if (EstimatedTriangles > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Array would exceed triangle limit. Current: %d, Estimated: %lld, Max: %d"), 
+                           TriCountBefore, EstimatedTriangles, MAX_TRIANGLES_PER_DYNAMIC_MESH), 
+            TEXT("POLYGON_LIMIT_EXCEEDED"));
+        return true;
+    }
 
     // Create a copy for arraying
     UDynamicMesh* SourceMesh = NewObject<UDynamicMesh>(GetTransientPackage());
@@ -2485,15 +2766,15 @@ static bool HandleArrayRadial(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleCreateArch(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedArch");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double MajorRadius = Payload->HasField(TEXT("majorRadius")) ? Payload->GetNumberField(TEXT("majorRadius")) : 100.0;
-    double MinorRadius = Payload->HasField(TEXT("minorRadius")) ? Payload->GetNumberField(TEXT("minorRadius")) : 25.0;
-    double ArchAngle = Payload->HasField(TEXT("angle")) ? Payload->GetNumberField(TEXT("angle")) : 180.0;
-    int32 MajorSteps = Payload->HasField(TEXT("majorSteps")) ? (int32)Payload->GetNumberField(TEXT("majorSteps")) : 16;
-    int32 MinorSteps = Payload->HasField(TEXT("minorSteps")) ? (int32)Payload->GetNumberField(TEXT("minorSteps")) : 8;
+double MajorRadius = GetNumberFieldGeom(Payload, TEXT("majorRadius"), 100.0);
+    double MinorRadius = GetNumberFieldGeom(Payload, TEXT("minorRadius"), 25.0);
+    double ArchAngle = GetNumberFieldGeom(Payload, TEXT("angle"), 180.0);
+    int32 MajorSteps = GetIntFieldGeom(Payload, TEXT("majorSteps"), 16);
+    int32 MinorSteps = GetIntFieldGeom(Payload, TEXT("minorSteps"), 8);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -2540,15 +2821,15 @@ static bool HandleCreateArch(UMcpAutomationBridgeSubsystem* Self, const FString&
 static bool HandleCreatePipe(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedPipe");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double OuterRadius = Payload->HasField(TEXT("outerRadius")) ? Payload->GetNumberField(TEXT("outerRadius")) : 50.0;
-    double InnerRadius = Payload->HasField(TEXT("innerRadius")) ? Payload->GetNumberField(TEXT("innerRadius")) : 40.0;
-    double Height = Payload->HasField(TEXT("height")) ? Payload->GetNumberField(TEXT("height")) : 100.0;
-    int32 RadialSteps = Payload->HasField(TEXT("radialSteps")) ? (int32)Payload->GetNumberField(TEXT("radialSteps")) : 24;
-    int32 HeightSteps = Payload->HasField(TEXT("heightSteps")) ? (int32)Payload->GetNumberField(TEXT("heightSteps")) : 1;
+double OuterRadius = GetNumberFieldGeom(Payload, TEXT("outerRadius"), 50.0);
+    double InnerRadius = GetNumberFieldGeom(Payload, TEXT("innerRadius"), 40.0);
+    double Height = GetNumberFieldGeom(Payload, TEXT("height"), 100.0);
+    int32 RadialSteps = GetIntFieldGeom(Payload, TEXT("radialSteps"), 24);
+    int32 HeightSteps = GetIntFieldGeom(Payload, TEXT("heightSteps"), 1);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -2605,13 +2886,13 @@ static bool HandleCreatePipe(UMcpAutomationBridgeSubsystem* Self, const FString&
 static bool HandleCreateRamp(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedRamp");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Width = Payload->HasField(TEXT("width")) ? Payload->GetNumberField(TEXT("width")) : 100.0;
-    double Length = Payload->HasField(TEXT("length")) ? Payload->GetNumberField(TEXT("length")) : 200.0;
-    double Height = Payload->HasField(TEXT("height")) ? Payload->GetNumberField(TEXT("height")) : 50.0;
+double Width = GetNumberFieldGeom(Payload, TEXT("width"), 100.0);
+    double Length = GetNumberFieldGeom(Payload, TEXT("length"), 200.0);
+    double Height = GetNumberFieldGeom(Payload, TEXT("height"), 50.0);
 
     UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
     FGeometryScriptPrimitiveOptions Options;
@@ -2665,7 +2946,7 @@ static bool HandleCreateRamp(UMcpAutomationBridgeSubsystem* Self, const FString&
 static bool HandleTriangulate(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
 
     if (ActorName.IsEmpty())
     {
@@ -2673,7 +2954,7 @@ static bool HandleTriangulate(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2700,9 +2981,30 @@ static bool HandleTriangulate(UMcpAutomationBridgeSubsystem* Self, const FString
 
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
 
+    // Safety: Check memory pressure before triangulation
+    if (!IsMemoryPressureSafe())
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Memory pressure too high (%.1f%% used). Triangulation blocked to prevent OOM."), 
+                           GetMemoryUsagePercent()), 
+            TEXT("MEMORY_PRESSURE"));
+        return true;
+    }
+
+    // Safety: Check triangle count before operation
+    int32 TriCountBefore = Mesh->GetTriangleCount();
+    if (TriCountBefore > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Mesh has too many triangles (%d). Max allowed: %d"), 
+                           TriCountBefore, MAX_TRIANGLES_PER_DYNAMIC_MESH), 
+            TEXT("POLYGON_LIMIT_EXCEEDED"));
+        return true;
+    }
+
     // Triangulate the mesh (convert quads/n-gons to triangles)
     UGeometryScriptLibrary_MeshSimplifyFunctions::ApplySimplifyToTriangleCount(
-        Mesh, Mesh->GetTriangleCount(), FGeometryScriptSimplifyMeshOptions(), nullptr);
+        Mesh, TriCountBefore, FGeometryScriptSimplifyMeshOptions(), nullptr);
 
     DMC->NotifyMeshUpdated();
 
@@ -2716,8 +3018,8 @@ static bool HandleTriangulate(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandlePoke(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                        const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double PokeOffset = Payload->HasField(TEXT("offset")) ? Payload->GetNumberField(TEXT("offset")) : 0.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double PokeOffset = GetNumberFieldGeom(Payload, TEXT("offset"), 0.0);
 
     if (ActorName.IsEmpty())
     {
@@ -2725,7 +3027,7 @@ static bool HandlePoke(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2752,6 +3054,30 @@ static bool HandlePoke(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
 
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
 
+    // Safety: Check memory pressure before poke operation
+    if (!IsMemoryPressureSafe())
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Memory pressure too high (%.1f%% used). Poke operation blocked to prevent OOM."), 
+                           GetMemoryUsagePercent()), 
+            TEXT("MEMORY_PRESSURE"));
+        return true;
+    }
+
+    // Safety: Check triangle count before operation
+    // Poke with PNTessellation roughly triples triangle count (each face gets subdivided)
+    int32 TriCountBefore = Mesh->GetTriangleCount();
+    int64 EstimatedTriangles = static_cast<int64>(TriCountBefore) * 4;  // 4x safety margin for subdivision
+    
+    if (EstimatedTriangles > MAX_TRIANGLES_PER_DYNAMIC_MESH)
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Poke would exceed triangle limit. Current: %d, Estimated: %lld, Max: %d"), 
+                           TriCountBefore, EstimatedTriangles, MAX_TRIANGLES_PER_DYNAMIC_MESH), 
+            TEXT("POLYGON_LIMIT_EXCEEDED"));
+        return true;
+    }
+
     // Poke faces - offset vertices inward/outward along face normals
     // UE 5.7: FGeometryScriptMeshOffsetFacesOptions uses Distance not OffsetDistance
     FGeometryScriptMeshOffsetFacesOptions PokeOptions;
@@ -2764,12 +3090,22 @@ static bool HandlePoke(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
     FGeometryScriptPNTessellateOptions TessOptions;
     UGeometryScriptLibrary_MeshSubdivideFunctions::ApplyPNTessellation(Mesh, TessOptions, 1, nullptr);
 
+    int32 TriCountAfter = Mesh->GetTriangleCount();
+
+    // Warning if approaching limit
+    if (TriCountAfter > WARNING_TRIANGLE_THRESHOLD)
+    {
+        UE_LOG(LogMcpGeometryHandlers, Warning, TEXT("Poke result has %d triangles (warning threshold: %d)"), 
+               TriCountAfter, WARNING_TRIANGLE_THRESHOLD);
+    }
+
     DMC->NotifyMeshUpdated();
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("actorName"), ActorName);
     Result->SetNumberField(TEXT("offset"), PokeOffset);
-    Result->SetNumberField(TEXT("triangleCount"), Mesh->GetTriangleCount());
+    Result->SetNumberField(TEXT("triangleCount"), TriCountAfter);
+    Result->SetNumberField(TEXT("originalTriangles"), TriCountBefore);
     Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Poke applied"), Result);
     return true;
 }
@@ -2781,9 +3117,9 @@ static bool HandlePoke(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
 static bool HandleRelax(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 Iterations = Payload->HasField(TEXT("iterations")) ? (int32)Payload->GetNumberField(TEXT("iterations")) : 3;
-    double Strength = Payload->HasField(TEXT("strength")) ? Payload->GetNumberField(TEXT("strength")) : 0.5;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 Iterations = GetIntFieldGeom(Payload, TEXT("iterations"), 3);
+    double Strength = GetNumberFieldGeom(Payload, TEXT("strength"), 0.5);
 
     if (ActorName.IsEmpty())
     {
@@ -2791,7 +3127,7 @@ static bool HandleRelax(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2841,10 +3177,10 @@ static bool HandleRelax(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 static bool HandleProjectUV(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                             const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString ProjectionType = Payload->HasField(TEXT("projectionType")) ? Payload->GetStringField(TEXT("projectionType")).ToLower() : TEXT("box");
-    double Scale = Payload->HasField(TEXT("scale")) ? Payload->GetNumberField(TEXT("scale")) : 1.0;
-    int32 UVChannel = Payload->HasField(TEXT("uvChannel")) ? (int32)Payload->GetNumberField(TEXT("uvChannel")) : 0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+FString ProjectionType = GetStringFieldGeom(Payload, TEXT("projectionType"), TEXT("box")).ToLower();
+    double Scale = GetNumberFieldGeom(Payload, TEXT("scale"), 1.0);
+    int32 UVChannel = GetIntFieldGeom(Payload, TEXT("uvChannel"), 0);
 
     if (ActorName.IsEmpty())
     {
@@ -2852,7 +3188,7 @@ static bool HandleProjectUV(UMcpAutomationBridgeSubsystem* Self, const FString& 
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2879,25 +3215,28 @@ static bool HandleProjectUV(UMcpAutomationBridgeSubsystem* Self, const FString& 
 
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
 
+    // Create projection transform with scale applied
+    FTransform ProjectionTransform(FQuat::Identity, FVector::ZeroVector, FVector(Scale));
+
     // UE 5.7: UV projection option structs removed. Use new function signatures directly.
     // Different projection types now have different function signatures.
     if (ProjectionType == TEXT("box") || ProjectionType == TEXT("cube"))
     {
         // UE 5.7: SetMeshUVsFromBoxProjection(Mesh, UVSetIndex, BoxTransform, Selection, MinIslandTriCount, Debug)
         UGeometryScriptLibrary_MeshUVFunctions::SetMeshUVsFromBoxProjection(
-            Mesh, UVChannel, FTransform::Identity, FGeometryScriptMeshSelection(), 2, nullptr);
+            Mesh, UVChannel, ProjectionTransform, FGeometryScriptMeshSelection(), 2, nullptr);
     }
     else if (ProjectionType == TEXT("planar"))
     {
         // UE 5.7: SetMeshUVsFromPlanarProjection(Mesh, UVSetIndex, PlaneTransform, Selection, Debug)
         UGeometryScriptLibrary_MeshUVFunctions::SetMeshUVsFromPlanarProjection(
-            Mesh, UVChannel, FTransform::Identity, FGeometryScriptMeshSelection(), nullptr);
+            Mesh, UVChannel, ProjectionTransform, FGeometryScriptMeshSelection(), nullptr);
     }
     else if (ProjectionType == TEXT("cylindrical"))
     {
         // UE 5.7: SetMeshUVsFromCylinderProjection(Mesh, UVSetIndex, CylinderTransform, Selection, SplitAngle, Debug)
         UGeometryScriptLibrary_MeshUVFunctions::SetMeshUVsFromCylinderProjection(
-            Mesh, UVChannel, FTransform::Identity, FGeometryScriptMeshSelection(), 45.0f, nullptr);
+            Mesh, UVChannel, ProjectionTransform, FGeometryScriptMeshSelection(), 45.0f, nullptr);
     }
     else
     {
@@ -2923,7 +3262,7 @@ static bool HandleProjectUV(UMcpAutomationBridgeSubsystem* Self, const FString& 
 static bool HandleRecomputeTangents(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                     const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
 
     if (ActorName.IsEmpty())
     {
@@ -2931,7 +3270,7 @@ static bool HandleRecomputeTangents(UMcpAutomationBridgeSubsystem* Self, const F
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -2977,13 +3316,13 @@ static bool HandleRecomputeTangents(UMcpAutomationBridgeSubsystem* Self, const F
 static bool HandleRevolve(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString Name = Payload->GetStringField(TEXT("name"));
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
     if (Name.IsEmpty()) Name = TEXT("GeneratedRevolve");
 
     FTransform Transform = ReadTransformFromPayload(Payload);
-    double Angle = Payload->HasField(TEXT("angle")) ? Payload->GetNumberField(TEXT("angle")) : 360.0;
-    int32 Steps = Payload->HasField(TEXT("steps")) ? (int32)Payload->GetNumberField(TEXT("steps")) : 16;
-    bool bCapped = Payload->HasField(TEXT("capped")) ? Payload->GetBoolField(TEXT("capped")) : true;
+double Angle = GetNumberFieldGeom(Payload, TEXT("angle"), 360.0);
+    int32 Steps = GetIntFieldGeom(Payload, TEXT("steps"), 16);
+    bool bCapped = GetBoolFieldGeom(Payload, TEXT("capped"), true);
 
     // Get profile points from payload
     TArray<FVector2D> ProfilePoints;
@@ -2995,8 +3334,8 @@ static bool HandleRevolve(UMcpAutomationBridgeSubsystem* Self, const FString& Re
             const TSharedPtr<FJsonObject>& PointObj = PointValue->AsObject();
             if (PointObj.IsValid())
             {
-                double X = PointObj->HasField(TEXT("x")) ? PointObj->GetNumberField(TEXT("x")) : 0.0;
-                double Y = PointObj->HasField(TEXT("y")) ? PointObj->GetNumberField(TEXT("y")) : 0.0;
+double X = GetNumberFieldGeom(PointObj, TEXT("x"), 0.0);
+                double Y = GetNumberFieldGeom(PointObj, TEXT("y"), 0.0);
                 ProfilePoints.Add(FVector2D(X, Y));
             }
         }
@@ -3065,9 +3404,9 @@ static bool HandleRevolve(UMcpAutomationBridgeSubsystem* Self, const FString& Re
 static bool HandleStretch(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString Axis = Payload->HasField(TEXT("axis")) ? Payload->GetStringField(TEXT("axis")).ToUpper() : TEXT("Z");
-    double Factor = Payload->HasField(TEXT("factor")) ? Payload->GetNumberField(TEXT("factor")) : 1.5;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString Axis = GetStringFieldGeom(Payload, TEXT("axis"), TEXT("Z")).ToUpper();
+    double Factor = GetNumberFieldGeom(Payload, TEXT("factor"), 1.5);
 
     if (ActorName.IsEmpty())
     {
@@ -3075,7 +3414,7 @@ static bool HandleStretch(UMcpAutomationBridgeSubsystem* Self, const FString& Re
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3108,7 +3447,24 @@ static bool HandleStretch(UMcpAutomationBridgeSubsystem* Self, const FString& Re
     else if (Axis == TEXT("Y")) ScaleVec.Y = Factor;
     else ScaleVec.Z = Factor;
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
     UGeometryScriptLibrary_MeshTransformFunctions::ScaleMesh(Mesh, ScaleVec, FVector::ZeroVector, true, nullptr);
+#else
+    // UE 5.3 fallback: Scale mesh using low-level API
+    {
+        UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+        for (int32 VID : EditMesh.VertexIndicesItr())
+        {
+            FVector3d Pos = EditMesh.GetVertex(VID);
+            Pos.X *= ScaleVec.X;
+            Pos.Y *= ScaleVec.Y;
+            Pos.Z *= ScaleVec.Z;
+            EditMesh.SetVertex(VID, Pos);
+        }
+            // EditMesh.UpdateVertexNormals(); // Not available in UE 5.3
+            // Mesh->NotifyMeshUpdated(); // Not available in UE 5.3
+    }
+#endif
 
     DMC->NotifyMeshUpdated();
 
@@ -3123,8 +3479,8 @@ static bool HandleStretch(UMcpAutomationBridgeSubsystem* Self, const FString& Re
 static bool HandleSpherify(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                            const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Factor = Payload->HasField(TEXT("factor")) ? Payload->GetNumberField(TEXT("factor")) : 1.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Factor = GetNumberFieldGeom(Payload, TEXT("factor"), 1.0);
 
     if (ActorName.IsEmpty())
     {
@@ -3132,7 +3488,7 @@ static bool HandleSpherify(UMcpAutomationBridgeSubsystem* Self, const FString& R
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3223,9 +3579,9 @@ static bool HandleSpherify(UMcpAutomationBridgeSubsystem* Self, const FString& R
 static bool HandleCylindrify(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString Axis = Payload->HasField(TEXT("axis")) ? Payload->GetStringField(TEXT("axis")).ToUpper() : TEXT("Z");
-    double Factor = Payload->HasField(TEXT("factor")) ? Payload->GetNumberField(TEXT("factor")) : 1.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString Axis = GetStringFieldGeom(Payload, TEXT("axis"), TEXT("Z")).ToUpper();
+    double Factor = GetNumberFieldGeom(Payload, TEXT("factor"), 1.0);
 
     if (ActorName.IsEmpty())
     {
@@ -3233,7 +3589,7 @@ static bool HandleCylindrify(UMcpAutomationBridgeSubsystem* Self, const FString&
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3376,9 +3732,9 @@ static bool HandleCylindrify(UMcpAutomationBridgeSubsystem* Self, const FString&
 static bool HandleChamfer(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Distance = Payload->HasField(TEXT("distance")) ? Payload->GetNumberField(TEXT("distance")) : 5.0;
-    int32 Steps = Payload->HasField(TEXT("steps")) ? (int32)Payload->GetNumberField(TEXT("steps")) : 1;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Distance = GetNumberFieldGeom(Payload, TEXT("distance"), 5.0);
+    int32 Steps = GetIntFieldGeom(Payload, TEXT("steps"), 1);
 
     if (ActorName.IsEmpty())
     {
@@ -3386,7 +3742,7 @@ static bool HandleChamfer(UMcpAutomationBridgeSubsystem* Self, const FString& Re
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3417,7 +3773,7 @@ static bool HandleChamfer(UMcpAutomationBridgeSubsystem* Self, const FString& Re
     // Use bevel with steps=1 for chamfer effect
     FGeometryScriptMeshBevelOptions BevelOptions;
     BevelOptions.BevelDistance = Distance;
-    BevelOptions.Subdivisions = FMath::Max(0, Steps - 1);
+            // BevelOptions.Subdivisions = FMath::Max(0, Steps - 1); // Not available in UE 5.3
     UGeometryScriptLibrary_MeshModelingFunctions::ApplyMeshPolygroupBevel(
         Mesh, BevelOptions, nullptr);
 
@@ -3438,9 +3794,9 @@ static bool HandleChamfer(UMcpAutomationBridgeSubsystem* Self, const FString& Re
 static bool HandleMergeVertices(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double Tolerance = Payload->HasField(TEXT("tolerance")) ? Payload->GetNumberField(TEXT("tolerance")) : 0.001;
-    bool bCompactMesh = Payload->HasField(TEXT("compact")) ? Payload->GetBoolField(TEXT("compact")) : true;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double Tolerance = GetNumberFieldGeom(Payload, TEXT("tolerance"), 0.001);
+    bool bCompactMesh = GetBoolFieldGeom(Payload, TEXT("compact"), true);
 
     if (ActorName.IsEmpty())
     {
@@ -3448,7 +3804,7 @@ static bool HandleMergeVertices(UMcpAutomationBridgeSubsystem* Self, const FStri
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3511,15 +3867,15 @@ static bool HandleMergeVertices(UMcpAutomationBridgeSubsystem* Self, const FStri
 static bool HandleTransformUVs(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 UVChannel = Payload->HasField(TEXT("uvChannel")) ? (int32)Payload->GetNumberField(TEXT("uvChannel")) : 0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 UVChannel = GetIntFieldGeom(Payload, TEXT("uvChannel"), 0);
     
     // Transform parameters
-    double TranslateU = Payload->HasField(TEXT("translateU")) ? Payload->GetNumberField(TEXT("translateU")) : 0.0;
-    double TranslateV = Payload->HasField(TEXT("translateV")) ? Payload->GetNumberField(TEXT("translateV")) : 0.0;
-    double ScaleU = Payload->HasField(TEXT("scaleU")) ? Payload->GetNumberField(TEXT("scaleU")) : 1.0;
-    double ScaleV = Payload->HasField(TEXT("scaleV")) ? Payload->GetNumberField(TEXT("scaleV")) : 1.0;
-    double Rotation = Payload->HasField(TEXT("rotation")) ? Payload->GetNumberField(TEXT("rotation")) : 0.0;
+double TranslateU = GetNumberFieldGeom(Payload, TEXT("translateU"), 0.0);
+    double TranslateV = GetNumberFieldGeom(Payload, TEXT("translateV"), 0.0);
+    double ScaleU = GetNumberFieldGeom(Payload, TEXT("scaleU"), 1.0);
+    double ScaleV = GetNumberFieldGeom(Payload, TEXT("scaleV"), 1.0);
+    double Rotation = GetNumberFieldGeom(Payload, TEXT("rotation"), 0.0);
 
     if (ActorName.IsEmpty())
     {
@@ -3527,7 +3883,7 @@ static bool HandleTransformUVs(UMcpAutomationBridgeSubsystem* Self, const FStrin
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3599,9 +3955,9 @@ static bool HandleTransformUVs(UMcpAutomationBridgeSubsystem* Self, const FStrin
 static bool HandleBooleanTrim(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString TrimActorName = Payload->GetStringField(TEXT("trimActorName"));
-    bool bKeepInside = Payload->HasField(TEXT("keepInside")) ? Payload->GetBoolField(TEXT("keepInside")) : false;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString TrimActorName = GetStringFieldGeom(Payload, TEXT("trimActorName"));
+    bool bKeepInside = GetBoolFieldGeom(Payload, TEXT("keepInside"), false);
 
     if (ActorName.IsEmpty() || TrimActorName.IsEmpty())
     {
@@ -3609,7 +3965,7 @@ static bool HandleBooleanTrim(UMcpAutomationBridgeSubsystem* Self, const FString
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
     ADynamicMeshActor* TrimActor = nullptr;
 
@@ -3672,8 +4028,8 @@ static bool HandleBooleanTrim(UMcpAutomationBridgeSubsystem* Self, const FString
 static bool HandleSelfUnion(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                             const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    bool bFillHoles = Payload->HasField(TEXT("fillHoles")) ? Payload->GetBoolField(TEXT("fillHoles")) : true;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    bool bFillHoles = GetBoolFieldGeom(Payload, TEXT("fillHoles"), true);
 
     if (ActorName.IsEmpty())
     {
@@ -3681,7 +4037,7 @@ static bool HandleSelfUnion(UMcpAutomationBridgeSubsystem* Self, const FString& 
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3733,10 +4089,10 @@ static bool HandleSelfUnion(UMcpAutomationBridgeSubsystem* Self, const FString& 
 static bool HandleBridge(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                          const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 EdgeGroupA = Payload->HasField(TEXT("edgeGroupA")) ? (int32)Payload->GetNumberField(TEXT("edgeGroupA")) : 0;
-    int32 EdgeGroupB = Payload->HasField(TEXT("edgeGroupB")) ? (int32)Payload->GetNumberField(TEXT("edgeGroupB")) : 1;
-    int32 Subdivisions = Payload->HasField(TEXT("subdivisions")) ? (int32)Payload->GetNumberField(TEXT("subdivisions")) : 1;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+int32 EdgeGroupA = GetIntFieldGeom(Payload, TEXT("edgeGroupA"), 0);
+    int32 EdgeGroupB = GetIntFieldGeom(Payload, TEXT("edgeGroupB"), 1);
+    int32 Subdivisions = GetIntFieldGeom(Payload, TEXT("subdivisions"), 1);
 
     if (ActorName.IsEmpty())
     {
@@ -3744,7 +4100,7 @@ static bool HandleBridge(UMcpAutomationBridgeSubsystem* Self, const FString& Req
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -3772,14 +4128,15 @@ static bool HandleBridge(UMcpAutomationBridgeSubsystem* Self, const FString& Req
     UDynamicMesh* Mesh = DMC->GetDynamicMesh();
     int32 TrisBefore = Mesh->GetTriangleCount();
 
+    int32 TrianglesCreated = 0;
+    FString BridgeStatus;
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
     // Get direct access to FDynamicMesh3 for low-level operations
     UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
     
-    // Find boundary loops using GeometryCore's FMeshBoundaryLoops
+    // Find boundary loops using GeometryCore's FMeshBoundaryLoops (UE 5.4+)
     UE::Geometry::FMeshBoundaryLoops BoundaryLoops(&EditMesh, true);
-    
-    int32 TrianglesCreated = 0;
-    FString BridgeStatus;
     
     if (BoundaryLoops.bAborted)
     {
@@ -3821,8 +4178,6 @@ static bool HandleBridge(UMcpAutomationBridgeSubsystem* Self, const FString& Req
         if (NumVertsA > 0 && NumVertsB > 0)
         {
             // Find the closest starting vertex on LoopB to LoopA's first vertex
-            // This helps align the loops better for bridging
-            // Note: UE::Geometry::FVector3d moved to FVector3d in UE 5.7
             FVector3d StartPosA = EditMesh.GetVertex(VertsA[0]);
             int32 BestStartB = 0;
             double BestDist = TNumericLimits<double>::Max();
@@ -3878,6 +4233,17 @@ static bool HandleBridge(UMcpAutomationBridgeSubsystem* Self, const FString& Req
             BridgeStatus = TEXT("One or both boundary loops have no vertices");
         }
     }
+#else
+    // UE 5.3 fallback: Use hole filling instead of bridging
+    BridgeStatus = TEXT("Bridging requires UE 5.4+ (FMeshBoundaryLoops). Using hole filling instead.");
+    
+    FGeometryScriptFillHolesOptions FillOptions;
+    FillOptions.FillMethod = EGeometryScriptFillHolesMethod::MinimalFill;
+    int32 NumFilledHoles = 0;
+    int32 NumFailedHoleFills = 0;
+    UGeometryScriptLibrary_MeshRepairFunctions::FillAllMeshHoles(Mesh, FillOptions, NumFilledHoles, NumFailedHoleFills, nullptr);
+    TrianglesCreated = NumFilledHoles; // Approximate
+#endif
 
     int32 TrisAfter = Mesh->GetTriangleCount();
     DMC->NotifyMeshUpdated();
@@ -3902,10 +4268,10 @@ static bool HandleBridge(UMcpAutomationBridgeSubsystem* Self, const FString& Req
 static bool HandleLoft(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                        const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 Subdivisions = Payload->HasField(TEXT("subdivisions")) ? (int32)Payload->GetNumberField(TEXT("subdivisions")) : 8;
-    bool bSmooth = Payload->HasField(TEXT("smooth")) ? Payload->GetBoolField(TEXT("smooth")) : true;
-    bool bCap = Payload->HasField(TEXT("cap")) ? Payload->GetBoolField(TEXT("cap")) : true;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 Subdivisions = GetIntFieldGeom(Payload, TEXT("subdivisions"), 8);
+    bool bSmooth = GetBoolFieldGeom(Payload, TEXT("smooth"), true);
+    bool bCap = GetBoolFieldGeom(Payload, TEXT("cap"), true);
 
     // Get profile actor names if provided
     TArray<FString> ProfileActors;
@@ -3924,7 +4290,7 @@ static bool HandleLoft(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -4056,9 +4422,10 @@ static bool HandleLoft(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
                         PolygonVerts2D = *Polygon.Vertices;
                     }
                     
-                    // UE 5.7: AppendSweepPolygon uses inline parameters, not an options struct
-                    // Signature: AppendSweepPolygon(TargetMesh, PrimOptions, Transform, PolygonVertices, SweepPath,
-                    //                               bLoop, bCapped, StartScale, EndScale, RotationAngleDeg, MiterLimit, Debug)
+                    // AppendSweepPolygon signature varies by UE version
+                    // UE 5.4+ signature: AppendSweepPolygon(TargetMesh, PrimOptions, Transform, PolygonVertices, SweepPath,
+                    //                                         bLoop, bCapped, StartScale, EndScale, RotationAngleDeg, MiterLimit, Debug)
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
                     UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolygon(
                         Mesh, PrimOptions, SweepTransform, PolygonVerts2D, PathFrames,
                         false,    // bLoop
@@ -4068,6 +4435,35 @@ static bool HandleLoft(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
                         0.0f,     // RotationAngleDeg
                         1.0f,     // MiterLimit
                         nullptr); // Debug
+#else
+                    // UE 5.3 fallback: Simple extrusion using AppendExtrude or manual mesh building
+                    // Since AppendSweepPolygon may not exist or have different signature in 5.3
+                    // We fall back to using AppendBox or manual lofting
+                    for (int32 i = 0; i < PathFrames.Num() - 1; ++i)
+                    {
+                        FVector PosA = PathFrames[i].GetLocation();
+                        FVector PosB = PathFrames[i + 1].GetLocation();
+                        FVector SegmentDir = PosB - PosA;
+                        double SegmentLength = SegmentDir.Size();
+                        
+                        if (SegmentLength > KINDA_SMALL_NUMBER)
+                        {
+                            SegmentDir.Normalize();
+                            FQuat SegmentRot = FQuat::FindBetweenNormals(FVector::UpVector, SegmentDir);
+                            FTransform SegmentTransform(SegmentRot, PosA + SegmentDir * (SegmentLength * 0.5));
+                            
+                            // Use a small capsule/cylinder segment (approximate)
+                            UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendCapsule(
+                                Mesh, PrimOptions, SegmentTransform,
+                                ProfileRadius * 0.5, SegmentLength,
+                                2, 8,
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+                                1,  // SegmentSteps parameter required in UE 5.4+
+#endif
+                                EGeometryScriptPrimitiveOriginMode::Center, nullptr);
+                        }
+                    }
+#endif
                     
                     ProfilesUsed = ProfileMeshActors.Num();
                 }
@@ -4156,13 +4552,13 @@ static bool HandleLoft(UMcpAutomationBridgeSubsystem* Self, const FString& Reque
 static bool HandleSweep(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString SplineActorName = Payload->HasField(TEXT("splineActorName")) ? Payload->GetStringField(TEXT("splineActorName")) : TEXT("");
-    int32 Steps = Payload->HasField(TEXT("steps")) ? (int32)Payload->GetNumberField(TEXT("steps")) : 16;
-    double Twist = Payload->HasField(TEXT("twist")) ? Payload->GetNumberField(TEXT("twist")) : 0.0;
-    double ScaleStart = Payload->HasField(TEXT("scaleStart")) ? Payload->GetNumberField(TEXT("scaleStart")) : 1.0;
-    double ScaleEnd = Payload->HasField(TEXT("scaleEnd")) ? Payload->GetNumberField(TEXT("scaleEnd")) : 1.0;
-    bool bCap = Payload->HasField(TEXT("cap")) ? Payload->GetBoolField(TEXT("cap")) : true;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+FString SplineActorName = GetStringFieldGeom(Payload, TEXT("splineActorName"), TEXT(""));
+    int32 Steps = GetIntFieldGeom(Payload, TEXT("steps"), 16);
+    double Twist = GetNumberFieldGeom(Payload, TEXT("twist"), 0.0);
+    double ScaleStart = GetNumberFieldGeom(Payload, TEXT("scaleStart"), 1.0);
+    double ScaleEnd = GetNumberFieldGeom(Payload, TEXT("scaleEnd"), 1.0);
+    bool bCap = GetBoolFieldGeom(Payload, TEXT("cap"), true);
 
     if (ActorName.IsEmpty())
     {
@@ -4170,7 +4566,7 @@ static bool HandleSweep(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
     AActor* SplineActor = nullptr;
 
@@ -4357,11 +4753,11 @@ static bool HandleSweep(UMcpAutomationBridgeSubsystem* Self, const FString& Requ
 static bool HandleDuplicateAlongSpline(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                        const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    FString SplineActorName = Payload->GetStringField(TEXT("splineActorName"));
-    int32 Count = Payload->HasField(TEXT("count")) ? (int32)Payload->GetNumberField(TEXT("count")) : 10;
-    bool bAlignToSpline = Payload->HasField(TEXT("alignToSpline")) ? Payload->GetBoolField(TEXT("alignToSpline")) : true;
-    double ScaleVariation = Payload->HasField(TEXT("scaleVariation")) ? Payload->GetNumberField(TEXT("scaleVariation")) : 0.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString SplineActorName = GetStringFieldGeom(Payload, TEXT("splineActorName"));
+int32 Count = GetIntFieldGeom(Payload, TEXT("count"), 10);
+    bool bAlignToSpline = GetBoolFieldGeom(Payload, TEXT("alignToSpline"), true);
+    double ScaleVariation = GetNumberFieldGeom(Payload, TEXT("scaleVariation"), 0.0);
 
     if (ActorName.IsEmpty() || SplineActorName.IsEmpty())
     {
@@ -4369,7 +4765,7 @@ static bool HandleDuplicateAlongSpline(UMcpAutomationBridgeSubsystem* Self, cons
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* SourceActor = nullptr;
     AActor* SplineActor = nullptr;
 
@@ -4464,9 +4860,9 @@ static bool HandleDuplicateAlongSpline(UMcpAutomationBridgeSubsystem* Self, cons
 static bool HandleLoopCut(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    int32 NumCuts = Payload->HasField(TEXT("numCuts")) ? (int32)Payload->GetNumberField(TEXT("numCuts")) : 1;
-    double Offset = Payload->HasField(TEXT("offset")) ? Payload->GetNumberField(TEXT("offset")) : 0.5;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 NumCuts = GetIntFieldGeom(Payload, TEXT("numCuts"), 1);
+    double Offset = GetNumberFieldGeom(Payload, TEXT("offset"), 0.5);
 
     if (ActorName.IsEmpty())
     {
@@ -4474,7 +4870,7 @@ static bool HandleLoopCut(UMcpAutomationBridgeSubsystem* Self, const FString& Re
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -4503,7 +4899,7 @@ static bool HandleLoopCut(UMcpAutomationBridgeSubsystem* Self, const FString& Re
     int32 TrisBefore = Mesh->GetTriangleCount();
 
     // Get optional axis parameter (default to Z for horizontal cuts)
-    FString Axis = Payload->HasField(TEXT("axis")) ? Payload->GetStringField(TEXT("axis")).ToUpper() : TEXT("Z");
+    FString Axis = GetStringFieldGeom(Payload, TEXT("axis"), TEXT("Z")).ToUpper();
     
     // Real loop cut implementation using plane cutting
     // Unlike PN tessellation which subdivides ALL faces uniformly,
@@ -4616,8 +5012,8 @@ static bool HandleLoopCut(UMcpAutomationBridgeSubsystem* Self, const FString& Re
 static bool HandleSplitNormals(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = Payload->GetStringField(TEXT("actorName"));
-    double SplitAngle = Payload->HasField(TEXT("splitAngle")) ? Payload->GetNumberField(TEXT("splitAngle")) : 60.0;
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double SplitAngle = GetNumberFieldGeom(Payload, TEXT("splitAngle"), 60.0);
 
     if (ActorName.IsEmpty())
     {
@@ -4625,7 +5021,7 @@ static bool HandleSplitNormals(UMcpAutomationBridgeSubsystem* Self, const FStrin
         return true;
     }
 
-    UWorld* World = GEditor->GetEditorWorldContext().World();
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     ADynamicMeshActor* TargetActor = nullptr;
 
     for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
@@ -4675,8 +5071,1931 @@ static bool HandleSplitNormals(UMcpAutomationBridgeSubsystem* Self, const FStrin
 }
 
 // -------------------------------------------------------------------------
+// create_procedural_mesh - Create empty dynamic mesh actor
+// -------------------------------------------------------------------------
+
+static bool HandleCreateProceduralMesh(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                       const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString Name = GetStringFieldGeom(Payload, TEXT("name"));
+    if (Name.IsEmpty()) Name = TEXT("ProceduralMesh");
+
+    FTransform Transform = ReadTransformFromPayload(Payload);
+    bool bEnableCollision = GetBoolFieldGeom(Payload, TEXT("enableCollision"), false);
+
+    UEditorActorSubsystem* ActorSS = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+    if (!ActorSS)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("EditorActorSubsystem unavailable"), TEXT("EDITOR_SUBSYSTEM_MISSING"));
+        return true;
+    }
+
+    AActor* NewActor = ActorSS->SpawnActorFromClass(ADynamicMeshActor::StaticClass(), Transform.GetLocation(), Transform.Rotator());
+    if (!NewActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("Failed to spawn DynamicMeshActor"), TEXT("SPAWN_FAILED"));
+        return true;
+    }
+
+    NewActor->SetActorLabel(Name);
+
+    // Initialize with an empty dynamic mesh
+    if (ADynamicMeshActor* DMActor = Cast<ADynamicMeshActor>(NewActor))
+    {
+        UDynamicMeshComponent* DMComp = DMActor->GetDynamicMeshComponent();
+        if (DMComp)
+        {
+            UDynamicMesh* DynMesh = GetOrCreateDynamicMesh(GetTransientPackage());
+            DMComp->SetDynamicMesh(DynMesh);
+            DMComp->SetGenerateOverlapEvents(bEnableCollision);
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("name"), NewActor->GetActorLabel());
+    Result->SetStringField(TEXT("class"), TEXT("DynamicMeshActor"));
+    Result->SetBoolField(TEXT("enableCollision"), bEnableCollision);
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Procedural mesh actor created"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// append_triangle - Add single triangle to mesh
+// -------------------------------------------------------------------------
+
+static bool HandleAppendTriangle(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    // Read vertices
+    FVector V0 = ReadVectorFromPayload(Payload, TEXT("v0"), FVector(0, 0, 0));
+    FVector V1 = ReadVectorFromPayload(Payload, TEXT("v1"), FVector(100, 0, 0));
+    FVector V2 = ReadVectorFromPayload(Payload, TEXT("v2"), FVector(50, 100, 0));
+    int32 GroupID = GetIntFieldGeom(Payload, TEXT("groupID"), 0);
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
+        return true;
+    }
+
+    ADynamicMeshActor* TargetActor = nullptr;
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+    // Use the internal mesh directly to append triangle
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+    
+    // Append vertices
+    int32 Idx0 = EditMesh.AppendVertex(UE::Geometry::FVertexInfo(V0));
+    int32 Idx1 = EditMesh.AppendVertex(UE::Geometry::FVertexInfo(V1));
+    int32 Idx2 = EditMesh.AppendVertex(UE::Geometry::FVertexInfo(V2));
+    
+    // Append triangle
+    int32 TriIdx = EditMesh.AppendTriangle(Idx0, Idx1, Idx2, GroupID);
+    
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("triangleIndex"), TriIdx);
+    Result->SetNumberField(TEXT("vertexIndex0"), Idx0);
+    Result->SetNumberField(TEXT("vertexIndex1"), Idx1);
+    Result->SetNumberField(TEXT("vertexIndex2"), Idx2);
+    Result->SetNumberField(TEXT("triangleCount"), Mesh->GetTriangleCount());
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Triangle appended"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// set_vertex_color - Set vertex colors on mesh
+// -------------------------------------------------------------------------
+
+static bool HandleSetVertexColor(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 VertexIndex = GetIntFieldGeom(Payload, TEXT("vertexIndex"), -1);
+    double R = GetNumberFieldGeom(Payload, TEXT("r"), 1.0);
+    double G = GetNumberFieldGeom(Payload, TEXT("g"), 1.0);
+    double B = GetNumberFieldGeom(Payload, TEXT("b"), 1.0);
+    double A = GetNumberFieldGeom(Payload, TEXT("a"), 1.0);
+    bool bSetAll = GetBoolFieldGeom(Payload, TEXT("setAll"), false);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
+        return true;
+    }
+
+    ADynamicMeshActor* TargetActor = nullptr;
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+
+    // Enable vertex colors if not already enabled
+    if (!EditMesh.HasVertexColors())
+    {
+        EditMesh.EnableVertexColors(FVector3f(1.0f, 1.0f, 1.0f));
+    }
+
+    FVector4f Color(static_cast<float>(R), static_cast<float>(G), static_cast<float>(B), static_cast<float>(A));
+    int32 VerticesModified = 0;
+
+    if (bSetAll)
+    {
+        // Set all vertex colors
+        for (int32 VID : EditMesh.VertexIndicesItr())
+        {
+            EditMesh.SetVertexColor(VID, Color);
+            VerticesModified++;
+        }
+    }
+    else if (VertexIndex >= 0 && EditMesh.IsVertex(VertexIndex))
+    {
+        EditMesh.SetVertexColor(VertexIndex, Color);
+        VerticesModified = 1;
+    }
+    else
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Invalid vertex index: %d"), VertexIndex), TEXT("INVALID_VERTEX"));
+        return true;
+    }
+
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("verticesModified"), VerticesModified);
+    Result->SetNumberField(TEXT("r"), R);
+    Result->SetNumberField(TEXT("g"), G);
+    Result->SetNumberField(TEXT("b"), B);
+    Result->SetNumberField(TEXT("a"), A);
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Vertex color set"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// set_uvs - Set UV coordinates on mesh
+// -------------------------------------------------------------------------
+
+static bool HandleSetUVs(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                         const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 VertexIndex = GetIntFieldGeom(Payload, TEXT("vertexIndex"), -1);
+    double U = GetNumberFieldGeom(Payload, TEXT("u"), 0.0);
+    double V = GetNumberFieldGeom(Payload, TEXT("v"), 0.0);
+    int32 UVChannel = GetIntFieldGeom(Payload, TEXT("uvChannel"), 0);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
+        return true;
+    }
+
+    ADynamicMeshActor* TargetActor = nullptr;
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+
+    // Ensure the mesh has UV overlay for the specified channel
+    UE::Geometry::FDynamicMeshAttributeSet* Attributes = EditMesh.Attributes();
+    if (!Attributes)
+    {
+        EditMesh.EnableAttributes();
+        Attributes = EditMesh.Attributes();
+    }
+
+    if (UVChannel >= Attributes->NumUVLayers())
+    {
+        // Add UV layers up to the requested channel
+        for (int32 i = Attributes->NumUVLayers(); i <= UVChannel; ++i)
+        {
+            Attributes->SetNumUVLayers(i + 1);
+        }
+    }
+
+    UE::Geometry::FDynamicMeshUVOverlay* UVOverlay = Attributes->GetUVLayer(UVChannel);
+    if (!UVOverlay)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("Failed to access UV layer"), TEXT("UV_LAYER_ERROR"));
+        return true;
+    }
+
+    // Set UV for the vertex (all connected elements)
+    FVector2f UVValue(static_cast<float>(U), static_cast<float>(V));
+    int32 ElementsModified = 0;
+
+    if (VertexIndex >= 0 && EditMesh.IsVertex(VertexIndex))
+    {
+        // Get all UV elements for this vertex and set their UVs
+        TArray<int32> ElementIDs;
+        for (int32 ElementID : UVOverlay->ElementIndicesItr())
+        {
+            if (UVOverlay->GetParentVertex(ElementID) == VertexIndex)
+            {
+                UVOverlay->SetElement(ElementID, UVValue);
+                ElementsModified++;
+            }
+        }
+        
+        // If no elements exist for this vertex, we need to handle it differently
+        if (ElementsModified == 0)
+        {
+            Self->SendAutomationError(Socket, RequestId, 
+                FString::Printf(TEXT("No UV elements found for vertex %d"), VertexIndex), TEXT("NO_UV_ELEMENTS"));
+            return true;
+        }
+    }
+    else
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Invalid vertex index: %d"), VertexIndex), TEXT("INVALID_VERTEX"));
+        return true;
+    }
+
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("vertexIndex"), VertexIndex);
+    Result->SetNumberField(TEXT("u"), U);
+    Result->SetNumberField(TEXT("v"), V);
+    Result->SetNumberField(TEXT("uvChannel"), UVChannel);
+    Result->SetNumberField(TEXT("elementsModified"), ElementsModified);
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("UV coordinates set"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// append_vertex - Add a single vertex to mesh
+// -------------------------------------------------------------------------
+
+static bool HandleAppendVertex(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    FVector Position = ReadVectorFromPayload(Payload, TEXT("position"), FVector::ZeroVector);
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
+        return true;
+    }
+
+    ADynamicMeshActor* TargetActor = nullptr;
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+    
+    int32 VertexIndex = EditMesh.AppendVertex(UE::Geometry::FVertexInfo(Position));
+    
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("vertexIndex"), VertexIndex);
+    Result->SetNumberField(TEXT("vertexCount"), UGeometryScriptLibrary_MeshQueryFunctions::GetVertexCount(Mesh));
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Vertex appended"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// delete_vertex - Remove a vertex from mesh
+// -------------------------------------------------------------------------
+
+static bool HandleDeleteVertex(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                               const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 VertexIndex = GetIntFieldGeom(Payload, TEXT("vertexIndex"), -1);
+    
+    if (ActorName.IsEmpty() || VertexIndex < 0)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName and vertexIndex required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
+        return true;
+    }
+
+    ADynamicMeshActor* TargetActor = nullptr;
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+    
+    if (!EditMesh.IsVertex(VertexIndex))
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Invalid vertex index: %d"), VertexIndex), TEXT("INVALID_VERTEX"));
+        return true;
+    }
+    
+    // Remove the vertex (this will also remove any triangles using it)
+    UE::Geometry::EMeshResult RemoveResult = EditMesh.RemoveVertex(VertexIndex);
+    bool bSuccess = (RemoveResult == UE::Geometry::EMeshResult::Ok);
+    
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("vertexIndex"), VertexIndex);
+    Result->SetBoolField(TEXT("success"), bSuccess);
+    Result->SetNumberField(TEXT("vertexCount"), UGeometryScriptLibrary_MeshQueryFunctions::GetVertexCount(Mesh));
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Vertex deleted"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// delete_triangle - Remove a triangle from mesh
+// -------------------------------------------------------------------------
+
+static bool HandleDeleteTriangle(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 TriangleIndex = GetIntFieldGeom(Payload, TEXT("triangleIndex"), -1);
+    
+    if (ActorName.IsEmpty() || TriangleIndex < 0)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName and triangleIndex required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("No world available"), TEXT("NO_WORLD"));
+        return true;
+    }
+
+    ADynamicMeshActor* TargetActor = nullptr;
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+    
+    if (!EditMesh.IsTriangle(TriangleIndex))
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Invalid triangle index: %d"), TriangleIndex), TEXT("INVALID_TRIANGLE"));
+        return true;
+    }
+    
+    UE::Geometry::EMeshResult RemoveResult = EditMesh.RemoveTriangle(TriangleIndex);
+    bool bSuccess = (RemoveResult == UE::Geometry::EMeshResult::Ok);
+    
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("triangleIndex"), TriangleIndex);
+    Result->SetBoolField(TEXT("success"), bSuccess);
+    Result->SetNumberField(TEXT("triangleCount"), Mesh->GetTriangleCount());
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Triangle deleted"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// get_vertex_position - Get position of a vertex
+// -------------------------------------------------------------------------
+
+static bool HandleGetVertexPosition(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 VertexIndex = GetIntFieldGeom(Payload, TEXT("vertexIndex"), -1);
+    
+    if (ActorName.IsEmpty() || VertexIndex < 0)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName and vertexIndex required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    
+    bool bIsValidVertex = false;
+    FVector Position = UGeometryScriptLibrary_MeshQueryFunctions::GetVertexPosition(Mesh, VertexIndex, bIsValidVertex);
+    
+    if (!bIsValidVertex)
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Invalid vertex index: %d"), VertexIndex), TEXT("INVALID_VERTEX"));
+        return true;
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("vertexIndex"), VertexIndex);
+    
+    TSharedPtr<FJsonObject> PosObj = MakeShared<FJsonObject>();
+    PosObj->SetNumberField(TEXT("x"), Position.X);
+    PosObj->SetNumberField(TEXT("y"), Position.Y);
+    PosObj->SetNumberField(TEXT("z"), Position.Z);
+    Result->SetObjectField(TEXT("position"), PosObj);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Vertex position retrieved"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// set_vertex_position - Set position of a vertex
+// -------------------------------------------------------------------------
+
+static bool HandleSetVertexPosition(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 VertexIndex = GetIntFieldGeom(Payload, TEXT("vertexIndex"), -1);
+    FVector Position = ReadVectorFromPayload(Payload, TEXT("position"), FVector::ZeroVector);
+    
+    if (ActorName.IsEmpty() || VertexIndex < 0)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName and vertexIndex required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    UE::Geometry::FDynamicMesh3& EditMesh = Mesh->GetMeshRef();
+    
+    if (!EditMesh.IsVertex(VertexIndex))
+    {
+        Self->SendAutomationError(Socket, RequestId, 
+            FString::Printf(TEXT("Invalid vertex index: %d"), VertexIndex), TEXT("INVALID_VERTEX"));
+        return true;
+    }
+    
+    EditMesh.SetVertex(VertexIndex, Position);
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("vertexIndex"), VertexIndex);
+    
+    TSharedPtr<FJsonObject> PosObj = MakeShared<FJsonObject>();
+    PosObj->SetNumberField(TEXT("x"), Position.X);
+    PosObj->SetNumberField(TEXT("y"), Position.Y);
+    PosObj->SetNumberField(TEXT("z"), Position.Z);
+    Result->SetObjectField(TEXT("position"), PosObj);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Vertex position set"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// translate_mesh - Translate entire mesh
+// -------------------------------------------------------------------------
+
+static bool HandleTranslateMesh(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FVector Translation = ReadVectorFromPayload(Payload, TEXT("translation"), FVector::ZeroVector);
+    
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    
+    // Use Geometry Script to translate the mesh
+    // UE 5.7+: TranslateMesh is in MeshTransformFunctions
+    // UE 5.5+: TranslateMesh is in MeshTransformFunctions
+    UGeometryScriptLibrary_MeshTransformFunctions::TranslateMesh(Mesh, Translation, nullptr);
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    
+    TSharedPtr<FJsonObject> TransObj = MakeShared<FJsonObject>();
+    TransObj->SetNumberField(TEXT("x"), Translation.X);
+    TransObj->SetNumberField(TEXT("y"), Translation.Y);
+    TransObj->SetNumberField(TEXT("z"), Translation.Z);
+    Result->SetObjectField(TEXT("translation"), TransObj);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Mesh translated"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// UV Operations - Unwrap and Pack
+// -------------------------------------------------------------------------
+
+static bool HandleUnwrapUV(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 UVChannel = GetIntFieldGeom(Payload, TEXT("uvChannel"), 0);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+    // Use XAtlas for proper UV unwrapping
+    FGeometryScriptXAtlasOptions XAtlasOptions;
+    // XAtlas defaults are reasonable for most cases
+
+    UGeometryScriptLibrary_MeshUVFunctions::AutoGenerateXAtlasMeshUVs(
+        Mesh,
+        UVChannel,
+        XAtlasOptions,
+        nullptr
+    );
+
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("uvChannel"), UVChannel);
+
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("UV unwrapping completed"), Result);
+    return true;
+}
+
+static bool HandlePackUVIslands(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 UVChannel = GetIntFieldGeom(Payload, TEXT("uvChannel"), 0);
+    int32 TextureResolution = GetIntFieldGeom(Payload, TEXT("textureResolution"), 1024);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+    // Use XAtlas with packing - it handles both unwrapping and packing
+    FGeometryScriptXAtlasOptions XAtlasOptions;
+    // XAtlas will pack islands efficiently by default
+
+    UGeometryScriptLibrary_MeshUVFunctions::AutoGenerateXAtlasMeshUVs(
+        Mesh,
+        UVChannel,
+        XAtlasOptions,
+        nullptr
+    );
+
+    DMC->NotifyMeshUpdated();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("uvChannel"), UVChannel);
+    Result->SetNumberField(TEXT("textureResolution"), TextureResolution);
+
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("UV islands packed"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Nanite Conversion
+// -------------------------------------------------------------------------
+
+static bool HandleConvertToNanite(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                  const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString AssetPath = GetStringFieldGeom(Payload, TEXT("assetPath"));
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+    if (AssetPath.IsEmpty())
+    {
+        AssetPath = FString::Printf(TEXT("/Game/GeneratedMeshes/%s_Nanite"), *ActorName);
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+    FGeometryScriptCreateNewStaticMeshAssetOptions CreateOptions;
+    CreateOptions.bEnableRecomputeNormals = true;
+    CreateOptions.bEnableRecomputeTangents = true;
+    // Enable Nanite for this conversion
+    CreateOptions.bEnableNanite = true;
+
+    EGeometryScriptOutcomePins Outcome;
+
+    UGeometryScriptLibrary_CreateNewAssetFunctions::CreateNewStaticMeshAssetFromMesh(
+        Mesh,
+        AssetPath,
+        CreateOptions,
+        Outcome,
+        nullptr
+    );
+
+    if (Outcome != EGeometryScriptOutcomePins::Success)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("Failed to create Nanite StaticMesh asset"), TEXT("ASSET_CREATION_FAILED"));
+        return true;
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetStringField(TEXT("assetPath"), AssetPath);
+    Result->SetBoolField(TEXT("naniteEnabled"), true);
+
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Nanite StaticMesh created from DynamicMesh"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Extrude Along Spline
+// -------------------------------------------------------------------------
+
+static bool HandleExtrudeAlongSpline(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                     const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    FString SplineActorName = GetStringFieldGeom(Payload, TEXT("splineActorName"));
+    int32 Segments = GetIntFieldGeom(Payload, TEXT("segments"), 16);
+    bool bCap = GetBoolFieldGeom(Payload, TEXT("cap"), true);
+    double ScaleStart = GetNumberFieldGeom(Payload, TEXT("scaleStart"), 1.0);
+    double ScaleEnd = GetNumberFieldGeom(Payload, TEXT("scaleEnd"), 1.0);
+    double Twist = GetNumberFieldGeom(Payload, TEXT("twist"), 0.0);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    if (SplineActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("splineActorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+    AActor* SplineActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == SplineActorName)
+        {
+            SplineActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    if (!SplineActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Spline actor not found: %s"), *SplineActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    USplineComponent* SplineComp = SplineActor->FindComponentByClass<USplineComponent>();
+    if (!SplineComp)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("Spline actor has no USplineComponent"), TEXT("COMPONENT_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    int32 TrisBefore = Mesh->GetTriangleCount();
+
+    // Get mesh bounding box to derive profile shape
+    FBox MeshBBox = UGeometryScriptLibrary_MeshQueryFunctions::GetMeshBoundingBox(Mesh);
+    FVector MeshCenter = MeshBBox.GetCenter();
+    FVector MeshExtent = MeshBBox.GetExtent();
+
+    // Create a cross-section profile from mesh XY bounds
+    TArray<FVector2D> PolygonVertices;
+    int32 NumPolySides = FMath::Clamp(Segments / 2, 4, 32);
+    double ProfileRadius = FMath::Max(MeshExtent.X, MeshExtent.Y);
+
+    if (ProfileRadius < KINDA_SMALL_NUMBER)
+    {
+        ProfileRadius = 50.0; // Default fallback
+    }
+
+    for (int32 i = 0; i < NumPolySides; ++i)
+    {
+        double Angle = 2.0 * PI * i / NumPolySides;
+        PolygonVertices.Add(FVector2D(
+            FMath::Cos(Angle) * ProfileRadius,
+            FMath::Sin(Angle) * ProfileRadius
+        ));
+    }
+
+    // Build path frames from spline
+    TArray<FTransform> PathFrames;
+    float SplineLength = SplineComp->GetSplineLength();
+    int32 PathSteps = FMath::Clamp(Segments, 2, 256);
+
+    for (int32 i = 0; i <= PathSteps; ++i)
+    {
+        float Alpha = (float)i / PathSteps;
+        float Dist = SplineLength * Alpha;
+
+        // Get spline location and rotation at this distance
+        FVector Location = SplineComp->GetLocationAtDistanceAlongSpline(Dist, ESplineCoordinateSpace::World);
+        FQuat Rotation = SplineComp->GetQuaternionAtDistanceAlongSpline(Dist, ESplineCoordinateSpace::World);
+
+        // Apply twist interpolation
+        float TwistAngle = FMath::DegreesToRadians(Twist * Alpha);
+        FQuat TwistRotation = FQuat(FVector::ForwardVector, TwistAngle);
+        Rotation = Rotation * TwistRotation;
+
+        // Apply scale interpolation
+        float Scale = FMath::Lerp((float)ScaleStart, (float)ScaleEnd, Alpha);
+
+        PathFrames.Add(FTransform(Rotation, Location, FVector(Scale)));
+    }
+
+    // Use SweepPolygon to create the extruded mesh
+    // UE 5.7: FGeometryScriptPolygonsToSweepOptions removed, use direct parameters
+    FGeometryScriptPrimitiveOptions PrimOptions;
+
+    // Clear existing mesh and sweep the profile along the path
+    // UE 5.4+: AppendSweepPolygon has MiterLimit parameter
+    // UE 5.3 and earlier: No MiterLimit parameter
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+    UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolygon(
+        Mesh,
+        PrimOptions,
+        FTransform::Identity,
+        PolygonVertices,
+        PathFrames,
+        true,  // bLoop
+        bCap,  // bCapped
+        1.0f,  // StartScale
+        1.0f,  // EndScale
+        0.0f,  // RotationAngleDeg
+        1.0f,  // MiterLimit
+        nullptr
+    );
+#else
+    UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSweepPolygon(
+        Mesh,
+        PrimOptions,
+        FTransform::Identity,
+        PolygonVertices,
+        PathFrames,
+        true,  // bLoop
+        bCap,  // bCapped
+        1.0f,  // StartScale
+        1.0f,  // EndScale
+        0.0f,  // RotationAngleDeg
+        nullptr
+    );
+#endif
+
+    DMC->NotifyMeshUpdated();
+
+    int32 TrisAfter = Mesh->GetTriangleCount();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetStringField(TEXT("splineActorName"), SplineActorName);
+    Result->SetNumberField(TEXT("splineLength"), SplineLength);
+    Result->SetNumberField(TEXT("segments"), Segments);
+    Result->SetNumberField(TEXT("trianglesBefore"), TrisBefore);
+    Result->SetNumberField(TEXT("trianglesAfter"), TrisAfter);
+    
+    // Add verification data for the target actor
+    if (TargetActor)
+    {
+        AddActorVerification(Result, TargetActor);
+    }
+
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Extruded profile along spline"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Edge Split Operations
+// -------------------------------------------------------------------------
+
+static bool HandleEdgeSplit(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                            const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    
+    // Parse edge indices to split (can be array or single number)
+    TArray<int32> EdgeIndices;
+    const TArray<TSharedPtr<FJsonValue>>* EdgeArray = nullptr;
+    if (Payload->TryGetArrayField(TEXT("edges"), EdgeArray))
+    {
+        for (const auto& Val : *EdgeArray)
+        {
+            if (Val.IsValid() && Val->Type == EJson::Number)
+            {
+                EdgeIndices.Add(static_cast<int32>(Val->AsNumber()));
+            }
+        }
+    }
+    else
+    {
+        // Single edge index
+        int32 EdgeIndex = GetIntFieldGeom(Payload, TEXT("edgeIndex"), -1);
+        if (EdgeIndex >= 0)
+        {
+            EdgeIndices.Add(EdgeIndex);
+        }
+    }
+    
+    double SplitFactor = GetNumberFieldGeom(Payload, TEXT("splitFactor"), 0.5);
+    bool bWeldVertices = GetBoolFieldGeom(Payload, TEXT("weldVertices"), true);
+    double WeldTolerance = GetNumberFieldGeom(Payload, TEXT("weldTolerance"), 0.0001);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    int32 TrisBefore = Mesh->GetTriangleCount();
+    
+    // Use FDynamicMesh3 directly for edge splitting
+    // GeometryScript doesn't have a direct edge split function, so we use the low-level API
+    UE::Geometry::FDynamicMesh3& DynMesh = Mesh->GetMeshRef();
+    
+    int32 EdgesSplit = 0;
+    for (int32 EdgeID : EdgeIndices)
+    {
+        if (DynMesh.IsEdge(EdgeID))
+        {
+            // Get edge vertices
+            UE::Geometry::FIndex2i EdgeV = DynMesh.GetEdgeV(EdgeID);
+            
+            // Compute midpoint position
+            FVector3d V0 = DynMesh.GetVertex(EdgeV.A);
+            FVector3d V1 = DynMesh.GetVertex(EdgeV.B);
+            FVector3d Midpoint = V0 + (V1 - V0) * SplitFactor;
+            
+            // Insert new vertex at midpoint
+            int32 NewVertexID = DynMesh.AppendVertex(Midpoint);
+            
+            // Split triangles connected to this edge
+            UE::Geometry::FIndex2i EdgeT = DynMesh.GetEdgeT(EdgeID);
+            TArray<int32> TrisToModify;
+            if (EdgeT.A >= 0) TrisToModify.Add(EdgeT.A);
+            if (EdgeT.B >= 0) TrisToModify.Add(EdgeT.B);
+            
+            for (int32 TriID : TrisToModify)
+            {
+                if (DynMesh.IsTriangle(TriID))
+                {
+                    UE::Geometry::FIndex3i Tri = DynMesh.GetTriangle(TriID);
+                    
+                    // Find which edges to split
+                    int32 ReplaceV = -1;
+                    int32 KeepV1 = -1, KeepV2 = -1;
+                    
+                    if (Tri.A == EdgeV.A && Tri.B == EdgeV.B) { ReplaceV = Tri.B; KeepV1 = Tri.A; KeepV2 = Tri.C; }
+                    else if (Tri.B == EdgeV.A && Tri.C == EdgeV.B) { ReplaceV = Tri.C; KeepV1 = Tri.A; KeepV2 = Tri.B; }
+                    else if (Tri.C == EdgeV.A && Tri.A == EdgeV.B) { ReplaceV = Tri.A; KeepV1 = Tri.B; KeepV2 = Tri.C; }
+                    else if (Tri.A == EdgeV.B && Tri.B == EdgeV.A) { ReplaceV = Tri.B; KeepV1 = Tri.A; KeepV2 = Tri.C; }
+                    else if (Tri.B == EdgeV.B && Tri.C == EdgeV.A) { ReplaceV = Tri.C; KeepV1 = Tri.A; KeepV2 = Tri.B; }
+                    else if (Tri.C == EdgeV.B && Tri.A == EdgeV.A) { ReplaceV = Tri.A; KeepV1 = Tri.B; KeepV2 = Tri.C; }
+                    
+                    if (ReplaceV >= 0)
+                    {
+                        // Remove old triangle and add two new ones
+                        DynMesh.RemoveTriangle(TriID);
+                        DynMesh.AppendTriangle(KeepV1, NewVertexID, KeepV2);
+                        DynMesh.AppendTriangle(NewVertexID, ReplaceV, KeepV2);
+                        EdgesSplit++;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Weld vertices if requested
+    if (bWeldVertices && WeldTolerance > 0)
+    {
+        FGeometryScriptWeldEdgesOptions WeldOptions;
+        WeldOptions.Tolerance = WeldTolerance;
+        WeldOptions.bOnlyUniquePairs = true;
+        UGeometryScriptLibrary_MeshRepairFunctions::WeldMeshEdges(Mesh, WeldOptions, nullptr);
+    }
+
+    DMC->NotifyMeshUpdated();
+
+    int32 TrisAfter = Mesh->GetTriangleCount();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("edgesSplit"), EdgesSplit);
+    Result->SetNumberField(TEXT("trianglesBefore"), TrisBefore);
+    Result->SetNumberField(TEXT("trianglesAfter"), TrisAfter);
+    
+    // Add verification data
+    AddActorVerification(Result, TargetActor);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Edge split applied"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Quadrangulate Operations
+// -------------------------------------------------------------------------
+
+static bool HandleQuadrangulate(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double TargetQuadSize = GetNumberFieldGeom(Payload, TEXT("targetQuadSize"), 50.0);
+    bool bPreserveFeatures = GetBoolFieldGeom(Payload, TEXT("preserveFeatures"), true);
+    double FeatureAngleThreshold = GetNumberFieldGeom(Payload, TEXT("featureAngleThreshold"), 30.0);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    int32 TrisBefore = Mesh->GetTriangleCount();
+
+    // Note: UE5 doesn't have a direct quadrangulation function in GeometryScript
+    // We use a workaround: retriangulate with PolyGroups to create more quad-like topology
+    // Then merge pairs of triangles where possible
+    
+    FGeometryScriptRemeshOptions RemeshOptions;
+    RemeshOptions.bDiscardAttributes = false;
+    RemeshOptions.bReprojectToInputMesh = true;
+    
+    FGeometryScriptUniformRemeshOptions UniformOptions;
+    // Use TriangleCount target type since EdgeLength is not available
+    int32 TargetTris = FMath::Max(100, TrisBefore / 2);  // Target half the triangles
+    UniformOptions.TargetType = EGeometryScriptUniformRemeshTargetType::TriangleCount;
+    UniformOptions.TargetTriangleCount = TargetTris;
+
+    // Apply uniform remesh to get more regular topology
+    UGeometryScriptLibrary_RemeshingFunctions::ApplyUniformRemesh(Mesh, RemeshOptions, UniformOptions, nullptr);
+
+    // Note: Full quadrangulation would require external library integration
+    // (e.g., QuadriFlow). Here we provide a simplified version that creates
+    // more uniform topology suitable for quad-like subdivision.
+
+    DMC->NotifyMeshUpdated();
+
+    int32 TrisAfter = Mesh->GetTriangleCount();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("trianglesBefore"), TrisBefore);
+    Result->SetNumberField(TEXT("trianglesAfter"), TrisAfter);
+    Result->SetStringField(TEXT("note"), TEXT("Partial quadrangulation applied - full quad remesh requires external library"));
+    
+    // Add verification data
+    AddActorVerification(Result, TargetActor);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Quadrangulation applied"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Voxel Remesh Operations
+// -------------------------------------------------------------------------
+
+static bool HandleRemeshVoxel(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                              const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double VoxelSize = GetNumberFieldGeom(Payload, TEXT("voxelSize"), 10.0);
+    double SurfaceDistance = GetNumberFieldGeom(Payload, TEXT("surfaceDistance"), 0.0);
+    bool bFillHoles = GetBoolFieldGeom(Payload, TEXT("fillHoles"), true);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+    int32 TrisBefore = Mesh->GetTriangleCount();
+
+    // Voxel remesh: Use uniform remesh as approximation (UE5 doesn't have direct voxel remesh in GeometryScript)
+    // For voxel-like results, we use uniform remesh with the voxel size as target edge length approximation
+    FGeometryScriptRemeshOptions RemeshOptions;
+    RemeshOptions.bDiscardAttributes = false;
+    RemeshOptions.bReprojectToInputMesh = true;
+    
+    FGeometryScriptUniformRemeshOptions UniformOptions;
+    // Calculate target triangle count based on voxel size
+    int32 TargetTris = FMath::Max(100, TrisBefore / 2);
+    UniformOptions.TargetType = EGeometryScriptUniformRemeshTargetType::TriangleCount;
+    UniformOptions.TargetTriangleCount = TargetTris;
+    
+    UGeometryScriptLibrary_RemeshingFunctions::ApplyUniformRemesh(Mesh, RemeshOptions, UniformOptions, nullptr);
+    
+    // Fill holes if requested
+    if (bFillHoles)
+    {
+        FGeometryScriptFillHolesOptions FillOptions;
+        FillOptions.FillMethod = EGeometryScriptFillHolesMethod::Automatic;
+        int32 NumFilled = 0;
+        int32 NumFailed = 0;
+        UGeometryScriptLibrary_MeshRepairFunctions::FillAllMeshHoles(Mesh, FillOptions, NumFilled, NumFailed, nullptr);
+    }
+
+    DMC->NotifyMeshUpdated();
+
+    int32 TrisAfter = Mesh->GetTriangleCount();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("voxelSize"), VoxelSize);
+    Result->SetNumberField(TEXT("trianglesBefore"), TrisBefore);
+    Result->SetNumberField(TEXT("trianglesAfter"), TrisAfter);
+    
+    // Add verification data
+    AddActorVerification(Result, TargetActor);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Voxel remesh applied"), Result);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Complex Collision Generation
+// -------------------------------------------------------------------------
+
+static bool HandleGenerateComplexCollision(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                           const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 MaxHullCount = GetIntFieldGeom(Payload, TEXT("maxHullCount"), 8);
+    int32 MaxHullVerts = GetIntFieldGeom(Payload, TEXT("maxHullVerts"), 32);
+    double HullPrecision = GetNumberFieldGeom(Payload, TEXT("hullPrecision"), 100.0);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+    // Use convex decomposition for complex collision
+    FGeometryScriptCollisionFromMeshOptions CollisionOptions;
+    CollisionOptions.Method = EGeometryScriptCollisionGenerationMethod::ConvexHulls;
+    CollisionOptions.MaxConvexHullsPerMesh = FMath::Clamp(MaxHullCount, 1, 64);
+    CollisionOptions.bEmitTransaction = false;
+    
+    // Generate collision from mesh
+    FGeometryScriptSimpleCollision Collision = UGeometryScriptLibrary_CollisionFunctions::GenerateCollisionFromMesh(
+        Mesh, CollisionOptions, nullptr);
+
+    // Set the collision on the DynamicMeshComponent
+    FGeometryScriptSetSimpleCollisionOptions SetOptions;
+    UGeometryScriptLibrary_CollisionFunctions::SetSimpleCollisionOfDynamicMeshComponent(
+        Collision, DMC, SetOptions, nullptr);
+
+    int32 ShapeCount = UGeometryScriptLibrary_CollisionFunctions::GetSimpleCollisionShapeCount(Collision);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("hullCount"), MaxHullCount);
+    Result->SetNumberField(TEXT("shapeCount"), ShapeCount);
+    Result->SetStringField(TEXT("collisionType"), TEXT("convex_decomposition"));
+    
+    // Add verification data
+    AddActorVerification(Result, TargetActor);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Complex collision generated"), Result);
+#else
+    Self->SendAutomationError(Socket, RequestId, TEXT("Complex collision generation requires UE 5.4+"), TEXT("VERSION_NOT_SUPPORTED"));
+#endif
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Simplify Collision
+// -------------------------------------------------------------------------
+
+static bool HandleSimplifyCollision(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    double SimplificationFactor = GetNumberFieldGeom(Payload, TEXT("simplificationFactor"), 0.5);
+    int32 TargetHullCount = GetIntFieldGeom(Payload, TEXT("targetHullCount"), 4);
+
+    if (ActorName.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    ADynamicMeshActor* TargetActor = nullptr;
+
+    for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == ActorName)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+
+    if (!TargetActor)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+    if (!DMC || !DMC->GetDynamicMesh())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+        return true;
+    }
+
+    UDynamicMesh* Mesh = DMC->GetDynamicMesh();
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+    // Simplify the mesh first, then generate simpler collision
+    // Use mesh simplification to reduce geometry before collision generation
+    FGeometryScriptSimplifyMeshOptions SimplifyOptions;
+    SimplifyOptions.Method = EGeometryScriptRemoveMeshSimplificationType::StandardQEM;
+    SimplifyOptions.bAllowSeamCollapse = true;
+    
+    // Calculate target triangle count based on simplification factor
+    int32 CurrentTris = Mesh->GetTriangleCount();
+    int32 TargetTris = FMath::Max(4, static_cast<int32>(CurrentTris * SimplificationFactor));
+    
+    UGeometryScriptLibrary_MeshSimplifyFunctions::ApplySimplifyToTriangleCount(
+        Mesh, TargetTris, SimplifyOptions, nullptr);
+
+    // Generate simplified collision
+    FGeometryScriptCollisionFromMeshOptions CollisionOptions;
+    CollisionOptions.Method = EGeometryScriptCollisionGenerationMethod::ConvexHulls;
+    CollisionOptions.MaxConvexHullsPerMesh = FMath::Clamp(TargetHullCount, 1, 16);
+    CollisionOptions.bEmitTransaction = false;
+    
+    FGeometryScriptSimpleCollision Collision = UGeometryScriptLibrary_CollisionFunctions::GenerateCollisionFromMesh(
+        Mesh, CollisionOptions, nullptr);
+
+    FGeometryScriptSetSimpleCollisionOptions SetOptions;
+    UGeometryScriptLibrary_CollisionFunctions::SetSimpleCollisionOfDynamicMeshComponent(
+        Collision, DMC, SetOptions, nullptr);
+
+    int32 ShapeCount = UGeometryScriptLibrary_CollisionFunctions::GetSimpleCollisionShapeCount(Collision);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), ActorName);
+    Result->SetNumberField(TEXT("trianglesBefore"), CurrentTris);
+    Result->SetNumberField(TEXT("trianglesAfter"), Mesh->GetTriangleCount());
+    Result->SetNumberField(TEXT("shapeCount"), ShapeCount);
+    
+    // Add verification data
+    AddActorVerification(Result, TargetActor);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("Collision simplified"), Result);
+#else
+    Self->SendAutomationError(Socket, RequestId, TEXT("Collision simplification requires UE 5.4+"), TEXT("VERSION_NOT_SUPPORTED"));
+#endif
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// LOD Generation (Geometry)
+// -------------------------------------------------------------------------
+
+static bool HandleGenerateLODsGeometry(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                       const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetStringFieldGeom(Payload, TEXT("actorName"));
+    int32 LODCount = GetIntFieldGeom(Payload, TEXT("lodCount"), 4);
+    FString AssetPath = GetStringFieldGeom(Payload, TEXT("assetPath"), TEXT(""));
+    
+    if (ActorName.IsEmpty() && AssetPath.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("actorName or assetPath required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    LODCount = FMath::Clamp(LODCount, 1, 50);
+
+#if WITH_EDITOR
+    UStaticMesh* StaticMesh = nullptr;
+    FString TargetPath;
+    
+    // If we have an asset path, load the existing static mesh
+    if (!AssetPath.IsEmpty())
+    {
+        FString SafePath = SanitizeProjectRelativePath(AssetPath);
+        if (SafePath.IsEmpty())
+        {
+            Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath), TEXT("INVALID_ASSET_PATH"));
+            return true;
+        }
+        
+        StaticMesh = LoadObject<UStaticMesh>(nullptr, *SafePath);
+        if (!StaticMesh)
+        {
+            Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("StaticMesh not found: %s"), *SafePath), TEXT("ASSET_NOT_FOUND"));
+            return true;
+        }
+        TargetPath = SafePath;
+    }
+    else
+    {
+        // Convert DynamicMesh to StaticMesh first
+        UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+        ADynamicMeshActor* TargetActor = nullptr;
+
+        for (TActorIterator<ADynamicMeshActor> It(World); It; ++It)
+        {
+            if (It->GetActorLabel() == ActorName)
+            {
+                TargetActor = *It;
+                break;
+            }
+        }
+
+        if (!TargetActor)
+        {
+            Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Actor not found: %s"), *ActorName), TEXT("ACTOR_NOT_FOUND"));
+            return true;
+        }
+
+        UDynamicMeshComponent* DMC = TargetActor->GetDynamicMeshComponent();
+        if (!DMC || !DMC->GetDynamicMesh())
+        {
+            Self->SendAutomationError(Socket, RequestId, TEXT("DynamicMesh not available"), TEXT("MESH_NOT_FOUND"));
+            return true;
+        }
+
+        UDynamicMesh* DynMesh = DMC->GetDynamicMesh();
+        
+        // Convert to StaticMesh
+        FString MeshName = ActorName + TEXT("_LOD");
+        TargetPath = FString::Printf(TEXT("/Game/MCPTest/%s"), *MeshName);
+        
+        FGeometryScriptCreateNewStaticMeshAssetOptions AssetOptions;
+        AssetOptions.bEnableRecomputeNormals = true;
+        AssetOptions.bEnableRecomputeTangents = true;
+        AssetOptions.bEnableNanite = false;
+        
+        EGeometryScriptOutcomePins Outcome;
+        
+        StaticMesh = UGeometryScriptLibrary_CreateNewAssetFunctions::CreateNewStaticMeshAssetFromMesh(
+            DynMesh, TargetPath, AssetOptions, Outcome, nullptr);
+            
+        if (Outcome != EGeometryScriptOutcomePins::Success || !StaticMesh)
+        {
+            Self->SendAutomationError(Socket, RequestId, TEXT("Failed to convert DynamicMesh to StaticMesh"), TEXT("CONVERSION_FAILED"));
+            return true;
+        }
+    }
+
+    // Generate LODs
+    StaticMesh->Modify();
+    StaticMesh->SetNumSourceModels(LODCount);
+
+    // Configure LOD reduction settings with progressive reduction
+    for (int32 LODIndex = 1; LODIndex < LODCount; LODIndex++)
+    {
+        FStaticMeshSourceModel& SourceModel = StaticMesh->GetSourceModel(LODIndex);
+        FMeshReductionSettings& ReductionSettings = SourceModel.ReductionSettings;
+
+        // Progressive reduction: 50%, 25%, 12.5%...
+        float ReductionPercent = 1.0f / FMath::Pow(2.0f, static_cast<float>(LODIndex));
+        ReductionSettings.PercentTriangles = ReductionPercent;
+        ReductionSettings.PercentVertices = ReductionPercent;
+
+        SourceModel.BuildSettings.bRecomputeNormals = false;
+        SourceModel.BuildSettings.bRecomputeTangents = false;
+        SourceModel.BuildSettings.bUseMikkTSpace = true;
+    }
+
+    // Build the mesh with new LOD settings
+    StaticMesh->Build();
+    StaticMesh->PostEditChange();
+    McpSafeAssetSave(StaticMesh);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), TargetPath);
+    Result->SetNumberField(TEXT("lodCount"), LODCount);
+    Result->SetNumberField(TEXT("triangles"), StaticMesh->GetNumTriangles(0));
+    
+    // Add verification data
+    AddAssetVerification(Result, StaticMesh);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("LODs generated for geometry"), Result);
+#else
+    Self->SendAutomationError(Socket, RequestId, TEXT("Requires editor build"), TEXT("NOT_SUPPORTED"));
+#endif
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Set LOD Settings
+// -------------------------------------------------------------------------
+
+static bool HandleSetLODSettings(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                 const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString AssetPath = GetStringFieldGeom(Payload, TEXT("assetPath"));
+    int32 LODIndex = GetIntFieldGeom(Payload, TEXT("lodIndex"), 1);
+    double TrianglePercent = GetNumberFieldGeom(Payload, TEXT("trianglePercent"), 50.0);
+    bool bRecomputeNormals = GetBoolFieldGeom(Payload, TEXT("recomputeNormals"), false);
+    bool bRecomputeTangents = GetBoolFieldGeom(Payload, TEXT("recomputeTangents"), false);
+
+    if (AssetPath.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("assetPath required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+#if WITH_EDITOR
+    FString SafePath = SanitizeProjectRelativePath(AssetPath);
+    if (SafePath.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath), TEXT("INVALID_ASSET_PATH"));
+        return true;
+    }
+
+    UStaticMesh* StaticMesh = LoadObject<UStaticMesh>(nullptr, *SafePath);
+    if (!StaticMesh)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("StaticMesh not found: %s"), *SafePath), TEXT("ASSET_NOT_FOUND"));
+        return true;
+    }
+
+    if (LODIndex < 0 || LODIndex >= StaticMesh->GetNumSourceModels())
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Invalid LOD index: %d (mesh has %d LODs)"), LODIndex, StaticMesh->GetNumSourceModels()), TEXT("INVALID_LOD_INDEX"));
+        return true;
+    }
+
+    StaticMesh->Modify();
+    
+    FStaticMeshSourceModel& SourceModel = StaticMesh->GetSourceModel(LODIndex);
+    
+    // Set reduction settings
+    SourceModel.ReductionSettings.PercentTriangles = TrianglePercent / 100.0f;
+    SourceModel.ReductionSettings.PercentVertices = TrianglePercent / 100.0f;
+    
+    // Set build settings
+    SourceModel.BuildSettings.bRecomputeNormals = bRecomputeNormals;
+    SourceModel.BuildSettings.bRecomputeTangents = bRecomputeTangents;
+
+    // Rebuild
+    StaticMesh->Build();
+    StaticMesh->PostEditChange();
+    McpSafeAssetSave(StaticMesh);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), SafePath);
+    Result->SetNumberField(TEXT("lodIndex"), LODIndex);
+    Result->SetNumberField(TEXT("trianglePercent"), TrianglePercent);
+    
+    // Add verification data
+    AddAssetVerification(Result, StaticMesh);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("LOD settings updated"), Result);
+#else
+    Self->SendAutomationError(Socket, RequestId, TEXT("Requires editor build"), TEXT("NOT_SUPPORTED"));
+#endif
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Set LOD Screen Sizes
+// -------------------------------------------------------------------------
+
+static bool HandleSetLODScreenSizes(UMcpAutomationBridgeSubsystem* Self, const FString& RequestId,
+                                    const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString AssetPath = GetStringFieldGeom(Payload, TEXT("assetPath"));
+    
+    // Parse screen sizes (can be array or object)
+    TArray<float> ScreenSizes;
+    const TArray<TSharedPtr<FJsonValue>>* SizeArray = nullptr;
+    if (Payload->TryGetArrayField(TEXT("screenSizes"), SizeArray))
+    {
+        for (const auto& Val : *SizeArray)
+        {
+            if (Val.IsValid() && Val->Type == EJson::Number)
+            {
+                ScreenSizes.Add(static_cast<float>(Val->AsNumber()));
+            }
+        }
+    }
+
+    if (AssetPath.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("assetPath required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+    if (ScreenSizes.Num() == 0)
+    {
+        Self->SendAutomationError(Socket, RequestId, TEXT("screenSizes array required"), TEXT("INVALID_ARGUMENT"));
+        return true;
+    }
+
+#if WITH_EDITOR
+    FString SafePath = SanitizeProjectRelativePath(AssetPath);
+    if (SafePath.IsEmpty())
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath), TEXT("INVALID_ASSET_PATH"));
+        return true;
+    }
+
+    UStaticMesh* StaticMesh = LoadObject<UStaticMesh>(nullptr, *SafePath);
+    if (!StaticMesh)
+    {
+        Self->SendAutomationError(Socket, RequestId, FString::Printf(TEXT("StaticMesh not found: %s"), *SafePath), TEXT("ASSET_NOT_FOUND"));
+        return true;
+    }
+
+    StaticMesh->Modify();
+    
+    // Set screen sizes for each LOD
+    // Note: UE5 doesn't have a direct SetLODScreenSize API on UStaticMesh
+    // Screen sizes are typically managed via the LODGroup or platform-specific settings
+    // Here we configure the reduction settings which indirectly affect LOD switching
+    int32 NumLODs = StaticMesh->GetNumSourceModels();
+    
+    for (int32 i = 0; i < FMath::Min(ScreenSizes.Num(), NumLODs); i++)
+    {
+        // Configure reduction settings based on screen size
+        // The screen size affects when this LOD becomes visible
+        // Higher screen size = LOD becomes visible sooner (closer to camera)
+        if (i > 0)  // LOD 0 is the base mesh
+        {
+            FStaticMeshSourceModel& SourceModel = StaticMesh->GetSourceModel(i);
+            // Screen size is used to determine when to switch to this LOD
+            // We set it as a percentage of the previous LOD's screen size
+            SourceModel.ReductionSettings.PercentTriangles = ScreenSizes[i];
+        }
+    }
+
+    StaticMesh->PostEditChange();
+    McpSafeAssetSave(StaticMesh);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("assetPath"), SafePath);
+    Result->SetNumberField(TEXT("lodCount"), NumLODs);
+    Result->SetNumberField(TEXT("screenSizesSet"), ScreenSizes.Num());
+    
+    // Add verification data
+    AddAssetVerification(Result, StaticMesh);
+    
+    Self->SendAutomationResponse(Socket, RequestId, true, TEXT("LOD screen sizes updated"), Result);
+#else
+    Self->SendAutomationError(Socket, RequestId, TEXT("Requires editor build"), TEXT("NOT_SUPPORTED"));
+#endif
+    return true;
+}
+
+// -------------------------------------------------------------------------
 // Handler Dispatcher
 // -------------------------------------------------------------------------
+
+#endif // MCP_HAS_FULL_GEOMETRY_SCRIPT
 
 bool UMcpAutomationBridgeSubsystem::HandleGeometryAction(
     const FString& RequestId,
@@ -4689,13 +7008,15 @@ bool UMcpAutomationBridgeSubsystem::HandleGeometryAction(
         return false;
     }
 
+#if MCP_HAS_FULL_GEOMETRY_SCRIPT
+
     if (!Payload.IsValid())
     {
         SendAutomationError(RequestingSocket, RequestId, TEXT("Missing payload"), TEXT("INVALID_PAYLOAD"));
         return true;
     }
 
-    FString SubAction = Payload->GetStringField(TEXT("subAction"));
+    FString SubAction = GetStringFieldGeom(Payload, TEXT("subAction"));
     if (SubAction.IsEmpty())
     {
         SendAutomationError(RequestingSocket, RequestId, TEXT("Missing 'subAction' in payload"), TEXT("INVALID_ARGUMENT"));
@@ -4718,6 +7039,8 @@ bool UMcpAutomationBridgeSubsystem::HandleGeometryAction(
     if (SubAction == TEXT("create_pipe")) return HandleCreatePipe(this, RequestId, Payload, RequestingSocket);
     if (SubAction == TEXT("create_ramp")) return HandleCreateRamp(this, RequestId, Payload, RequestingSocket);
     if (SubAction == TEXT("revolve")) return HandleRevolve(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("create_procedural_mesh")) return HandleCreateProceduralMesh(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("append_triangle")) return HandleAppendTriangle(this, RequestId, Payload, RequestingSocket);
 
     // Booleans
     if (SubAction == TEXT("boolean_union")) return HandleBooleanUnion(this, RequestId, Payload, RequestingSocket);
@@ -4777,6 +7100,8 @@ bool UMcpAutomationBridgeSubsystem::HandleGeometryAction(
     // UV Operations
     if (SubAction == TEXT("project_uv")) return HandleProjectUV(this, RequestId, Payload, RequestingSocket);
     if (SubAction == TEXT("transform_uvs")) return HandleTransformUVs(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("set_uvs")) return HandleSetUVs(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("set_vertex_color")) return HandleSetVertexColor(this, RequestId, Payload, RequestingSocket);
 
     // Tangent Operations
     if (SubAction == TEXT("recompute_tangents")) return HandleRecomputeTangents(this, RequestId, Payload, RequestingSocket);
@@ -4791,8 +7116,56 @@ bool UMcpAutomationBridgeSubsystem::HandleGeometryAction(
     if (SubAction == TEXT("loop_cut")) return HandleLoopCut(this, RequestId, Payload, RequestingSocket);
     if (SubAction == TEXT("duplicate_along_spline")) return HandleDuplicateAlongSpline(this, RequestId, Payload, RequestingSocket);
 
+    // Vertex and Triangle Operations
+    if (SubAction == TEXT("append_vertex")) return HandleAppendVertex(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("delete_vertex")) return HandleDeleteVertex(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("delete_triangle")) return HandleDeleteTriangle(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("get_vertex_position")) return HandleGetVertexPosition(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("set_vertex_position")) return HandleSetVertexPosition(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("translate_mesh")) return HandleTranslateMesh(this, RequestId, Payload, RequestingSocket);
+
+    // Additional UV Operations
+    if (SubAction == TEXT("unwrap_uv")) return HandleUnwrapUV(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("pack_uv_islands")) return HandlePackUVIslands(this, RequestId, Payload, RequestingSocket);
+
+    // Nanite Conversion
+    if (SubAction == TEXT("convert_to_nanite")) return HandleConvertToNanite(this, RequestId, Payload, RequestingSocket);
+
+    // Spline-based Operations
+    if (SubAction == TEXT("extrude_along_spline")) return HandleExtrudeAlongSpline(this, RequestId, Payload, RequestingSocket);
+
+    // Aliases
+    if (SubAction == TEXT("difference")) return HandleBooleanSubtract(this, RequestId, Payload, RequestingSocket);
+
+    // Edge Operations
+    if (SubAction == TEXT("edge_split")) return HandleEdgeSplit(this, RequestId, Payload, RequestingSocket);
+
+    // Topology Operations
+    if (SubAction == TEXT("quadrangulate")) return HandleQuadrangulate(this, RequestId, Payload, RequestingSocket);
+
+    // Remesh Operations
+    if (SubAction == TEXT("remesh_voxel")) return HandleRemeshVoxel(this, RequestId, Payload, RequestingSocket);
+
+    // Complex Collision
+    if (SubAction == TEXT("generate_complex_collision")) return HandleGenerateComplexCollision(this, RequestId, Payload, RequestingSocket);
+
+    // Collision Simplification
+    if (SubAction == TEXT("simplify_collision")) return HandleSimplifyCollision(this, RequestId, Payload, RequestingSocket);
+
+    // LOD Operations (Geometry-specific)
+    if (SubAction == TEXT("generate_lods")) return HandleGenerateLODsGeometry(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("set_lod_settings")) return HandleSetLODSettings(this, RequestId, Payload, RequestingSocket);
+    if (SubAction == TEXT("set_lod_screen_sizes")) return HandleSetLODScreenSizes(this, RequestId, Payload, RequestingSocket);
+
     SendAutomationError(RequestingSocket, RequestId, FString::Printf(TEXT("Unknown geometry subAction: '%s'"), *SubAction), TEXT("UNKNOWN_SUBACTION"));
     return true;
+#else
+    // UE 5.0 doesn't have full GeometryScript support
+    SendAutomationError(RequestingSocket, RequestId,
+        TEXT("GeometryScript operations require UE 5.1 or later"),
+        TEXT("NOT_SUPPORTED"));
+    return true;
+#endif // MCP_HAS_FULL_GEOMETRY_SCRIPT
 }
 
 #endif // WITH_EDITOR

@@ -131,7 +131,7 @@ export interface IBlueprintTools {
     createBlueprint(params: { name: string; blueprintType?: string; savePath?: string; parentClass?: string; properties?: Record<string, unknown>; timeoutMs?: number; waitForCompletion?: boolean; waitForCompletionTimeoutMs?: number }): Promise<StandardActionResponse>;
     modifyConstructionScript(params: { blueprintPath: string; operations: Array<Record<string, unknown>>; compile?: boolean; save?: boolean; timeoutMs?: number; waitForCompletion?: boolean; waitForCompletionTimeoutMs?: number }): Promise<StandardActionResponse>;
     addComponent(params: { blueprintName: string; componentType: string; componentName: string; attachTo?: string; transform?: Record<string, unknown>; properties?: Record<string, unknown>; compile?: boolean; save?: boolean; timeoutMs?: number; waitForCompletion?: boolean; waitForCompletionTimeoutMs?: number }): Promise<StandardActionResponse>;
-    waitForBlueprint(blueprintRef: string | string[], timeoutMs?: number): Promise<StandardActionResponse>;
+    waitForBlueprint(blueprintRef: string | string[], options?: { timeoutMs?: number; shouldExist?: boolean }): Promise<StandardActionResponse>;
     getBlueprint(params: { blueprintName: string; timeoutMs?: number }): Promise<StandardActionResponse>;
     getBlueprintInfo(params: { blueprintPath: string; timeoutMs?: number }): Promise<StandardActionResponse>;
     probeSubobjectDataHandle(opts?: { componentClass?: string }): Promise<StandardActionResponse>;
@@ -220,7 +220,7 @@ export interface ILandscapeTools {
     createProceduralTerrain(params: { name: string; location?: [number, number, number]; subdivisions?: number; heightFunction?: string; material?: string; settings?: Record<string, unknown> }): Promise<StandardActionResponse>;
     createLandscapeGrassType(params: { name: string; meshPath: string; density?: number; minScale?: number; maxScale?: number; path?: string; staticMesh?: string }): Promise<StandardActionResponse>;
     setLandscapeMaterial(params: { landscapeName: string; materialPath: string }): Promise<StandardActionResponse>;
-    modifyHeightmap(params: { landscapeName: string; heightData: number[]; minX: number; minY: number; maxX: number; maxY: number; updateNormals?: boolean }): Promise<StandardActionResponse>;
+    modifyHeightmap(params: { landscapeName: string; heightData: number[]; minX: number; minY: number; maxX: number; maxY: number; updateNormals?: boolean; timeoutMs?: number }): Promise<StandardActionResponse>;
 }
 
 export interface IFoliageTools {

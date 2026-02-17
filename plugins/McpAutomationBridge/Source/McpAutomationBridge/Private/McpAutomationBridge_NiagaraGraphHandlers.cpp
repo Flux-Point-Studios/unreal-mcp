@@ -1,6 +1,12 @@
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeSubsystem.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
+
+// Helper macros for JSON field access
+#define GetStringFieldNiaG GetJsonStringField
+#define GetNumberFieldNiaG GetJsonNumberField
+#define GetBoolFieldNiaG GetJsonBoolField
 
 #if WITH_EDITOR
 #include "NiagaraSystem.h"
@@ -45,7 +51,7 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
         return true;
     }
 
-    FString SubAction = Payload->GetStringField(TEXT("subAction"));
+    FString SubAction = GetStringFieldNiaG(Payload, TEXT("subAction"));
     FString EmitterName;
     Payload->TryGetStringField(TEXT("emitterName"), EmitterName);
 
@@ -71,17 +77,38 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
         // Emitter script
         for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
         {
-            if (Handle.GetName() == EmitterName)
+            if (Handle.GetName() == FName(*EmitterName))
             {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
                 UNiagaraEmitter* Emitter = Handle.GetInstance().Emitter;
                 if (Emitter)
                 {
+                    // Guard GetLatestEmitterData() before dereferencing - can be null
+                    const auto* EmitterData = Emitter->GetLatestEmitterData();
+                    if (!EmitterData)
+                    {
+                        SendAutomationError(RequestingSocket, RequestId,
+                            TEXT("Emitter data not available."), TEXT("EMITTER_DATA_MISSING"));
+                        return true;
+                    }
                     // Again, Emitter has Spawn, Update, etc.
-                    TargetScript = Emitter->GetLatestEmitterData()->SpawnScriptProps.Script; // Default
+                    TargetScript = EmitterData->SpawnScriptProps.Script; // Default
                     FString ScriptType;
                     if (Payload->TryGetStringField(TEXT("scriptType"), ScriptType))
                     {
-                        if (ScriptType == TEXT("Update")) TargetScript = Emitter->GetLatestEmitterData()->UpdateScriptProps.Script;
+                        if (ScriptType == TEXT("Update")) TargetScript = EmitterData->UpdateScriptProps.Script;
+#else
+                // UE 5.0: GetInstance() returns UNiagaraEmitter* directly
+                UNiagaraEmitter* Emitter = Handle.GetInstance();
+                if (Emitter)
+                {
+                    // UE 5.0: Direct access to script props
+                    TargetScript = Emitter->SpawnScriptProps.Script; // Default
+                    FString ScriptType;
+                    if (Payload->TryGetStringField(TEXT("scriptType"), ScriptType))
+                    {
+                        if (ScriptType == TEXT("Update")) TargetScript = Emitter->UpdateScriptProps.Script;
+#endif
                         // Add ParticleSpawn, ParticleUpdate etc.
                     }
                 }
@@ -124,8 +151,12 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
         UNiagaraNodeFunctionCall* FuncNode = NewObject<UNiagaraNodeFunctionCall>(TargetGraph);
         FuncNode->FunctionScript = ModuleScript;
         TargetGraph->AddNode(FuncNode, true, false);
-        
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Module node added."));
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        AddAssetVerification(Result, System);
+        Result->SetStringField(TEXT("modulePath"), ModulePath);
+        Result->SetStringField(TEXT("nodeId"), FuncNode->NodeGuid.ToString());
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Module node added."), Result);
         return true;
     }
     // Implement other subactions: connect, remove, etc.
@@ -190,7 +221,14 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
         const bool bConnected = TargetGraph->GetSchema()->TryCreateConnection(FromPin, ToPin);
         if (bConnected)
         {
-             SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Pins connected successfully."));
+             TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+             AddAssetVerification(Result, System);
+             Result->SetStringField(TEXT("fromNode"), FromNodeId);
+             Result->SetStringField(TEXT("fromPin"), FromPinName);
+             Result->SetStringField(TEXT("toNode"), ToNodeId);
+             Result->SetStringField(TEXT("toPin"), ToPinName);
+             Result->SetBoolField(TEXT("connected"), true);
+             SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Pins connected successfully."), Result);
         }
         else
         {
@@ -216,7 +254,11 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
         if (TargetNode)
         {
             TargetGraph->RemoveNode(TargetNode);
-            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Node removed."));
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            AddAssetVerification(Result, System);
+            Result->SetStringField(TEXT("nodeId"), NodeId);
+            Result->SetBoolField(TEXT("removed"), true);
+            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Node removed."), Result);
         }
         else
         {
@@ -255,14 +297,24 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
         if (UserStore.FindParameterVariable(FNiagaraVariable(FNiagaraTypeDefinition::GetFloatDef(), FName(*ParamName))))
         {
             UserStore.SetParameterValue(Val, FNiagaraVariable(FNiagaraTypeDefinition::GetFloatDef(), FName(*ParamName)));
-            // ...
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            AddAssetVerification(Result, System);
+            Result->SetStringField(TEXT("parameterName"), ParamName);
+            Result->SetNumberField(TEXT("value"), Val);
+            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Float parameter set."), Result);
+            return true;
         }
         
         // Try bool
         if (UserStore.FindParameterVariable(FNiagaraVariable(FNiagaraTypeDefinition::GetBoolDef(), FName(*ParamName))))
         {
             UserStore.SetParameterValue(bVal, FNiagaraVariable(FNiagaraTypeDefinition::GetBoolDef(), FName(*ParamName)));
-            // ...
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            AddAssetVerification(Result, System);
+            Result->SetStringField(TEXT("parameterName"), ParamName);
+            Result->SetBoolField(TEXT("value"), bVal);
+            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Bool parameter set."), Result);
+            return true;
         }
 
         SendAutomationError(RequestingSocket, RequestId, TEXT("Parameter not found or type not supported (Float/Bool only)."), TEXT("PARAM_FAILED"));
@@ -276,3 +328,8 @@ bool UMcpAutomationBridgeSubsystem::HandleNiagaraGraphAction(const FString& Requ
     return true;
 #endif
 }
+
+#undef GetStringFieldNiaG
+#undef GetNumberFieldNiaG
+#undef GetBoolFieldNiaG
+

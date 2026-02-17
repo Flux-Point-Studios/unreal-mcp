@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 // Copyright Epic Games, Inc. All Rights Reserved.
 // Phase 26: Spline System Handlers
 
@@ -28,7 +29,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogMcpSplineHandlers, Log, All);
 #if WITH_EDITOR
 
 // Helper to get string field from JSON
-static FString GetJsonStringField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FString& Default = TEXT(""))
+static FString GetJsonStringFieldSpline(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FString& Default = TEXT(""))
 {
     if (!Payload.IsValid()) return Default;
     FString Value;
@@ -40,7 +41,7 @@ static FString GetJsonStringField(const TSharedPtr<FJsonObject>& Payload, const 
 }
 
 // Helper to get number field from JSON
-static double GetJsonNumberField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, double Default = 0.0)
+static double GetJsonNumberFieldSpline(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, double Default = 0.0)
 {
     if (!Payload.IsValid()) return Default;
     double Value;
@@ -52,7 +53,7 @@ static double GetJsonNumberField(const TSharedPtr<FJsonObject>& Payload, const T
 }
 
 // Helper to get bool field from JSON
-static bool GetJsonBoolField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, bool Default = false)
+static bool GetJsonBoolFieldSpline(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, bool Default = false)
 {
     if (!Payload.IsValid()) return Default;
     bool Value;
@@ -64,7 +65,7 @@ static bool GetJsonBoolField(const TSharedPtr<FJsonObject>& Payload, const TCHAR
 }
 
 // Helper to get int field from JSON
-static int32 GetJsonIntField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, int32 Default = 0)
+static int32 GetJsonIntFieldSpline(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, int32 Default = 0)
 {
     if (!Payload.IsValid()) return Default;
     double Value;
@@ -76,32 +77,32 @@ static int32 GetJsonIntField(const TSharedPtr<FJsonObject>& Payload, const TCHAR
 }
 
 // Helper to get FVector from JSON object field
-static FVector GetJsonVectorField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FVector& Default = FVector::ZeroVector)
+static FVector GetJsonVectorFieldSpline(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FVector& Default = FVector::ZeroVector)
 {
     if (!Payload.IsValid()) return Default;
     const TSharedPtr<FJsonObject>* VecObj;
     if (Payload->TryGetObjectField(FieldName, VecObj) && VecObj->IsValid())
     {
         return FVector(
-            GetJsonNumberField(*VecObj, TEXT("x"), Default.X),
-            GetJsonNumberField(*VecObj, TEXT("y"), Default.Y),
-            GetJsonNumberField(*VecObj, TEXT("z"), Default.Z)
+            GetJsonNumberFieldSpline(*VecObj, TEXT("x"), Default.X),
+            GetJsonNumberFieldSpline(*VecObj, TEXT("y"), Default.Y),
+            GetJsonNumberFieldSpline(*VecObj, TEXT("z"), Default.Z)
         );
     }
     return Default;
 }
 
 // Helper to get FRotator from JSON object field
-static FRotator GetJsonRotatorField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FRotator& Default = FRotator::ZeroRotator)
+static FRotator GetJsonRotatorFieldSpline(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FRotator& Default = FRotator::ZeroRotator)
 {
     if (!Payload.IsValid()) return Default;
     const TSharedPtr<FJsonObject>* RotObj;
     if (Payload->TryGetObjectField(FieldName, RotObj) && RotObj->IsValid())
     {
         return FRotator(
-            GetJsonNumberField(*RotObj, TEXT("pitch"), Default.Pitch),
-            GetJsonNumberField(*RotObj, TEXT("yaw"), Default.Yaw),
-            GetJsonNumberField(*RotObj, TEXT("roll"), Default.Roll)
+            GetJsonNumberFieldSpline(*RotObj, TEXT("pitch"), Default.Pitch),
+            GetJsonNumberFieldSpline(*RotObj, TEXT("yaw"), Default.Yaw),
+            GetJsonNumberFieldSpline(*RotObj, TEXT("roll"), Default.Roll)
         );
     }
     return Default;
@@ -183,11 +184,11 @@ static bool HandleCreateSplineActor(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"), TEXT("SplineActor"));
-    FVector Location = GetJsonVectorField(Payload, TEXT("location"));
-    FRotator Rotation = GetJsonRotatorField(Payload, TEXT("rotation"));
-    bool bClosedLoop = GetJsonBoolField(Payload, TEXT("bClosedLoop"), false);
-    FString SplineType = GetJsonStringField(Payload, TEXT("splineType"), TEXT("Curve"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"), TEXT("SplineActor"));
+    FVector Location = GetJsonVectorFieldSpline(Payload, TEXT("location"));
+    FRotator Rotation = GetJsonRotatorFieldSpline(Payload, TEXT("rotation"));
+    bool bClosedLoop = GetJsonBoolFieldSpline(Payload, TEXT("bClosedLoop"), false);
+    FString SplineType = GetJsonStringFieldSpline(Payload, TEXT("splineType"), TEXT("Curve"));
 
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
@@ -198,8 +199,11 @@ static bool HandleCreateSplineActor(
     }
 
     // Spawn a new actor with a spline component
+    // Use NameMode::Requested to auto-generate unique name if collision occurs
+    // This prevents the Fatal Error: "Cannot generate unique name for 'SplineActor'"
     FActorSpawnParameters SpawnParams;
     SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
     AActor* NewActor = World->SpawnActor<AActor>(AActor::StaticClass(), Location, Rotation, SpawnParams);
@@ -252,7 +256,7 @@ static bool HandleCreateSplineActor(
             const TSharedPtr<FJsonObject>* PointObj;
             if ((*PointsArray)[i]->TryGetObject(PointObj))
             {
-                FVector PointLocation = GetJsonVectorField(*PointObj, TEXT("location"));
+                FVector PointLocation = GetJsonVectorFieldSpline(*PointObj, TEXT("location"));
                 SplineComp->AddSplinePoint(PointLocation, ESplineCoordinateSpace::Local, true);
                 SplineComp->SetSplinePointType(i, PointType, false);
             }
@@ -269,6 +273,9 @@ static bool HandleCreateSplineActor(
     Result->SetNumberField(TEXT("splineLength"), SplineComp->GetSplineLength());
     Result->SetBoolField(TEXT("closedLoop"), SplineComp->IsClosedLoop());
 
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Spline actor '%s' created with %d points"), *ActorName, SplineComp->GetNumberOfSplinePoints()), Result);
     return true;
@@ -280,10 +287,10 @@ static bool HandleAddSplinePoint(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FVector Position = GetJsonVectorField(Payload, TEXT("position"));
-    int32 Index = GetJsonIntField(Payload, TEXT("index"), -1);
-    FString PointType = GetJsonStringField(Payload, TEXT("pointType"), TEXT("Curve"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    FVector Position = GetJsonVectorFieldSpline(Payload, TEXT("position"));
+    int32 Index = GetJsonIntFieldSpline(Payload, TEXT("index"), -1);
+    FString PointType = GetJsonStringFieldSpline(Payload, TEXT("pointType"), TEXT("Curve"));
 
     if (ActorName.IsEmpty())
     {
@@ -336,6 +343,9 @@ static bool HandleAddSplinePoint(
     Result->SetNumberField(TEXT("pointIndex"), Index);
     Result->SetNumberField(TEXT("totalPoints"), SplineComp->GetNumberOfSplinePoints());
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Added spline point at index %d"), Index), Result);
     return true;
@@ -347,8 +357,8 @@ static bool HandleRemoveSplinePoint(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    int32 PointIndex = GetJsonIntField(Payload, TEXT("pointIndex"), 0);
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    int32 PointIndex = GetJsonIntFieldSpline(Payload, TEXT("pointIndex"), 0);
 
     if (ActorName.IsEmpty())
     {
@@ -397,6 +407,9 @@ static bool HandleRemoveSplinePoint(
     Result->SetNumberField(TEXT("removedIndex"), PointIndex);
     Result->SetNumberField(TEXT("remainingPoints"), SplineComp->GetNumberOfSplinePoints());
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Removed spline point at index %d"), PointIndex), Result);
     return true;
@@ -408,9 +421,9 @@ static bool HandleSetSplinePointPosition(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    int32 PointIndex = GetJsonIntField(Payload, TEXT("pointIndex"), 0);
-    FVector Position = GetJsonVectorField(Payload, TEXT("position"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    int32 PointIndex = GetJsonIntFieldSpline(Payload, TEXT("pointIndex"), 0);
+    FVector Position = GetJsonVectorFieldSpline(Payload, TEXT("position"));
 
     if (ActorName.IsEmpty())
     {
@@ -458,6 +471,9 @@ static bool HandleSetSplinePointPosition(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetNumberField(TEXT("pointIndex"), PointIndex);
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Set position for spline point %d"), PointIndex), Result);
     return true;
@@ -469,10 +485,10 @@ static bool HandleSetSplinePointTangents(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    int32 PointIndex = GetJsonIntField(Payload, TEXT("pointIndex"), 0);
-    FVector ArriveTangent = GetJsonVectorField(Payload, TEXT("arriveTangent"));
-    FVector LeaveTangent = GetJsonVectorField(Payload, TEXT("leaveTangent"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    int32 PointIndex = GetJsonIntFieldSpline(Payload, TEXT("pointIndex"), 0);
+    FVector ArriveTangent = GetJsonVectorFieldSpline(Payload, TEXT("arriveTangent"));
+    FVector LeaveTangent = GetJsonVectorFieldSpline(Payload, TEXT("leaveTangent"));
 
     if (ActorName.IsEmpty())
     {
@@ -529,6 +545,9 @@ static bool HandleSetSplinePointTangents(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetNumberField(TEXT("pointIndex"), PointIndex);
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Set tangents for spline point %d"), PointIndex), Result);
     return true;
@@ -540,9 +559,9 @@ static bool HandleSetSplinePointRotation(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    int32 PointIndex = GetJsonIntField(Payload, TEXT("pointIndex"), 0);
-    FRotator Rotation = GetJsonRotatorField(Payload, TEXT("pointRotation"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    int32 PointIndex = GetJsonIntFieldSpline(Payload, TEXT("pointIndex"), 0);
+    FRotator Rotation = GetJsonRotatorFieldSpline(Payload, TEXT("pointRotation"));
 
     if (ActorName.IsEmpty())
     {
@@ -590,6 +609,9 @@ static bool HandleSetSplinePointRotation(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetNumberField(TEXT("pointIndex"), PointIndex);
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Set rotation for spline point %d"), PointIndex), Result);
     return true;
@@ -601,9 +623,9 @@ static bool HandleSetSplinePointScale(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    int32 PointIndex = GetJsonIntField(Payload, TEXT("pointIndex"), 0);
-    FVector Scale = GetJsonVectorField(Payload, TEXT("pointScale"), FVector::OneVector);
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    int32 PointIndex = GetJsonIntFieldSpline(Payload, TEXT("pointIndex"), 0);
+    FVector Scale = GetJsonVectorFieldSpline(Payload, TEXT("pointScale"), FVector::OneVector);
 
     if (ActorName.IsEmpty())
     {
@@ -651,6 +673,9 @@ static bool HandleSetSplinePointScale(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetNumberField(TEXT("pointIndex"), PointIndex);
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Set scale for spline point %d"), PointIndex), Result);
     return true;
@@ -662,9 +687,9 @@ static bool HandleSetSplineType(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString SplineType = GetJsonStringField(Payload, TEXT("splineType"), TEXT("Curve"));
-    int32 PointIndex = GetJsonIntField(Payload, TEXT("pointIndex"), -1);
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    FString SplineType = GetJsonStringFieldSpline(Payload, TEXT("splineType"), TEXT("Curve"));
+    int32 PointIndex = GetJsonIntFieldSpline(Payload, TEXT("pointIndex"), -1);
 
     if (ActorName.IsEmpty())
     {
@@ -726,6 +751,9 @@ static bool HandleSetSplineType(
     Result->SetStringField(TEXT("splineType"), SplineType);
     Result->SetNumberField(TEXT("pointsAffected"), PointIndex >= 0 ? 1 : SplineComp->GetNumberOfSplinePoints());
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Set spline type to %s"), *SplineType), Result);
     return true;
@@ -741,10 +769,10 @@ static bool HandleCreateSplineMeshComponent(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString BlueprintPath = GetJsonStringField(Payload, TEXT("blueprintPath"));
-    FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"), TEXT("SplineMesh"));
-    FString MeshPath = GetJsonStringField(Payload, TEXT("meshPath"));
-    FString ForwardAxis = GetJsonStringField(Payload, TEXT("forwardAxis"), TEXT("X"));
+    FString BlueprintPath = GetJsonStringFieldSpline(Payload, TEXT("blueprintPath"));
+    FString ComponentName = GetJsonStringFieldSpline(Payload, TEXT("componentName"), TEXT("SplineMesh"));
+    FString MeshPath = GetJsonStringFieldSpline(Payload, TEXT("meshPath"));
+    FString ForwardAxis = GetJsonStringFieldSpline(Payload, TEXT("forwardAxis"), TEXT("X"));
 
     if (BlueprintPath.IsEmpty())
     {
@@ -753,7 +781,31 @@ static bool HandleCreateSplineMeshComponent(
         return true;
     }
 
-    UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+    // SECURITY: Validate blueprintPath to prevent directory traversal and arbitrary file access
+    FString SafeBlueprintPath = SanitizeProjectRelativePath(BlueprintPath);
+    if (SafeBlueprintPath.IsEmpty())
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            FString::Printf(TEXT("Invalid or unsafe blueprintPath: %s. Path must be relative to project (e.g., /Game/...)"), *BlueprintPath),
+            nullptr, TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
+
+    // SECURITY: Validate meshPath if provided
+    FString SafeMeshPath;
+    if (!MeshPath.IsEmpty())
+    {
+        SafeMeshPath = SanitizeProjectRelativePath(MeshPath);
+        if (SafeMeshPath.IsEmpty())
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Invalid or unsafe meshPath: %s. Path must be relative to project (e.g., /Game/...)"), *MeshPath),
+                nullptr, TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+    }
+
+    UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *SafeBlueprintPath);
     if (!Blueprint)
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
@@ -793,14 +845,17 @@ static bool HandleCreateSplineMeshComponent(
     USplineMeshComponent* MeshComp = Cast<USplineMeshComponent>(NewNode->ComponentTemplate);
     if (MeshComp)
     {
-        // Set mesh if provided
-        if (!MeshPath.IsEmpty())
+        // Set mesh if provided (use sanitized path)
+        if (!SafeMeshPath.IsEmpty())
         {
-            UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
-            if (Mesh)
+            UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *SafeMeshPath);
+            if (!Mesh)
             {
-                MeshComp->SetStaticMesh(Mesh);
+                Self->SendAutomationResponse(Socket, RequestId, false,
+                    FString::Printf(TEXT("Mesh not found: %s"), *SafeMeshPath), nullptr, TEXT("MESH_NOT_FOUND"));
+                return true;
             }
+            MeshComp->SetStaticMesh(Mesh);
         }
 
         // Set forward axis
@@ -808,6 +863,17 @@ static bool HandleCreateSplineMeshComponent(
         if (ForwardAxis == TEXT("Y")) Axis = ESplineMeshAxis::Y;
         else if (ForwardAxis == TEXT("Z")) Axis = ESplineMeshAxis::Z;
         MeshComp->SetForwardAxis(Axis);
+
+        // Ensure material is valid - use fallback if engine default is missing
+        // This prevents "DefaultMaterial not available" warnings on custom engine builds
+        if (MeshComp->GetMaterial(0) == nullptr)
+        {
+            UMaterialInterface* FallbackMaterial = McpLoadMaterialWithFallback(TEXT(""), true);
+            if (FallbackMaterial)
+            {
+                MeshComp->SetMaterial(0, FallbackMaterial);
+            }
+        }
     }
 
     // Add node to SCS
@@ -815,7 +881,7 @@ static bool HandleCreateSplineMeshComponent(
 
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-    if (GetJsonBoolField(Payload, TEXT("save"), false))
+    if (GetJsonBoolFieldSpline(Payload, TEXT("save"), false))
     {
         McpSafeAssetSave(Blueprint);
     }
@@ -823,6 +889,11 @@ static bool HandleCreateSplineMeshComponent(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("componentName"), ComponentName);
     Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+    
+    // Add verification data
+    Result->SetBoolField(TEXT("existsAfter"), true);
+    // Use action prefix format expected by TS message-handler.ts enforceActionMatch()
+    Result->SetStringField(TEXT("action"), TEXT("manage_splines:component_added"));
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("SplineMeshComponent '%s' added to Blueprint"), *ComponentName), Result);
@@ -835,14 +906,24 @@ static bool HandleSetSplineMeshAsset(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"));
-    FString MeshPath = GetJsonStringField(Payload, TEXT("meshPath"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    FString ComponentName = GetJsonStringFieldSpline(Payload, TEXT("componentName"));
+    FString MeshPath = GetJsonStringFieldSpline(Payload, TEXT("meshPath"));
 
     if (ActorName.IsEmpty() || MeshPath.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("actorName and meshPath are required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // SECURITY: Validate meshPath to prevent directory traversal and arbitrary file access
+    FString SafeMeshPath = SanitizeProjectRelativePath(MeshPath);
+    if (SafeMeshPath.IsEmpty())
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            FString::Printf(TEXT("Invalid or unsafe meshPath: %s. Path must be relative to project (e.g., /Game/...)"), *MeshPath),
+            nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -890,11 +971,11 @@ static bool HandleSetSplineMeshAsset(
         return true;
     }
 
-    UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
+    UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *SafeMeshPath);
     if (!Mesh)
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
-            FString::Printf(TEXT("Mesh not found: %s"), *MeshPath), nullptr, TEXT("MESH_NOT_FOUND"));
+            FString::Printf(TEXT("Mesh not found: %s"), *SafeMeshPath), nullptr, TEXT("MESH_NOT_FOUND"));
         return true;
     }
 
@@ -903,7 +984,10 @@ static bool HandleSetSplineMeshAsset(
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("actorName"), ActorName);
-    Result->SetStringField(TEXT("meshPath"), MeshPath);
+    Result->SetStringField(TEXT("meshPath"), SafeMeshPath);
+
+    // Add verification data
+    AddActorVerification(Result, Actor);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         TEXT("Spline mesh asset set"), Result);
@@ -916,9 +1000,9 @@ static bool HandleConfigureSplineMeshAxis(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"));
-    FString ForwardAxis = GetJsonStringField(Payload, TEXT("forwardAxis"), TEXT("X"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    FString ComponentName = GetJsonStringFieldSpline(Payload, TEXT("componentName"));
+    FString ForwardAxis = GetJsonStringFieldSpline(Payload, TEXT("forwardAxis"), TEXT("X"));
 
     if (ActorName.IsEmpty())
     {
@@ -980,6 +1064,9 @@ static bool HandleConfigureSplineMeshAxis(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("forwardAxis"), ForwardAxis);
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Spline mesh forward axis set to %s"), *ForwardAxis), Result);
     return true;
@@ -991,15 +1078,25 @@ static bool HandleSetSplineMeshMaterial(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"));
-    FString MaterialPath = GetJsonStringField(Payload, TEXT("materialPath"));
-    int32 MaterialIndex = GetJsonIntField(Payload, TEXT("materialIndex"), 0);
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    FString ComponentName = GetJsonStringFieldSpline(Payload, TEXT("componentName"));
+    FString MaterialPath = GetJsonStringFieldSpline(Payload, TEXT("materialPath"));
+    int32 MaterialIndex = GetJsonIntFieldSpline(Payload, TEXT("materialIndex"), 0);
 
     if (ActorName.IsEmpty() || MaterialPath.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("actorName and materialPath are required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // SECURITY: Validate materialPath to prevent directory traversal and arbitrary file access
+    FString SafeMaterialPath = SanitizeProjectRelativePath(MaterialPath);
+    if (SafeMaterialPath.IsEmpty())
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            FString::Printf(TEXT("Invalid or unsafe materialPath: %s. Path must be relative to project (e.g., /Game/...)"), *MaterialPath),
+            nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -1046,11 +1143,11 @@ static bool HandleSetSplineMeshMaterial(
         return true;
     }
 
-    UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *MaterialPath);
+    UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *SafeMaterialPath);
     if (!Material)
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
-            FString::Printf(TEXT("Material not found: %s"), *MaterialPath), nullptr, TEXT("MATERIAL_NOT_FOUND"));
+            FString::Printf(TEXT("Material not found: %s"), *SafeMaterialPath), nullptr, TEXT("MATERIAL_NOT_FOUND"));
         return true;
     }
 
@@ -1058,11 +1155,132 @@ static bool HandleSetSplineMeshMaterial(
     World->MarkPackageDirty();
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-    Result->SetStringField(TEXT("materialPath"), MaterialPath);
+    Result->SetStringField(TEXT("materialPath"), SafeMaterialPath);
     Result->SetNumberField(TEXT("materialIndex"), MaterialIndex);
+    
+    // Add verification data
+    AddActorVerification(Result, Actor);
+    AddComponentVerification(Result, TargetComp);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         TEXT("Spline mesh material set"), Result);
+    return true;
+}
+
+static bool HandleCreateSplineMeshActor(
+    UMcpAutomationBridgeSubsystem* Self,
+    const FString& RequestId,
+    const TSharedPtr<FJsonObject>& Payload,
+    TSharedPtr<FMcpBridgeWebSocket> Socket)
+{
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"), TEXT("SplineMeshActor"));
+    FString ComponentName = GetJsonStringFieldSpline(Payload, TEXT("componentName"), TEXT("SplineMesh"));
+    FString MeshPath = GetJsonStringFieldSpline(Payload, TEXT("meshPath"));
+    FString ForwardAxis = GetJsonStringFieldSpline(Payload, TEXT("forwardAxis"), TEXT("X"));
+    FVector Location = GetJsonVectorFieldSpline(Payload, TEXT("location"));
+    FRotator Rotation = GetJsonRotatorFieldSpline(Payload, TEXT("rotation"));
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("No editor world available"), nullptr, TEXT("NO_WORLD"));
+        return true;
+    }
+
+    // SECURITY: Validate meshPath if provided
+    FString SafeMeshPath;
+    if (!MeshPath.IsEmpty())
+    {
+        SafeMeshPath = SanitizeProjectRelativePath(MeshPath);
+        if (SafeMeshPath.IsEmpty())
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Invalid or unsafe meshPath: %s. Path must be relative to project (e.g., /Game/...)"), *MeshPath),
+                nullptr, TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+    }
+
+    // Spawn actor with unique name handling
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    AActor* NewActor = World->SpawnActor<AActor>(AActor::StaticClass(), Location, Rotation, SpawnParams);
+    if (!NewActor)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Failed to spawn spline mesh actor"), nullptr, TEXT("SPAWN_FAILED"));
+        return true;
+    }
+
+    NewActor->SetActorLabel(*ActorName);
+
+    // Create SplineMeshComponent and attach to actor
+    USplineMeshComponent* SplineMeshComp = NewObject<USplineMeshComponent>(NewActor, *ComponentName);
+    if (!SplineMeshComp)
+    {
+        NewActor->Destroy();
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Failed to create SplineMeshComponent"), nullptr, TEXT("COMPONENT_FAILED"));
+        return true;
+    }
+
+    SplineMeshComp->RegisterComponent();
+    NewActor->AddInstanceComponent(SplineMeshComp);
+    NewActor->SetRootComponent(SplineMeshComp);
+
+    // Set mesh if provided
+    if (!SafeMeshPath.IsEmpty())
+    {
+        UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *SafeMeshPath);
+        if (!Mesh)
+        {
+            // Clean up the partially created actor
+            NewActor->Destroy();
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Mesh not found: %s"), *SafeMeshPath), nullptr, TEXT("MESH_NOT_FOUND"));
+            return true;
+        }
+        SplineMeshComp->SetStaticMesh(Mesh);
+    }
+
+    // Ensure material is valid - use fallback if engine default is missing
+    // This prevents "DefaultMaterial not available" warnings on custom engine builds
+    if (SplineMeshComp->GetMaterial(0) == nullptr)
+    {
+        UMaterialInterface* FallbackMaterial = McpLoadMaterialWithFallback(TEXT(""), true);
+        if (FallbackMaterial)
+        {
+            SplineMeshComp->SetMaterial(0, FallbackMaterial);
+        }
+    }
+
+    // Set forward axis
+    ESplineMeshAxis::Type Axis = ESplineMeshAxis::X;
+    if (ForwardAxis == TEXT("Y")) Axis = ESplineMeshAxis::Y;
+    else if (ForwardAxis == TEXT("Z")) Axis = ESplineMeshAxis::Z;
+    SplineMeshComp->SetForwardAxis(Axis);
+
+    // Set default start/end positions for a simple spline mesh
+    SplineMeshComp->SetStartAndEnd(FVector::ZeroVector, FVector(100, 0, 0),
+                                    FVector(500, 0, 0), FVector(-100, 0, 0));
+
+    World->MarkPackageDirty();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actorName"), NewActor->GetActorLabel());
+    Result->SetStringField(TEXT("actorPath"), NewActor->GetPathName());
+    Result->SetStringField(TEXT("componentName"), ComponentName);
+    
+    // Add verification data
+    AddActorVerification(Result, NewActor);
+    AddComponentVerification(Result, SplineMeshComp);
+
+    Self->SendAutomationResponse(Socket, RequestId, true,
+        FString::Printf(TEXT("SplineMeshActor '%s' created with component '%s'"), *ActorName, *ComponentName), Result);
     return true;
 }
 
@@ -1076,15 +1294,26 @@ static bool HandleScatterMeshesAlongSpline(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString MeshPath = GetJsonStringField(Payload, TEXT("meshPath"));
-    double Spacing = GetJsonNumberField(Payload, TEXT("spacing"), 100.0);
-    bool bAlignToSpline = GetJsonBoolField(Payload, TEXT("bAlignToSpline"), true);
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
+    FString MeshPath = GetJsonStringFieldSpline(Payload, TEXT("meshPath"));
+    double Spacing = GetJsonNumberFieldSpline(Payload, TEXT("spacing"), 100.0);
+    bool bAlignToSpline = GetJsonBoolFieldSpline(Payload, TEXT("alignToSpline"), true);
 
-    if (ActorName.IsEmpty() || MeshPath.IsEmpty())
+    // Sanitize mesh path
+    FString SafeMeshPath = SanitizeProjectRelativePath(MeshPath);
+    if (SafeMeshPath.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
-            TEXT("actorName and meshPath are required"), nullptr, TEXT("MISSING_PARAM"));
+            FString::Printf(TEXT("Invalid or unsafe meshPath: %s. Path must be relative to project (e.g., /Game/...)"), *MeshPath),
+            nullptr, TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
+
+    // Validate spacing to prevent division by zero
+    if (Spacing <= 0.0)
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("spacing must be greater than 0"), nullptr, TEXT("INVALID_PARAM"));
         return true;
     }
 
@@ -1112,11 +1341,11 @@ static bool HandleScatterMeshesAlongSpline(
         return true;
     }
 
-    UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
+    UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *SafeMeshPath);
     if (!Mesh)
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
-            FString::Printf(TEXT("Mesh not found: %s"), *MeshPath), nullptr, TEXT("MESH_NOT_FOUND"));
+            FString::Printf(TEXT("Mesh not found: %s"), *SafeMeshPath), nullptr, TEXT("MESH_NOT_FOUND"));
         return true;
     }
 
@@ -1153,6 +1382,9 @@ static bool HandleScatterMeshesAlongSpline(
     Result->SetNumberField(TEXT("splineLength"), SplineLength);
     Result->SetNumberField(TEXT("spacing"), Spacing);
 
+    // Add verification data
+    AddActorVerification(Result, Actor);
+
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Scattered %d meshes along spline"), CreatedMeshes.Num()), Result);
     return true;
@@ -1169,12 +1401,12 @@ static bool HandleConfigureMeshSpacing(
     // Future enhancement: Store in actor metadata via UMetaData component.
     
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-    Result->SetNumberField(TEXT("spacing"), GetJsonNumberField(Payload, TEXT("spacing"), 100.0));
-    Result->SetBoolField(TEXT("useRandomOffset"), GetJsonBoolField(Payload, TEXT("useRandomOffset"), false));
-    Result->SetNumberField(TEXT("randomOffsetRange"), GetJsonNumberField(Payload, TEXT("randomOffsetRange"), 0.0));
+    Result->SetNumberField(TEXT("spacing"), GetJsonNumberFieldSpline(Payload, TEXT("spacing"), 100.0));
+    Result->SetBoolField(TEXT("useRandomOffset"), GetJsonBoolFieldSpline(Payload, TEXT("useRandomOffset"), false));
+    Result->SetNumberField(TEXT("randomOffsetRange"), GetJsonNumberFieldSpline(Payload, TEXT("randomOffsetRange"), 0.0));
 
     Self->SendAutomationResponse(Socket, RequestId, true,
-        TEXT("Mesh spacing configuration stored"), Result);
+        TEXT("Mesh spacing parameters validated (storage not implemented - pass to scatter_meshes_along_spline)"), Result);
     return true;
 }
 
@@ -1188,14 +1420,14 @@ static bool HandleConfigureMeshRandomization(
     // Storage is not implemented - pass randomization params to scatter_meshes_along_spline.
     // Future enhancement: Store in actor metadata via UMetaData component.
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-    Result->SetBoolField(TEXT("randomizeScale"), GetJsonBoolField(Payload, TEXT("randomizeScale"), false));
-    Result->SetNumberField(TEXT("minScale"), GetJsonNumberField(Payload, TEXT("minScale"), 0.8));
-    Result->SetNumberField(TEXT("maxScale"), GetJsonNumberField(Payload, TEXT("maxScale"), 1.2));
-    Result->SetBoolField(TEXT("randomizeRotation"), GetJsonBoolField(Payload, TEXT("randomizeRotation"), false));
-    Result->SetNumberField(TEXT("rotationRange"), GetJsonNumberField(Payload, TEXT("rotationRange"), 360.0));
+    Result->SetBoolField(TEXT("randomizeScale"), GetJsonBoolFieldSpline(Payload, TEXT("randomizeScale"), false));
+    Result->SetNumberField(TEXT("minScale"), GetJsonNumberFieldSpline(Payload, TEXT("minScale"), 0.8));
+    Result->SetNumberField(TEXT("maxScale"), GetJsonNumberFieldSpline(Payload, TEXT("maxScale"), 1.2));
+    Result->SetBoolField(TEXT("randomizeRotation"), GetJsonBoolFieldSpline(Payload, TEXT("randomizeRotation"), false));
+    Result->SetNumberField(TEXT("rotationRange"), GetJsonNumberFieldSpline(Payload, TEXT("rotationRange"), 360.0));
 
     Self->SendAutomationResponse(Socket, RequestId, true,
-        TEXT("Mesh randomization configuration stored"), Result);
+        TEXT("Mesh randomization parameters validated (storage not implemented - pass to scatter_meshes_along_spline)"), Result);
     return true;
 }
 
@@ -1211,10 +1443,10 @@ static bool HandleCreateTemplateSpline(
     const FString& TemplateName,
     const FString& DefaultMeshPath)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"), TemplateName + TEXT("_Spline"));
-    FVector Location = GetJsonVectorField(Payload, TEXT("location"));
-    double Width = GetJsonNumberField(Payload, TEXT("width"), 400.0);
-    FString MaterialPath = GetJsonStringField(Payload, TEXT("materialPath"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"), TemplateName + TEXT("_Spline"));
+    FVector Location = GetJsonVectorFieldSpline(Payload, TEXT("location"));
+    double Width = GetJsonNumberFieldSpline(Payload, TEXT("width"), 400.0);
+    FString MaterialPath = GetJsonStringFieldSpline(Payload, TEXT("materialPath"));
 
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
@@ -1225,8 +1457,11 @@ static bool HandleCreateTemplateSpline(
     }
 
     // Spawn actor with spline
+    // Use NameMode::Requested to auto-generate unique name if collision occurs
+    // This prevents the Fatal Error: "Cannot generate unique name for 'SplineActor'"
     FActorSpawnParameters SpawnParams;
     SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
     AActor* NewActor = World->SpawnActor<AActor>(AActor::StaticClass(), Location, FRotator::ZeroRotator, SpawnParams);
@@ -1267,6 +1502,9 @@ static bool HandleCreateTemplateSpline(
     Result->SetStringField(TEXT("templateType"), TemplateName);
     Result->SetNumberField(TEXT("pointCount"), SplineComp->GetNumberOfSplinePoints());
     Result->SetNumberField(TEXT("splineLength"), SplineComp->GetSplineLength());
+
+    // Add verification data
+    AddActorVerification(Result, NewActor);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("%s spline '%s' created"), *TemplateName, *ActorName), Result);
@@ -1337,7 +1575,7 @@ static bool HandleGetSplinesInfo(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
+    FString ActorName = GetJsonStringFieldSpline(Payload, TEXT("actorName"));
 
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
@@ -1442,7 +1680,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageSplinesAction(
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
 #if WITH_EDITOR
-    FString SubAction = GetJsonStringField(Payload, TEXT("subAction"), TEXT(""));
+    FString SubAction = GetJsonStringFieldSpline(Payload, TEXT("subAction"), TEXT(""));
     
     UE_LOG(LogMcpSplineHandlers, Verbose, TEXT("HandleManageSplinesAction: SubAction=%s"), *SubAction);
 
@@ -1467,6 +1705,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageSplinesAction(
     // Spline Mesh
     if (SubAction == TEXT("create_spline_mesh_component"))
         return HandleCreateSplineMeshComponent(this, RequestId, Payload, Socket);
+    if (SubAction == TEXT("create_spline_mesh_actor"))
+        return HandleCreateSplineMeshActor(this, RequestId, Payload, Socket);
     if (SubAction == TEXT("set_spline_mesh_asset"))
         return HandleSetSplineMeshAsset(this, RequestId, Payload, Socket);
     if (SubAction == TEXT("configure_spline_mesh_axis"))

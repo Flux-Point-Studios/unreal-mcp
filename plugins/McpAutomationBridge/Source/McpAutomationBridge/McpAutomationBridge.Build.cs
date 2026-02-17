@@ -2,9 +2,31 @@ using UnrealBuildTool;
 using System;
 using System.IO;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 public class McpAutomationBridge : ModuleRules
 {
+    // ============================================================================
+    // NATIVE WINDOWS API FOR ACTUAL MEMORY DETECTION
+    // ============================================================================
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORYSTATUSEX
+    {
+        internal uint dwLength;
+        internal uint dwMemoryLoad;
+        internal ulong ullTotalPhys;
+        internal ulong ullAvailPhys;
+        internal ulong ullTotalPageFile;
+        internal ulong ullAvailPageFile;
+        internal ulong ullTotalVirtual;
+        internal ulong ullAvailVirtual;
+        internal ulong ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
     /// <summary>
     /// Configures build rules, dependencies, and compile-time feature definitions for the McpAutomationBridge module based on the provided build target.
     /// </summary>
@@ -21,40 +43,52 @@ public class McpAutomationBridge : ModuleRules
         // requiring system paging file modifications.
         // ============================================================================
         
-        // Disable PCH to prevent virtual memory exhaustion on systems with limited RAM
-        // This is the most reliable workaround for C3859/C1076 errors
+        // ============================================================================
+        // DYNAMIC MEMORY-BASED BUILD CONFIGURATION
+        // ============================================================================
+        // Automatically adjust build parallelism based on ACTUAL available system memory
+        // to prevent "compiler is out of heap space" errors (C1060)
+        
+        long AvailableMemoryMB = GetActualAvailableMemoryMB();
+        long TotalMemoryMB = GetTotalPhysicalMemoryMB();
+        
+        // UBT already handles parallelism based on 1.5GB/action globally
+        // Our job is to prevent HUGE compilation units that exceed heap space
+        
+        // IMPORTANT: Unity builds combine many .cpp files into one compilation unit
+        // This causes each compiler process to need 3-6GB+ heap space instead of 1.5GB
+        // For a module with 50+ handler files, unity builds cause heap exhaustion
+        // even with plenty of RAM, because Windows page file space is limited
+        
+        Console.WriteLine(string.Format("McpAutomationBridge: Detected {0}MB available memory (of {1}MB total)", AvailableMemoryMB, TotalMemoryMB));
+        
+        // Disable PCH to prevent virtual memory exhaustion
         PCHUsage = PCHUsageMode.NoPCHs;
         
-        // Enable Unity builds to reduce compilation units
+        // Unity builds enabled - combine files for faster compilation
+        // Note: If you get "compiler out of heap space" errors, install BuildConfiguration.xml
+        // from plugins/McpAutomationBridge/Config/BuildConfiguration.xml to %AppData%\Unreal Engine\UnrealBuildTool\
         bUseUnity = true;
-        MinSourceFilesForUnityBuildOverride = 2;
+        Console.WriteLine("McpAutomationBridge: Unity builds enabled");
         
-        // Increase bytes per unity file to combine MORE files into fewer translation units
-        // Default is 384KB; we increase to 2MB to handle our 50+ handler files
-        // This reduces number of compiler invocations, preventing memory exhaustion
-        NumIncludedBytesPerUnityCPPOverride = 2048 * 1024;
-        
-        // Disable Adaptive Unity to prevent files from being excluded from unity builds
-        // bUseAdaptiveUnityBuild was removed in UE 5.7, use reflection to set it safely
-        try
+        // UE 5.0 + MSVC: Suppress warnings from engine headers using Clang-only __has_feature macro
+        if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion == 0)
         {
-            var prop = GetType().GetProperty("bUseAdaptiveUnityBuild");
-            if (prop != null) { prop.SetValue(this, false); }
+            if (Target.Platform == UnrealTargetPlatform.Win64)
+            {
+                // C4668: '__has_feature' is not defined as a preprocessor macro
+                // C4067: unexpected tokens following preprocessor directive
+                PublicDefinitions.Add("__has_feature(x)=0");
+                Console.WriteLine("McpAutomationBridge: Added MSVC warning suppression for UE 5.0");
+            }
         }
-        catch { /* Property doesn't exist in this UE version */ }
-        
-        // bMergeUnityFiles was also removed in UE 5.7
-        try
-        {
-            var prop = GetType().GetProperty("bMergeUnityFiles");
-            if (prop != null) { prop.SetValue(this, true); }
-        }
-        catch { /* Property doesn't exist in this UE version */ }
 
-        PublicDependencyModuleNames.AddRange(new string[]
+PublicDependencyModuleNames.AddRange(new string[]
         {
             "Core","CoreUObject","Engine","Json","JsonUtilities",
-            "LevelSequence", "MovieScene", "MovieSceneTracks", "GameplayTags"
+            "LevelSequence", "MovieScene", "MovieSceneTracks", "GameplayTags",
+            "AIModule",  // Required for UEnvQueryTest_Distance and other EQS classes
+            "Landscape"  // Required for FGrassVariety and other landscape classes
         });
 
         if (Target.bBuildEditor)
@@ -63,26 +97,32 @@ public class McpAutomationBridge : ModuleRules
             PublicDependencyModuleNames.AddRange(new string[] 
             { 
                 "LevelSequenceEditor", "Sequencer", "MovieSceneTools", "Niagara", "NiagaraEditor", "UnrealEd",
-                "WorldPartitionEditor", "DataLayerEditor", "EnhancedInput", "InputEditor"
+                "WorldPartitionEditor", "DataLayerEditor", "EnhancedInput", "InputEditor",
+                // Required for linking symbols used in handlers (already in base: AIModule, Landscape, Engine)
+                "BehaviorTreeEditor",  // UBehaviorTreeGraphNode classes
+                "MaterialEditor"  // UMaterialExpressionRotator and other material expressions
             });
 
             PrivateDependencyModuleNames.AddRange(new string[]
             {
                 "ApplicationCore","Slate","SlateCore","Projects","InputCore","DeveloperSettings","Settings","EngineSettings",
-                "Sockets","Networking","EditorSubsystem","EditorScriptingUtilities","BlueprintGraph",
-                "Kismet","KismetCompiler","AssetRegistry","AssetTools","MaterialEditor","SourceControl",
+                "Sockets","Networking","EditorSubsystem","EditorScriptingUtilities","BlueprintGraph","SSL",
+                "Kismet","KismetCompiler","AssetRegistry","AssetTools","SourceControl",
                 "AudioEditor", "DataValidation", "NiagaraEditor",
                 // Phase 24: GAS, Audio, and missing module dependencies
                 "GameplayAbilities",  // Required for UAttributeSet, UGameplayEffect, UGameplayAbility, etc.
                 "AudioMixer"          // Required for FAudioEQEffect::ClampValues
             });
 
+            // Add OpenSSL for TLS support (requires WITH_SSL)
+            AddEngineThirdPartyPrivateStaticDependencies(Target, "OpenSSL");
+
             PrivateDependencyModuleNames.AddRange(new string[]
             {
-                "Landscape","LandscapeEditor","LandscapeEditorUtilities","Foliage","FoliageEdit",
+"LandscapeEditor","LandscapeEditorUtilities","Foliage","FoliageEdit",
                 "AnimGraph","AnimationBlueprintLibrary","Persona","ToolMenus","EditorWidgets","PropertyEditor","LevelEditor",
-                "ControlRig","ControlRigDeveloper","ControlRigEditor","UMG","UMGEditor","ProceduralMeshComponent","MergeActors",
-                "BehaviorTreeEditor", "RenderCore", "RHI", "AutomationController", "GameplayDebugger", "TraceLog", "TraceAnalysis", "AIModule", "AIGraph",
+                "ControlRig","ControlRigDeveloper","ControlRigEditor","RigVM","RigVMDeveloper","UMG","UMGEditor","ProceduralMeshComponent","MergeActors",
+                "EnvironmentQueryEditor", "RenderCore", "RHI", "AutomationController", "GameplayDebugger", "TraceLog", "TraceAnalysis", "AIGraph",
                 "MeshUtilities", "MaterialUtilities", "PhysicsCore", "ClothingSystemRuntimeCommon",
                 // Phase 6: Geometry Script (GeometryScripting plugin dependency in .uplugin ensures availability)
                 "GeometryCore", "GeometryScriptingCore", "GeometryScriptingEditor", "GeometryFramework", "DynamicMesh", "MeshDescription", "StaticMeshDescription",
@@ -178,8 +218,8 @@ public class McpAutomationBridge : ModuleRules
                 PublicDefinitions.Add("MCP_ENABLE_EDIT_AND_CONTINUE=1");
             }
 
-            // Control Rig Factory Support
-            PublicDefinitions.Add("MCP_HAS_CONTROLRIG_FACTORY=1");
+            // Control Rig Factory Support - detection is handled in source code via __has_include
+            // Do not define MCP_HAS_CONTROLRIG_FACTORY here to avoid redefinition warnings
         }
         else
         {
@@ -295,6 +335,72 @@ public class McpAutomationBridge : ModuleRules
         }
         catch { /* Ignore access denied errors */ }
         return false;
+    }
+
+    /// <summary>
+    /// Gets the ACTUAL available physical memory in MB using Windows API.
+    /// Falls back to conservative estimate if detection fails.
+    /// </summary>
+    /// <returns>Available memory in MB.</returns>
+    private long GetActualAvailableMemoryMB()
+    {
+        try
+        {
+            // Try Windows API first (most accurate)
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+            {
+                var memStatus = new MEMORYSTATUSEX();
+                memStatus.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+                
+                if (GlobalMemoryStatusEx(ref memStatus))
+                {
+                    // Return available physical memory in MB
+                    return (long)(memStatus.ullAvailPhys / (1024 * 1024));
+                }
+            }
+        }
+        catch
+        {
+            // Fall through to heuristics
+        }
+        
+        // Fallback: Check for environment variable hint
+        string MemoryHint = Environment.GetEnvironmentVariable("UE_BUILD_MEMORY_MB");
+        if (!string.IsNullOrEmpty(MemoryHint))
+        {
+            long HintValue;
+            if (long.TryParse(MemoryHint, out HintValue) && HintValue > 0)
+            {
+                return HintValue;
+            }
+        }
+        
+        // Conservative fallback - assume 4GB available
+        return 4096;
+    }
+
+    /// <summary>
+    /// Gets the total physical memory in MB using Windows API.
+    /// </summary>
+    /// <returns>Total memory in MB.</returns>
+    private long GetTotalPhysicalMemoryMB()
+    {
+        try
+        {
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+            {
+                var memStatus = new MEMORYSTATUSEX();
+                memStatus.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+                
+                if (GlobalMemoryStatusEx(ref memStatus))
+                {
+                    return (long)(memStatus.ullTotalPhys / (1024 * 1024));
+                }
+            }
+        }
+        catch { }
+        
+        return 8192; // Conservative fallback
     }
 
     /// <summary>

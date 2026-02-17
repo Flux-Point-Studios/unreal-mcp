@@ -2,11 +2,16 @@
  * Volume Handlers (Phase 24)
  *
  * Complete volume and trigger system management including:
- * - Trigger Volumes: trigger_volume, trigger_box, trigger_sphere, trigger_capsule
- * - Gameplay Volumes: blocking, kill_z, pain_causing, physics, audio, reverb
- * - Rendering Volumes: cull_distance, precomputed_visibility, lightmass_importance
+ * - Trigger Volumes: create_trigger_volume, add_trigger_volume, trigger_box, trigger_sphere, trigger_capsule
+ * - Gameplay Volumes: create_blocking, add_blocking, kill_z, pain_causing, physics
+ * - Audio Volumes: audio, reverb
+ * - Rendering Volumes: create_cull_distance, add_cull_distance, precomputed_visibility, lightmass_importance
  * - Navigation Volumes: nav_mesh_bounds, nav_modifier, camera_blocking
  * - Volume Configuration: extent, properties
+ * - Post Process: create_post_process_volume, add_post_process_volume (UE 5.1-5.6)
+ *
+ * Note: add_*_volume actions create volumes attached to existing actors (require actorPath)
+ * create_*_volume actions create standalone volumes
  *
  * @module volume-handlers
  */
@@ -52,6 +57,30 @@ function normalizePathFields(args: Record<string, unknown>): Record<string, unkn
 }
 
 /**
+ * Normalize parameter names from snake_case to camelCase for C++ compatibility.
+ * Tests may send volume_name but C++ expects volumeName.
+ */
+function normalizeParamNames(args: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...args };
+  const paramMappings: Record<string, string> = {
+    'volume_name': 'volumeName',
+    'volume_path': 'volumePath',
+    'box_extent': 'boxExtent',
+    'sphere_radius': 'sphereRadius',
+    'capsule_radius': 'capsuleRadius',
+    'capsule_half_height': 'capsuleHalfHeight'
+  };
+
+  for (const [snakeCase, camelCase] of Object.entries(paramMappings)) {
+    if (snakeCase in result && !(camelCase in result)) {
+      result[camelCase] = result[snakeCase];
+      delete result[snakeCase];
+    }
+  }
+  return result;
+}
+
+/**
  * Handles all volume actions for the manage_volumes tool.
  */
 export async function handleVolumeTools(
@@ -59,8 +88,8 @@ export async function handleVolumeTools(
   args: HandlerArgs,
   tools: ITools
 ): Promise<Record<string, unknown>> {
-  // Normalize path fields before sending to C++
-  const argsRecord = normalizePathFields(args as Record<string, unknown>);
+  // Normalize path fields and parameter names before sending to C++
+  const argsRecord = normalizeParamNames(normalizePathFields(args as Record<string, unknown>));
   const timeoutMs = getTimeoutMs();
 
   // All actions are dispatched to C++ via automation bridge
@@ -83,6 +112,10 @@ export async function handleVolumeTools(
     case 'create_trigger_volume':
       return sendRequest('create_trigger_volume');
 
+    case 'add_trigger_volume':
+      // add_trigger_volume creates volume attached to existing actor (requires actorPath)
+      return sendRequest('add_trigger_volume');
+
     case 'create_trigger_box':
       return sendRequest('create_trigger_box');
 
@@ -98,14 +131,26 @@ export async function handleVolumeTools(
     case 'create_blocking_volume':
       return sendRequest('create_blocking_volume');
 
+    case 'add_blocking_volume':
+      // add_blocking_volume creates volume attached to existing actor (requires actorPath)
+      return sendRequest('add_blocking_volume');
+
     case 'create_kill_z_volume':
       return sendRequest('create_kill_z_volume');
+
+    case 'add_kill_z_volume':
+      // add_kill_z_volume creates volume attached to existing actor (requires actorPath)
+      return sendRequest('add_kill_z_volume');
 
     case 'create_pain_causing_volume':
       return sendRequest('create_pain_causing_volume');
 
     case 'create_physics_volume':
       return sendRequest('create_physics_volume');
+
+    case 'add_physics_volume':
+      // add_physics_volume creates volume attached to existing actor (requires actorPath)
+      return sendRequest('add_physics_volume');
 
     case 'create_audio_volume':
       return sendRequest('create_audio_volume');
@@ -115,6 +160,10 @@ export async function handleVolumeTools(
 
     case 'create_cull_distance_volume':
       return sendRequest('create_cull_distance_volume');
+
+    case 'add_cull_distance_volume':
+      // add_cull_distance_volume creates volume attached to existing actor (requires actorPath)
+      return sendRequest('add_cull_distance_volume');
 
     case 'create_precomputed_visibility_volume':
       return sendRequest('create_precomputed_visibility_volume');
@@ -132,13 +181,30 @@ export async function handleVolumeTools(
       return sendRequest('create_camera_blocking_volume');
 
     // ========================================================================
-    // Volume Configuration (2 actions)
+    // Post Process Volume (UE 5.1-5.6 only, removed in 5.7+)
+    // ========================================================================
+    case 'create_post_process_volume':
+      return sendRequest('create_post_process_volume');
+
+    case 'add_post_process_volume':
+      // add_post_process_volume creates volume attached to existing actor (requires actorPath)
+      return sendRequest('add_post_process_volume');
+
+    // ========================================================================
+    // Volume Configuration (3 actions)
     // ========================================================================
     case 'set_volume_extent':
+    case 'set_volume_bounds': // Alias for compatibility
       return sendRequest('set_volume_extent');
 
     case 'set_volume_properties':
       return sendRequest('set_volume_properties');
+
+    // ========================================================================
+    // Volume Removal (1 action)
+    // ========================================================================
+    case 'remove_volume':
+      return sendRequest('remove_volume');
 
     // ========================================================================
     // Utility (1 action)

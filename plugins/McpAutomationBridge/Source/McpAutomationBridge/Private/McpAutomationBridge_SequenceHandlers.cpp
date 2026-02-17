@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 #include "LevelSequence.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
@@ -8,6 +9,15 @@
 #include "MovieSceneSequence.h"
 #include "MovieSceneTrack.h"
 #include "UObject/UObjectIterator.h"
+
+// UE 5.0 compatibility: GetTracks() was introduced in UE 5.1, use GetMasterTracks() in 5.0
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#define MCP_GET_MOVIESCENE_TRACKS(MovieScene) (MovieScene)->GetTracks()
+#define MCP_GET_BINDING_TRACKS(Binding) (Binding).GetTracks()
+#else
+#define MCP_GET_MOVIESCENE_TRACKS(MovieScene) (MovieScene)->GetMasterTracks()
+#define MCP_GET_BINDING_TRACKS(Binding) (Binding).GetTracks()
+#endif
 
 #if WITH_EDITOR
 #include "Editor.h"
@@ -33,7 +43,8 @@
 
 // Header checks removed causing issues with private headers
 
-#if __has_include("LevelSequenceEditorSubsystem.h")
+// LevelSequenceEditorSubsystem is only available in UE 5.1+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 #include "LevelSequenceEditorSubsystem.h"
 #define MCP_HAS_LEVELSEQUENCE_EDITOR_SUBSYSTEM 1
 #else
@@ -154,10 +165,10 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceCreate(
          TEXT("HandleSequenceCreate: Handing RequestID=%s Path=%s"),
          *RequestIdArg, *FullPath);
 
-  // Check existence first to avoid error log spam
+// Check existence first to avoid error log spam
   if (UEditorAssetLibrary::DoesAssetExist(FullPath)) {
     TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
-    Resp->SetStringField(TEXT("sequencePath"), FullPath);
+    VerifyAssetExists(Resp, FullPath);
     UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
            TEXT("HandleSequenceCreate: Sequence exists, sending response for "
                 "RequestID=%s"),
@@ -183,11 +194,11 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceCreate(
             TEXT("AssetTools"));
     UObject *NewObj = AssetToolsModule.Get().CreateAsset(
         Name, DestFolder, ULevelSequence::StaticClass(), Factory);
-    if (NewObj) {
-      UEditorAssetLibrary::SaveAsset(FullPath);
+if (NewObj) {
+      McpSafeAssetSave(NewObj);
       GCurrentSequencePath = FullPath;
       TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
-      Resp->SetStringField(TEXT("sequencePath"), FullPath);
+      AddAssetVerification(Resp, NewObj);
       UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
              TEXT("HandleSequenceCreate: Created sequence, sending response "
                   "for RequestID=%s"),
@@ -281,14 +292,14 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetDisplayRate(
         bRateFound = true;
       }
 
-      if (bRateFound) {
+if (bRateFound) {
         MovieScene->SetDisplayRate(NewRate);
         MovieScene->Modify();
 
         TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
-        Resp->SetBoolField(TEXT("success"), true);
         Resp->SetStringField(TEXT("displayRate"),
                              NewRate.ToPrettyText().ToString());
+        AddAssetVerification(Resp, LevelSeq);
         SendAutomationResponse(Socket, RequestId, true,
                                TEXT("Display rate set"), Resp, FString());
         return true;
@@ -478,6 +489,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceOpen(
     return true;
   }
 
+#if MCP_HAS_LEVELSEQUENCE_EDITOR_SUBSYSTEM
   if (ULevelSequence *LevelSeq = Cast<ULevelSequence>(SeqObj)) {
     if (GEditor) {
       if (ULevelSequenceEditorSubsystem *LSES =
@@ -499,6 +511,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceOpen(
       }
     }
   }
+#endif
 
   if (GEditor) {
     if (UAssetEditorSubsystem *AssetEditorSS =
@@ -1246,7 +1259,13 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceStop(
       FMovieSceneSequencePlaybackParams PlaybackParams;
       PlaybackParams.Frame = FFrameTime(0);
       PlaybackParams.UpdateMethod = EUpdatePositionMethod::Scrub;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+      // UE 5.4+: SetGlobalPosition available
       ULevelSequenceEditorBlueprintLibrary::SetGlobalPosition(PlaybackParams);
+#else
+      // UE 5.0-5.3 fallback - use SetCurrentTime (takes int32 frame number)
+      ULevelSequenceEditorBlueprintLibrary::SetCurrentTime(0);
+#endif
 
       Subsystem->SendAutomationResponse(
           Socket, RequestIdArg, true, TEXT("Sequence stopped (reset to start)"),
@@ -1280,7 +1299,12 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceList(
   IAssetRegistry &AssetRegistry = AssetRegistryModule.Get();
 
   FARFilter Filter;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
   Filter.ClassPaths.Add(ULevelSequence::StaticClass()->GetClassPathName());
+#else
+  // UE 5.0: Use ClassNames instead of ClassPaths
+  Filter.ClassNames.Add(ULevelSequence::StaticClass()->GetFName());
+#endif
   Filter.bRecursiveClasses = true;
   Filter.bRecursivePaths = true;
   Filter.PackagePaths.Add(FName("/Game"));
@@ -1290,7 +1314,12 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceList(
 
   for (const FAssetData &Asset : AssetList) {
     TSharedPtr<FJsonObject> SeqObj = MakeShared<FJsonObject>();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
     SeqObj->SetStringField(TEXT("path"), Asset.GetObjectPathString());
+#else
+    // UE 5.0: Construct object path manually
+    SeqObj->SetStringField(TEXT("path"), FString::Printf(TEXT("%s.%s"), *Asset.PackageName.ToString(), *Asset.AssetName.ToString()));
+#endif
     SeqObj->SetStringField(TEXT("name"), Asset.AssetName.ToString());
     SequencesArray.Add(MakeShared<FJsonValueObject>(SeqObj));
   }
@@ -1819,7 +1848,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceAddSection(
   UMovieSceneTrack *Track = nullptr;
 
   // First check master tracks
-  for (UMovieSceneTrack *MasterTrack : MovieScene->GetTracks()) {
+  for (UMovieSceneTrack *MasterTrack : MCP_GET_MOVIESCENE_TRACKS(MovieScene)) {
     if (MasterTrack &&
         (MasterTrack->GetName().Contains(TrackName) ||
          MasterTrack->GetDisplayName().ToString().Contains(TrackName))) {
@@ -1845,7 +1874,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceAddSection(
 
       // If ActorName is provided, filter by it; otherwise search all bindings
       if (ActorName.IsEmpty() || BindingName.Contains(ActorName)) {
-        for (UMovieSceneTrack *BindingTrack : Binding.GetTracks()) {
+        for (UMovieSceneTrack *BindingTrack : MCP_GET_BINDING_TRACKS(Binding)) {
           if (BindingTrack &&
               (BindingTrack->GetName().Contains(TrackName) ||
                BindingTrack->GetDisplayName().ToString().Contains(TrackName))) {
@@ -2020,7 +2049,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetTrackMuted(
   UMovieSceneTrack *Track = nullptr;
 
   // Search master tracks and binding tracks
-  for (UMovieSceneTrack *MasterTrack : MovieScene->GetTracks()) {
+  for (UMovieSceneTrack *MasterTrack : MCP_GET_MOVIESCENE_TRACKS(MovieScene)) {
     if (MasterTrack && MasterTrack->GetName().Contains(TrackName)) {
       Track = MasterTrack;
       break;
@@ -2030,7 +2059,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetTrackMuted(
   if (!Track) {
     for (const FMovieSceneBinding &Binding :
          const_cast<const UMovieScene *>(MovieScene)->GetBindings()) {
-      for (UMovieSceneTrack *BindingTrack : Binding.GetTracks()) {
+      for (UMovieSceneTrack *BindingTrack : MCP_GET_BINDING_TRACKS(Binding)) {
         if (BindingTrack && BindingTrack->GetName().Contains(TrackName)) {
           Track = BindingTrack;
           break;
@@ -2097,7 +2126,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetTrackSolo(
 
   // Find the track to solo
   TArray<UMovieSceneTrack *> AllTracks;
-  for (UMovieSceneTrack *Track : MovieScene->GetTracks()) {
+  for (UMovieSceneTrack *Track : MCP_GET_MOVIESCENE_TRACKS(MovieScene)) {
     if (Track) {
       AllTracks.Add(Track);
       if (Track->GetName().Contains(TrackName)) {
@@ -2108,7 +2137,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetTrackSolo(
 
   for (const FMovieSceneBinding &Binding :
        const_cast<const UMovieScene *>(MovieScene)->GetBindings()) {
-    for (UMovieSceneTrack *Track : Binding.GetTracks()) {
+    for (UMovieSceneTrack *Track : MCP_GET_BINDING_TRACKS(Binding)) {
       if (Track) {
         AllTracks.Add(Track);
         if (Track->GetName().Contains(TrackName)) {
@@ -2178,7 +2207,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetTrackLocked(
   UMovieSceneTrack *Track = nullptr;
 
   // Search for track
-  for (UMovieSceneTrack *MasterTrack : MovieScene->GetTracks()) {
+  for (UMovieSceneTrack *MasterTrack : MCP_GET_MOVIESCENE_TRACKS(MovieScene)) {
     if (MasterTrack && MasterTrack->GetName().Contains(TrackName)) {
       Track = MasterTrack;
       break;
@@ -2188,7 +2217,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceSetTrackLocked(
   if (!Track) {
     for (const FMovieSceneBinding &Binding :
          const_cast<const UMovieScene *>(MovieScene)->GetBindings()) {
-      for (UMovieSceneTrack *BindingTrack : Binding.GetTracks()) {
+      for (UMovieSceneTrack *BindingTrack : MCP_GET_BINDING_TRACKS(Binding)) {
         if (BindingTrack && BindingTrack->GetName().Contains(TrackName)) {
           Track = BindingTrack;
           break;
@@ -2256,7 +2285,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceRemoveTrack(
   FString RemovedTrackName;
 
   // Try to remove from master tracks first
-  for (UMovieSceneTrack *Track : MovieScene->GetTracks()) {
+  for (UMovieSceneTrack *Track : MCP_GET_MOVIESCENE_TRACKS(MovieScene)) {
     if (Track && Track->GetName().Contains(TrackName)) {
       RemovedTrackName = Track->GetName();
       MovieScene->RemoveTrack(*Track);
@@ -2269,7 +2298,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceRemoveTrack(
   if (!bRemoved) {
     for (const FMovieSceneBinding &Binding :
          const_cast<const UMovieScene *>(MovieScene)->GetBindings()) {
-      for (UMovieSceneTrack *Track : Binding.GetTracks()) {
+      for (UMovieSceneTrack *Track : MCP_GET_BINDING_TRACKS(Binding)) {
         if (Track && Track->GetName().Contains(TrackName)) {
           RemovedTrackName = Track->GetName();
           MovieScene->RemoveTrack(*Track);
@@ -2531,7 +2560,16 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceAction(
       if (BindingGuid.IsValid()) {
         NewTrack = MovieScene->AddTrack(TrackClass, BindingGuid);
       } else {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
         NewTrack = MovieScene->AddTrack(TrackClass);
+#else
+        // UE 5.0: AddTrack always requires a binding GUID
+        SendAutomationError(
+            RequestingSocket, RequestId,
+            TEXT("Adding tracks without binding is not supported in UE 5.0. Please provide an actor or object binding."),
+            TEXT("NOT_SUPPORTED"));
+        return true;
+#endif
       }
     } else if (TrackClass) {
       // Found a class but it's not a track
@@ -2598,7 +2636,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceAction(
     TArray<TSharedPtr<FJsonValue>> TracksArray;
 
     // Get Tracks (formerly GetMasterTracks)
-    for (UMovieSceneTrack *Track : MovieScene->GetTracks()) {
+    for (UMovieSceneTrack *Track : MCP_GET_MOVIESCENE_TRACKS(MovieScene)) {
       if (!Track)
         continue;
       TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
@@ -2624,7 +2662,7 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceAction(
         BindingName = Spawnable->GetName();
       }
 
-      for (UMovieSceneTrack *Track : Binding.GetTracks()) {
+      for (UMovieSceneTrack *Track : MCP_GET_BINDING_TRACKS(Binding)) {
         if (!Track)
           continue;
         TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();

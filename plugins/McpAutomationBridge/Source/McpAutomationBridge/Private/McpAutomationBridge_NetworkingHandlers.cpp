@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 // McpAutomationBridge_NetworkingHandlers.cpp
 // Phase 20: Networking & Multiplayer System Handlers
 //
@@ -11,6 +12,7 @@
 // - Utility (info queries)
 
 #include "McpAutomationBridgeSubsystem.h"
+#include "McpAutomationBridgeHelpers.h"
 #include "McpBridgeWebSocket.h"
 #include "Misc/EngineVersionComparison.h"
 
@@ -47,31 +49,34 @@ namespace NetworkingHelpers
     // Get string field with default
     FString GetStringField(const TSharedPtr<FJsonObject>& Payload, const FString& FieldName, const FString& Default = TEXT(""))
     {
-        if (Payload.IsValid() && Payload->HasField(FieldName))
+        FString Value = Default;
+        if (Payload.IsValid())
         {
-            return Payload->GetStringField(FieldName);
+            Payload->TryGetStringField(FieldName, Value);
         }
-        return Default;
+        return Value;
     }
 
     // Get number field with default
     double GetNumberField(const TSharedPtr<FJsonObject>& Payload, const FString& FieldName, double Default = 0.0)
     {
-        if (Payload.IsValid() && Payload->HasField(FieldName))
+        double Value = Default;
+        if (Payload.IsValid())
         {
-            return Payload->GetNumberField(FieldName);
+            Payload->TryGetNumberField(FieldName, Value);
         }
-        return Default;
+        return Value;
     }
 
     // Get bool field with default
     bool GetBoolField(const TSharedPtr<FJsonObject>& Payload, const FString& FieldName, bool Default = false)
     {
-        if (Payload.IsValid() && Payload->HasField(FieldName))
+        bool Value = Default;
+        if (Payload.IsValid())
         {
-            return Payload->GetBoolField(FieldName);
+            Payload->TryGetBoolField(FieldName, Value);
         }
-        return Default;
+        return Value;
     }
 
     // Get object field
@@ -286,7 +291,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Property %s replication set to %s"), *PropertyName, bReplicated ? TEXT("true") : TEXT("false")));
-        ResultJson->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Property replication configured"), ResultJson);
         return true;
     }
@@ -338,7 +343,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Replication condition set to %s"), *Condition));
-        ResultJson->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Replication condition configured"), ResultJson);
         return true;
     }
@@ -364,17 +369,31 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         // Set on CDO
         AActor* CDO = Cast<AActor>(Blueprint->GeneratedClass->GetDefaultObject());
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
         if (CDO)
         {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+            // UE 5.5+ uses setter methods
             CDO->SetNetUpdateFrequency(static_cast<float>(NetUpdateFrequency));
             CDO->SetMinNetUpdateFrequency(static_cast<float>(MinNetUpdateFrequency));
+#else
+            // UE 5.1-5.4 uses public member variables (deprecated in 5.5)
+            CDO->NetUpdateFrequency = static_cast<float>(NetUpdateFrequency);
+            CDO->MinNetUpdateFrequency = static_cast<float>(MinNetUpdateFrequency);
+#endif
         }
+#else
+        // UE 5.0 fallback - these APIs not available
+        SendAutomationError(RequestingSocket, RequestId, TEXT("Net update frequency APIs not available in UE 5.0"), TEXT("NOT_AVAILABLE"));
+        return true;
+#endif
 
         Blueprint->Modify();
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Net update frequency set to %.1f (min: %.1f)"), NetUpdateFrequency, MinNetUpdateFrequency));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Net update frequency configured"), ResultJson);
         return true;
     }
@@ -408,6 +427,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Net priority set to %.2f"), NetPriority));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Net priority configured"), ResultJson);
         return true;
     }
@@ -442,6 +462,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Net dormancy set to %s"), *Dormancy));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Net dormancy configured"), ResultJson);
         return true;
     }
@@ -491,6 +512,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Replication graph settings configured (netLoadOnClient=%s, spatiallyLoaded=%s)"), 
             bNetLoadOnClient ? TEXT("true") : TEXT("false"),
             bSpatiallyLoaded ? TEXT("true") : TEXT("false")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Replication graph configured"), ResultJson);
         return true;
     }
@@ -573,6 +595,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
             ResultJson->SetStringField(TEXT("rpcType"), RpcType);
             ResultJson->SetBoolField(TEXT("reliable"), bReliable);
             ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Created %s RPC function: %s"), *RpcType, *FunctionName));
+            AddAssetVerification(ResultJson, Blueprint);
             SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("RPC function created"), ResultJson);
         }
         else
@@ -650,6 +673,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetBoolField(TEXT("withValidation"), bWithValidation);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("RPC validation %s for function %s"), bWithValidation ? TEXT("enabled") : TEXT("disabled"), *FunctionName));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("RPC validation configured"), ResultJson);
         return true;
     }
@@ -722,6 +746,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetBoolField(TEXT("reliable"), bReliable);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("RPC %s reliability set to %s"), *FunctionName, bReliable ? TEXT("reliable") : TEXT("unreliable")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("RPC reliability configured"), ResultJson);
         return true;
     }
@@ -765,6 +790,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), Owner ? FString::Printf(TEXT("Set owner of %s to %s"), *ActorName, *OwnerActorName) : FString::Printf(TEXT("Cleared owner of %s"), *ActorName));
+        AddActorVerification(ResultJson, Actor);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Owner set"), ResultJson);
         return true;
     }
@@ -817,6 +843,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetBoolField(TEXT("isAutonomousProxy"), bIsAutonomousProxy);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Autonomous proxy configuration %s for replicated properties"), bIsAutonomousProxy ? TEXT("enabled") : TEXT("disabled")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Autonomous proxy configured"), ResultJson);
         return true;
     }
@@ -921,17 +948,30 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         }
 
         AActor* CDO = Cast<AActor>(Blueprint->GeneratedClass->GetDefaultObject());
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
         if (CDO)
         {
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+            // UE 5.5+ uses setter methods
             CDO->SetNetCullDistanceSquared(static_cast<float>(NetCullDistanceSquared));
+#else
+            // UE 5.1-5.4 uses public member variables (deprecated in 5.5)
+            CDO->NetCullDistanceSquared = static_cast<float>(NetCullDistanceSquared);
+#endif
             CDO->bNetUseOwnerRelevancy = bUseOwnerNetRelevancy;
         }
+#else
+        // UE 5.0 fallback - SetNetCullDistanceSquared not available
+        SendAutomationError(RequestingSocket, RequestId, TEXT("Net cull distance API not available in UE 5.0"), TEXT("NOT_AVAILABLE"));
+        return true;
+#endif
 
         Blueprint->Modify();
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Net cull distance squared set to %.0f"), NetCullDistanceSquared));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Net cull distance configured"), ResultJson);
         return true;
     }
@@ -965,6 +1005,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Always relevant set to %s"), bAlwaysRelevant ? TEXT("true") : TEXT("false")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Always relevant configured"), ResultJson);
         return true;
     }
@@ -998,6 +1039,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Only relevant to owner set to %s"), bOnlyRelevantToOwner ? TEXT("true") : TEXT("false")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Only relevant to owner configured"), ResultJson);
         return true;
     }
@@ -1044,6 +1086,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
             ResultJson->SetStringField(TEXT("structName"), StructName);
         }
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Net serialization configured (customSerialization=%s)"), bCustomSerialization ? TEXT("true") : TEXT("false")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Net serialization configured"), ResultJson);
         return true;
     }
@@ -1093,6 +1136,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("ReplicatedUsing set to %s for property %s"), *RepNotifyFunc, *PropertyName));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("ReplicatedUsing configured"), ResultJson);
         return true;
     }
@@ -1146,6 +1190,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetBoolField(TEXT("usePushModel"), bUsePushModel);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Push model replication %s for all replicated properties"), bUsePushModel ? TEXT("enabled") : TEXT("disabled")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Push model configured"), ResultJson);
         return true;
     }
@@ -1198,6 +1243,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetBoolField(TEXT("enablePrediction"), bEnablePrediction);
         ResultJson->SetNumberField(TEXT("predictionThreshold"), PredictionThreshold);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Client prediction %s"), bEnablePrediction ? TEXT("enabled") : TEXT("disabled")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Client prediction configured"), ResultJson);
         return true;
     }
@@ -1241,6 +1287,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetNumberField(TEXT("correctionThreshold"), CorrectionThreshold);
         ResultJson->SetNumberField(TEXT("smoothingRate"), SmoothingRate);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Server correction configured (threshold=%.2f, smoothing=%.2f)"), CorrectionThreshold, SmoothingRate));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Server correction configured"), ResultJson);
         return true;
     }
@@ -1316,6 +1363,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetStringField(TEXT("variableName"), VarName);
         ResultJson->SetStringField(TEXT("dataType"), DataType);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Network prediction data variable '%s' of type '%s' added"), *VarName, *DataType));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Network prediction data added"), ResultJson);
         return true;
     }
@@ -1354,6 +1402,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), TEXT("Movement prediction configured"));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Movement prediction configured"), ResultJson);
         return true;
     }
@@ -1447,6 +1496,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
         ResultJson->SetStringField(TEXT("role"), Role);
         ResultJson->SetBoolField(TEXT("replicates"), CDO ? CDO->GetIsReplicated() : false);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Net role configured to %s (replicates=%s)"), *Role, CDO && CDO->GetIsReplicated() ? TEXT("true") : TEXT("false")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Net role configured"), ResultJson);
         return true;
     }
@@ -1480,6 +1530,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
 
         ResultJson->SetBoolField(TEXT("success"), true);
         ResultJson->SetStringField(TEXT("message"), FString::Printf(TEXT("Replicate movement set to %s"), bReplicateMovement ? TEXT("true") : TEXT("false")));
+        AddAssetVerification(ResultJson, Blueprint);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Replicated movement configured"), ResultJson);
         return true;
     }
@@ -1510,11 +1561,23 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
                 NetworkingInfo->SetBoolField(TEXT("bReplicates"), CDO->GetIsReplicated());
                 NetworkingInfo->SetBoolField(TEXT("bAlwaysRelevant"), CDO->bAlwaysRelevant);
                 NetworkingInfo->SetBoolField(TEXT("bOnlyRelevantToOwner"), CDO->bOnlyRelevantToOwner);
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+                // UE 5.5+ uses getter methods
                 NetworkingInfo->SetNumberField(TEXT("netUpdateFrequency"), CDO->GetNetUpdateFrequency());
                 NetworkingInfo->SetNumberField(TEXT("minNetUpdateFrequency"), CDO->GetMinNetUpdateFrequency());
+                NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), CDO->GetNetCullDistanceSquared());
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+                // UE 5.1-5.4 uses public member variables (deprecated in 5.5)
+                NetworkingInfo->SetNumberField(TEXT("netUpdateFrequency"), CDO->NetUpdateFrequency);
+                NetworkingInfo->SetNumberField(TEXT("minNetUpdateFrequency"), CDO->MinNetUpdateFrequency);
+                NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), CDO->NetCullDistanceSquared);
+#else
+                NetworkingInfo->SetNumberField(TEXT("netUpdateFrequency"), 0.0);
+                NetworkingInfo->SetNumberField(TEXT("minNetUpdateFrequency"), 0.0);
+                NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), 0.0);
+#endif
                 NetworkingInfo->SetNumberField(TEXT("netPriority"), CDO->NetPriority);
                 NetworkingInfo->SetStringField(TEXT("netDormancy"), NetDormancyToString(CDO->NetDormancy));
-                NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), CDO->GetNetCullDistanceSquared());
             }
         }
         else if (!ActorName.IsEmpty())
@@ -1536,11 +1599,23 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNetworkingAction(
             NetworkingInfo->SetBoolField(TEXT("bReplicates"), Actor->GetIsReplicated());
             NetworkingInfo->SetBoolField(TEXT("bAlwaysRelevant"), Actor->bAlwaysRelevant);
             NetworkingInfo->SetBoolField(TEXT("bOnlyRelevantToOwner"), Actor->bOnlyRelevantToOwner);
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+            // UE 5.5+ uses getter methods
             NetworkingInfo->SetNumberField(TEXT("netUpdateFrequency"), Actor->GetNetUpdateFrequency());
             NetworkingInfo->SetNumberField(TEXT("minNetUpdateFrequency"), Actor->GetMinNetUpdateFrequency());
+            NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), Actor->GetNetCullDistanceSquared());
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+            // UE 5.1-5.4 uses public member variables (deprecated in 5.5)
+            NetworkingInfo->SetNumberField(TEXT("netUpdateFrequency"), Actor->NetUpdateFrequency);
+            NetworkingInfo->SetNumberField(TEXT("minNetUpdateFrequency"), Actor->MinNetUpdateFrequency);
+            NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), Actor->NetCullDistanceSquared);
+#else
+            NetworkingInfo->SetNumberField(TEXT("netUpdateFrequency"), 0.0);
+            NetworkingInfo->SetNumberField(TEXT("minNetUpdateFrequency"), 0.0);
+            NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), 0.0);
+#endif
             NetworkingInfo->SetNumberField(TEXT("netPriority"), Actor->NetPriority);
             NetworkingInfo->SetStringField(TEXT("netDormancy"), NetDormancyToString(Actor->NetDormancy));
-            NetworkingInfo->SetNumberField(TEXT("netCullDistanceSquared"), Actor->GetNetCullDistanceSquared());
             NetworkingInfo->SetStringField(TEXT("role"), NetRoleToString(Actor->GetLocalRole()));
             NetworkingInfo->SetStringField(TEXT("remoteRole"), NetRoleToString(Actor->GetRemoteRole()));
             NetworkingInfo->SetBoolField(TEXT("hasAuthority"), Actor->HasAuthority());

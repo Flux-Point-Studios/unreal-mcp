@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 // Copyright Epic Games, Inc. All Rights Reserved.
 // Phase 25: Navigation System Handlers
 
@@ -34,7 +35,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogMcpNavigationHandlers, Log, All);
 #if WITH_EDITOR
 
 // Helper to get string field from JSON
-static FString GetJsonStringField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FString& Default = TEXT(""))
+static FString GetJsonStringFieldNav(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FString& Default = TEXT(""))
 {
     if (!Payload.IsValid()) return Default;
     FString Value;
@@ -46,7 +47,7 @@ static FString GetJsonStringField(const TSharedPtr<FJsonObject>& Payload, const 
 }
 
 // Helper to get number field from JSON
-static double GetJsonNumberField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, double Default = 0.0)
+static double GetJsonNumberFieldNav(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, double Default = 0.0)
 {
     if (!Payload.IsValid()) return Default;
     double Value;
@@ -58,7 +59,7 @@ static double GetJsonNumberField(const TSharedPtr<FJsonObject>& Payload, const T
 }
 
 // Helper to get bool field from JSON
-static bool GetJsonBoolField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, bool Default = false)
+static bool GetJsonBoolFieldNav(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, bool Default = false)
 {
     if (!Payload.IsValid()) return Default;
     bool Value;
@@ -70,35 +71,56 @@ static bool GetJsonBoolField(const TSharedPtr<FJsonObject>& Payload, const TCHAR
 }
 
 // Helper to get FVector from JSON object field
-static FVector GetJsonVectorField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FVector& Default = FVector::ZeroVector)
+static FVector GetJsonVectorFieldNav(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FVector& Default = FVector::ZeroVector)
 {
     if (!Payload.IsValid()) return Default;
     const TSharedPtr<FJsonObject>* VecObj;
     if (Payload->TryGetObjectField(FieldName, VecObj) && VecObj->IsValid())
     {
         return FVector(
-            GetJsonNumberField(*VecObj, TEXT("x"), Default.X),
-            GetJsonNumberField(*VecObj, TEXT("y"), Default.Y),
-            GetJsonNumberField(*VecObj, TEXT("z"), Default.Z)
+            GetJsonNumberFieldNav(*VecObj, TEXT("x"), Default.X),
+            GetJsonNumberFieldNav(*VecObj, TEXT("y"), Default.Y),
+            GetJsonNumberFieldNav(*VecObj, TEXT("z"), Default.Z)
         );
     }
     return Default;
 }
 
 // Helper to get FRotator from JSON object field
-static FRotator GetJsonRotatorField(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FRotator& Default = FRotator::ZeroRotator)
+static FRotator GetJsonRotatorFieldNav(const TSharedPtr<FJsonObject>& Payload, const TCHAR* FieldName, const FRotator& Default = FRotator::ZeroRotator)
 {
     if (!Payload.IsValid()) return Default;
     const TSharedPtr<FJsonObject>* RotObj;
     if (Payload->TryGetObjectField(FieldName, RotObj) && RotObj->IsValid())
     {
         return FRotator(
-            GetJsonNumberField(*RotObj, TEXT("pitch"), Default.Pitch),
-            GetJsonNumberField(*RotObj, TEXT("yaw"), Default.Yaw),
-            GetJsonNumberField(*RotObj, TEXT("roll"), Default.Roll)
+            GetJsonNumberFieldNav(*RotObj, TEXT("pitch"), Default.Pitch),
+            GetJsonNumberFieldNav(*RotObj, TEXT("yaw"), Default.Yaw),
+            GetJsonNumberFieldNav(*RotObj, TEXT("roll"), Default.Roll)
         );
     }
     return Default;
+}
+
+// Helper to validate actor name (reject path traversal and path separators)
+static bool IsValidActorName(const FString& Name)
+{
+    if (Name.IsEmpty()) return false;
+    // Reject path traversal
+    if (Name.Contains(TEXT(".."))) return false;
+    // Reject path separators (actor names should not contain slashes)
+    if (Name.Contains(TEXT("/")) || Name.Contains(TEXT("\\"))) return false;
+    // Reject Windows drive letters
+    if (Name.Contains(TEXT(":"))) return false;
+    return true;
+}
+
+// Helper to validate asset/class path (reject path traversal and ensure valid format)
+static bool IsValidNavigationPath(const FString& Path)
+{
+    if (Path.IsEmpty()) return false;
+    // Use the existing validation helper
+    return IsValidAssetPath(Path);
 }
 
 // ============================================================================
@@ -111,6 +133,28 @@ static bool HandleConfigureNavMeshSettings(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
+    // Validate optional blueprintPath parameter if provided
+    FString BlueprintPath = GetJsonStringFieldNav(Payload, TEXT("blueprintPath"));
+    if (!BlueprintPath.IsEmpty())
+    {
+        // Validate path format - reject path traversal and invalid characters
+        if (!IsValidNavigationPath(BlueprintPath))
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                TEXT("Invalid blueprintPath: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+        
+        // Check if blueprint exists
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), nullptr, TEXT("NOT_FOUND"));
+            return true;
+        }
+    }
+
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
@@ -140,25 +184,25 @@ static bool HandleConfigureNavMeshSettings(
 
     if (Payload->HasField(TEXT("tileSizeUU")))
     {
-        NavMesh->TileSizeUU = GetJsonNumberField(Payload, TEXT("tileSizeUU"), 1000.0f);
+        NavMesh->TileSizeUU = GetJsonNumberFieldNav(Payload, TEXT("tileSizeUU"), 1000.0f);
         bModified = true;
     }
 
     if (Payload->HasField(TEXT("minRegionArea")))
     {
-        NavMesh->MinRegionArea = GetJsonNumberField(Payload, TEXT("minRegionArea"), 0.0f);
+        NavMesh->MinRegionArea = GetJsonNumberFieldNav(Payload, TEXT("minRegionArea"), 0.0f);
         bModified = true;
     }
 
     if (Payload->HasField(TEXT("mergeRegionSize")))
     {
-        NavMesh->MergeRegionSize = GetJsonNumberField(Payload, TEXT("mergeRegionSize"), 400.0f);
+        NavMesh->MergeRegionSize = GetJsonNumberFieldNav(Payload, TEXT("mergeRegionSize"), 400.0f);
         bModified = true;
     }
 
     if (Payload->HasField(TEXT("maxSimplificationError")))
     {
-        NavMesh->MaxSimplificationError = GetJsonNumberField(Payload, TEXT("maxSimplificationError"), 1.3f);
+        NavMesh->MaxSimplificationError = GetJsonNumberFieldNav(Payload, TEXT("maxSimplificationError"), 1.3f);
         bModified = true;
     }
 
@@ -172,17 +216,17 @@ static bool HandleConfigureNavMeshSettings(
         
         if (Payload->HasField(TEXT("cellSize")))
         {
-            DefaultParams.CellSize = GetJsonNumberField(Payload, TEXT("cellSize"), 19.0f);
+            DefaultParams.CellSize = GetJsonNumberFieldNav(Payload, TEXT("cellSize"), 19.0f);
             bModified = true;
         }
         if (Payload->HasField(TEXT("cellHeight")))
         {
-            DefaultParams.CellHeight = GetJsonNumberField(Payload, TEXT("cellHeight"), 10.0f);
+            DefaultParams.CellHeight = GetJsonNumberFieldNav(Payload, TEXT("cellHeight"), 10.0f);
             bModified = true;
         }
         if (Payload->HasField(TEXT("agentStepHeight")))
         {
-            DefaultParams.AgentMaxStepHeight = GetJsonNumberField(Payload, TEXT("agentStepHeight"), 35.0f);
+            DefaultParams.AgentMaxStepHeight = GetJsonNumberFieldNav(Payload, TEXT("agentStepHeight"), 35.0f);
             bModified = true;
         }
 #else
@@ -190,17 +234,17 @@ static bool HandleConfigureNavMeshSettings(
         PRAGMA_DISABLE_DEPRECATION_WARNINGS
         if (Payload->HasField(TEXT("cellSize")))
         {
-            NavMesh->CellSize = GetJsonNumberField(Payload, TEXT("cellSize"), 19.0f);
+            NavMesh->CellSize = GetJsonNumberFieldNav(Payload, TEXT("cellSize"), 19.0f);
             bModified = true;
         }
         if (Payload->HasField(TEXT("cellHeight")))
         {
-            NavMesh->CellHeight = GetJsonNumberField(Payload, TEXT("cellHeight"), 10.0f);
+            NavMesh->CellHeight = GetJsonNumberFieldNav(Payload, TEXT("cellHeight"), 10.0f);
             bModified = true;
         }
         if (Payload->HasField(TEXT("agentStepHeight")))
         {
-            NavMesh->AgentMaxStepHeight = GetJsonNumberField(Payload, TEXT("agentStepHeight"), 35.0f);
+            NavMesh->AgentMaxStepHeight = GetJsonNumberFieldNav(Payload, TEXT("agentStepHeight"), 35.0f);
             bModified = true;
         }
         PRAGMA_ENABLE_DEPRECATION_WARNINGS
@@ -216,6 +260,12 @@ static bool HandleConfigureNavMeshSettings(
     Result->SetStringField(TEXT("navMeshName"), NavMesh->GetName());
     Result->SetNumberField(TEXT("tileSizeUU"), NavMesh->TileSizeUU);
     Result->SetBoolField(TEXT("modified"), bModified);
+    Result->SetBoolField(TEXT("navMeshPresent"), true);
+    
+    // Add verification data
+    Result->SetStringField(TEXT("navMeshPath"), NavMesh->GetPathName());
+    Result->SetStringField(TEXT("navMeshClass"), NavMesh->GetClass()->GetName());
+    Result->SetBoolField(TEXT("existsAfter"), true);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         bModified ? TEXT("NavMesh settings configured") : TEXT("No settings modified"), Result);
@@ -228,6 +278,28 @@ static bool HandleSetNavAgentProperties(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
+    // Validate optional blueprintPath parameter if provided
+    FString BlueprintPath = GetJsonStringFieldNav(Payload, TEXT("blueprintPath"));
+    if (!BlueprintPath.IsEmpty())
+    {
+        // Validate path format - reject path traversal and invalid characters
+        if (!IsValidNavigationPath(BlueprintPath))
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                TEXT("Invalid blueprintPath: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+        
+        // Check if blueprint exists
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), nullptr, TEXT("NOT_FOUND"));
+            return true;
+        }
+    }
+
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
@@ -257,19 +329,19 @@ static bool HandleSetNavAgentProperties(
 
     if (Payload->HasField(TEXT("agentRadius")))
     {
-        NavMesh->AgentRadius = GetJsonNumberField(Payload, TEXT("agentRadius"), 35.0f);
+        NavMesh->AgentRadius = GetJsonNumberFieldNav(Payload, TEXT("agentRadius"), 35.0f);
         bModified = true;
     }
 
     if (Payload->HasField(TEXT("agentHeight")))
     {
-        NavMesh->AgentHeight = GetJsonNumberField(Payload, TEXT("agentHeight"), 144.0f);
+        NavMesh->AgentHeight = GetJsonNumberFieldNav(Payload, TEXT("agentHeight"), 144.0f);
         bModified = true;
     }
 
     if (Payload->HasField(TEXT("agentMaxSlope")))
     {
-        NavMesh->AgentMaxSlope = GetJsonNumberField(Payload, TEXT("agentMaxSlope"), 44.0f);
+        NavMesh->AgentMaxSlope = GetJsonNumberFieldNav(Payload, TEXT("agentMaxSlope"), 44.0f);
         bModified = true;
     }
 
@@ -278,10 +350,10 @@ static bool HandleSetNavAgentProperties(
     {
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2
         FNavMeshResolutionParam& DefaultParams = NavMesh->NavMeshResolutionParams[(uint8)ENavigationDataResolution::Default];
-        DefaultParams.AgentMaxStepHeight = GetJsonNumberField(Payload, TEXT("agentStepHeight"), 35.0f);
+        DefaultParams.AgentMaxStepHeight = GetJsonNumberFieldNav(Payload, TEXT("agentStepHeight"), 35.0f);
 #else
         PRAGMA_DISABLE_DEPRECATION_WARNINGS
-        NavMesh->AgentMaxStepHeight = GetJsonNumberField(Payload, TEXT("agentStepHeight"), 35.0f);
+        NavMesh->AgentMaxStepHeight = GetJsonNumberFieldNav(Payload, TEXT("agentStepHeight"), 35.0f);
         PRAGMA_ENABLE_DEPRECATION_WARNINGS
 #endif
         bModified = true;
@@ -296,6 +368,11 @@ static bool HandleSetNavAgentProperties(
     Result->SetNumberField(TEXT("agentRadius"), NavMesh->AgentRadius);
     Result->SetNumberField(TEXT("agentHeight"), NavMesh->AgentHeight);
     Result->SetNumberField(TEXT("agentMaxSlope"), NavMesh->AgentMaxSlope);
+    Result->SetBoolField(TEXT("navMeshPresent"), true);
+    
+    // Add verification data
+    Result->SetStringField(TEXT("navMeshPath"), NavMesh->GetPathName());
+    Result->SetBoolField(TEXT("existsAfter"), true);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         TEXT("Nav agent properties set"), Result);
@@ -308,6 +385,28 @@ static bool HandleRebuildNavigation(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
+    // Validate optional blueprintPath parameter if provided
+    FString BlueprintPath = GetJsonStringFieldNav(Payload, TEXT("blueprintPath"));
+    if (!BlueprintPath.IsEmpty())
+    {
+        // Validate path format - reject path traversal and invalid characters
+        if (!IsValidNavigationPath(BlueprintPath))
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                TEXT("Invalid blueprintPath: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+        
+        // Check if blueprint exists
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), nullptr, TEXT("NOT_FOUND"));
+            return true;
+        }
+    }
+
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
@@ -324,14 +423,26 @@ static bool HandleRebuildNavigation(
         return true;
     }
 
+    // Check for RecastNavMesh - warn if missing but still allow rebuild attempt
+    // (rebuild may succeed if NavMeshBoundsVolume exists but NavMesh hasn't been built yet)
+    ARecastNavMesh* NavMesh = Cast<ARecastNavMesh>(NavSys->GetDefaultNavDataInstance());
+    bool bHasNavMesh = (NavMesh != nullptr);
+
     // Trigger full navigation rebuild
     NavSys->Build();
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetBoolField(TEXT("rebuilding"), NavSys->IsNavigationBuildInProgress());
+    Result->SetBoolField(TEXT("hasNavMesh"), bHasNavMesh);
+    Result->SetBoolField(TEXT("navMeshPresent"), bHasNavMesh);
+    Result->SetBoolField(TEXT("bHasNavMesh"), bHasNavMesh);
+    
+    // Add verification data
+    Result->SetStringField(TEXT("navigationSystemPath"), NavSys->GetPathName());
+    Result->SetBoolField(TEXT("existsAfter"), true);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
-        TEXT("Navigation rebuild initiated"), Result);
+        bHasNavMesh ? TEXT("Navigation rebuild initiated") : TEXT("Navigation rebuild initiated (no existing NavMesh - ensure NavMeshBoundsVolume is present)"), Result);
     return true;
 }
 
@@ -345,15 +456,31 @@ static bool HandleCreateNavModifierComponent(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString BlueprintPath = GetJsonStringField(Payload, TEXT("blueprintPath"));
-    FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"), TEXT("NavModifier"));
-    FString AreaClassPath = GetJsonStringField(Payload, TEXT("areaClass"));
-    FVector FailsafeExtent = GetJsonVectorField(Payload, TEXT("failsafeExtent"), FVector(100, 100, 100));
+    FString BlueprintPath = GetJsonStringFieldNav(Payload, TEXT("blueprintPath"));
+    FString ComponentName = GetJsonStringFieldNav(Payload, TEXT("componentName"), TEXT("NavModifier"));
+    FString AreaClassPath = GetJsonStringFieldNav(Payload, TEXT("areaClass"));
+    FVector FailsafeExtent = GetJsonVectorFieldNav(Payload, TEXT("failsafeExtent"), FVector(100, 100, 100));
 
     if (BlueprintPath.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("blueprintPath is required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate blueprint path - reject path traversal and invalid format
+    if (!IsValidNavigationPath(BlueprintPath))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid blueprintPath: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
+
+    // Validate area class path if provided
+    if (!AreaClassPath.IsEmpty() && !IsValidNavigationPath(AreaClassPath))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid areaClass: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -418,7 +545,7 @@ static bool HandleCreateNavModifierComponent(
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
     // Save if requested
-    if (GetJsonBoolField(Payload, TEXT("save"), false))
+    if (GetJsonBoolFieldNav(Payload, TEXT("save"), false))
     {
         McpSafeAssetSave(Blueprint);
     }
@@ -426,6 +553,10 @@ static bool HandleCreateNavModifierComponent(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("componentName"), ComponentName);
     Result->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+    Result->SetBoolField(TEXT("existsAfter"), true);
+    
+    // Add verification data for blueprint
+    AddAssetVerification(Result, Blueprint);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("NavModifierComponent '%s' added to Blueprint"), *ComponentName), Result);
@@ -438,14 +569,30 @@ static bool HandleSetNavAreaClass(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString ComponentName = GetJsonStringField(Payload, TEXT("componentName"));
-    FString AreaClassPath = GetJsonStringField(Payload, TEXT("areaClass"));
+    FString ActorName = GetJsonStringFieldNav(Payload, TEXT("actorName"));
+    FString ComponentName = GetJsonStringFieldNav(Payload, TEXT("componentName"));
+    FString AreaClassPath = GetJsonStringFieldNav(Payload, TEXT("areaClass"));
 
     if (ActorName.IsEmpty() || AreaClassPath.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("actorName and areaClass are required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate actor name - reject path traversal and invalid characters
+    if (!IsValidActorName(ActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid actorName: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
+
+    // Validate area class path - reject path traversal and invalid format
+    if (!IsValidNavigationPath(AreaClassPath))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid areaClass: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -529,6 +676,7 @@ static bool HandleSetNavAreaClass(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("actorName"), ActorName);
     Result->SetStringField(TEXT("areaClass"), AreaClassPath);
+    AddActorVerification(Result, TargetActor);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         TEXT("Nav area class set"), Result);
@@ -541,14 +689,23 @@ static bool HandleConfigureNavAreaCost(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString AreaClassPath = GetJsonStringField(Payload, TEXT("areaClass"));
-    double AreaCost = GetJsonNumberField(Payload, TEXT("areaCost"), 1.0);
-    double FixedCost = GetJsonNumberField(Payload, TEXT("fixedAreaEnteringCost"), 0.0);
+    FString AreaClassPath = GetJsonStringFieldNav(Payload, TEXT("areaClass"));
+    double AreaCost = GetJsonNumberFieldNav(Payload, TEXT("areaCost"), 1.0);
+    double FixedCost = GetJsonNumberFieldNav(Payload, TEXT("fixedAreaEnteringCost"), 0.0);
 
     if (AreaClassPath.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("areaClass is required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate area class path - reject path traversal and invalid format
+    // Note: NavArea class paths use /Script/NavigationSystem.NavArea_Xxx format
+    if (!IsValidNavigationPath(AreaClassPath))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid areaClass: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -578,6 +735,7 @@ static bool HandleConfigureNavAreaCost(
     Result->SetStringField(TEXT("areaClass"), AreaClassPath);
     Result->SetNumberField(TEXT("areaCost"), AreaCost);
     Result->SetNumberField(TEXT("fixedAreaEnteringCost"), AreaCDO->GetFixedAreaEnteringCost());
+    Result->SetBoolField(TEXT("existsAfter"), true);
     
     // Warn if user tried to set fixedAreaEnteringCost (it's read-only via automation)
     FString Message = TEXT("Nav area cost configured");
@@ -601,11 +759,35 @@ static bool HandleCreateNavLinkProxy(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"), TEXT("NavLinkProxy"));
-    FVector Location = GetJsonVectorField(Payload, TEXT("location"));
-    FRotator Rotation = GetJsonRotatorField(Payload, TEXT("rotation"));
-    FVector StartPoint = GetJsonVectorField(Payload, TEXT("startPoint"), FVector(-100, 0, 0));
-    FVector EndPoint = GetJsonVectorField(Payload, TEXT("endPoint"), FVector(100, 0, 0));
+    FString ActorName = GetJsonStringFieldNav(Payload, TEXT("actorName"), TEXT("NavLinkProxy"));
+    FVector Location = GetJsonVectorFieldNav(Payload, TEXT("location"));
+    FRotator Rotation = GetJsonRotatorFieldNav(Payload, TEXT("rotation"));
+    FVector StartPoint = GetJsonVectorFieldNav(Payload, TEXT("startPoint"), FVector(-100, 0, 0));
+    FVector EndPoint = GetJsonVectorFieldNav(Payload, TEXT("endPoint"), FVector(100, 0, 0));
+
+    // Validate required parameters - NavLinkProxy needs location and link geometry
+    if (!Payload->HasField(TEXT("location")))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("location is required for create_nav_link_proxy"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+    
+    // Validate that at least startPoint and endPoint are provided (link geometry is essential)
+    if (!Payload->HasField(TEXT("startPoint")) || !Payload->HasField(TEXT("endPoint")))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("startPoint and endPoint are required for create_nav_link_proxy to define the navigation link"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate actor name - reject path traversal and invalid characters
+    if (!IsValidActorName(ActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid actorName: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
 
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
@@ -616,8 +798,11 @@ static bool HandleCreateNavLinkProxy(
     }
 
     // Spawn the NavLinkProxy actor
+    // Use NameMode::Requested to auto-generate unique name if collision occurs
+    // This prevents the Fatal Error: "Cannot generate unique name for 'NavLinkProxy'"
     FActorSpawnParameters SpawnParams;
     SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
     ANavLinkProxy* NavLink = World->SpawnActor<ANavLinkProxy>(Location, Rotation, SpawnParams);
@@ -636,7 +821,7 @@ static bool HandleCreateNavLinkProxy(
     NewLink.Right = EndPoint;
     
     // Parse direction
-    FString DirectionStr = GetJsonStringField(Payload, TEXT("direction"), TEXT("BothWays"));
+    FString DirectionStr = GetJsonStringFieldNav(Payload, TEXT("direction"), TEXT("BothWays"));
     if (DirectionStr == TEXT("LeftToRight"))
     {
         NewLink.Direction = ENavLinkDirection::LeftToRight;
@@ -658,6 +843,7 @@ static bool HandleCreateNavLinkProxy(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("actorName"), NavLink->GetActorLabel());
     Result->SetStringField(TEXT("actorPath"), NavLink->GetPathName());
+    AddActorVerification(Result, NavLink);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("NavLinkProxy '%s' created"), *ActorName), Result);
@@ -670,12 +856,20 @@ static bool HandleConfigureNavLink(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
+    FString ActorName = GetJsonStringFieldNav(Payload, TEXT("actorName"));
     
     if (ActorName.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("actorName is required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate actor name - reject path traversal and invalid characters
+    if (!IsValidActorName(ActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid actorName: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -719,17 +913,17 @@ static bool HandleConfigureNavLink(
 
         if (Payload->HasField(TEXT("startPoint")))
         {
-            Link.Left = GetJsonVectorField(Payload, TEXT("startPoint"));
+            Link.Left = GetJsonVectorFieldNav(Payload, TEXT("startPoint"));
             bModified = true;
         }
         if (Payload->HasField(TEXT("endPoint")))
         {
-            Link.Right = GetJsonVectorField(Payload, TEXT("endPoint"));
+            Link.Right = GetJsonVectorFieldNav(Payload, TEXT("endPoint"));
             bModified = true;
         }
         if (Payload->HasField(TEXT("direction")))
         {
-            FString DirectionStr = GetJsonStringField(Payload, TEXT("direction"), TEXT("BothWays"));
+            FString DirectionStr = GetJsonStringFieldNav(Payload, TEXT("direction"), TEXT("BothWays"));
             if (DirectionStr == TEXT("LeftToRight"))
             {
                 Link.Direction = ENavLinkDirection::LeftToRight;
@@ -746,7 +940,7 @@ static bool HandleConfigureNavLink(
         }
         if (Payload->HasField(TEXT("snapRadius")))
         {
-            Link.SnapRadius = GetJsonNumberField(Payload, TEXT("snapRadius"), 30.0f);
+            Link.SnapRadius = GetJsonNumberFieldNav(Payload, TEXT("snapRadius"), 30.0f);
             bModified = true;
         }
     }
@@ -759,6 +953,7 @@ static bool HandleConfigureNavLink(
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("actorName"), ActorName);
     Result->SetBoolField(TEXT("modified"), bModified);
+    AddActorVerification(Result, NavLink);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         TEXT("NavLink configured"), Result);
@@ -771,13 +966,21 @@ static bool HandleSetNavLinkType(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
-    FString LinkType = GetJsonStringField(Payload, TEXT("linkType"), TEXT("simple"));
+    FString ActorName = GetJsonStringFieldNav(Payload, TEXT("actorName"));
+    FString LinkType = GetJsonStringFieldNav(Payload, TEXT("linkType"), TEXT("simple"));
 
     if (ActorName.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("actorName is required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate actor name - reject path traversal and invalid characters
+    if (!IsValidActorName(ActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid actorName: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -827,6 +1030,7 @@ static bool HandleSetNavLinkType(
     Result->SetStringField(TEXT("actorName"), ActorName);
     Result->SetStringField(TEXT("linkType"), LinkType);
     Result->SetBoolField(TEXT("bSmartLinkIsRelevant"), NavLink->bSmartLinkIsRelevant);
+    AddActorVerification(Result, NavLink);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("NavLink type set to %s"), *LinkType), Result);
@@ -839,11 +1043,35 @@ static bool HandleCreateSmartLink(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"), TEXT("SmartNavLink"));
-    FVector Location = GetJsonVectorField(Payload, TEXT("location"));
-    FRotator Rotation = GetJsonRotatorField(Payload, TEXT("rotation"));
-    FVector StartPoint = GetJsonVectorField(Payload, TEXT("startPoint"), FVector(-100, 0, 0));
-    FVector EndPoint = GetJsonVectorField(Payload, TEXT("endPoint"), FVector(100, 0, 0));
+    FString ActorName = GetJsonStringFieldNav(Payload, TEXT("actorName"), TEXT("SmartNavLink"));
+    FVector Location = GetJsonVectorFieldNav(Payload, TEXT("location"));
+    FRotator Rotation = GetJsonRotatorFieldNav(Payload, TEXT("rotation"));
+    FVector StartPoint = GetJsonVectorFieldNav(Payload, TEXT("startPoint"), FVector(-100, 0, 0));
+    FVector EndPoint = GetJsonVectorFieldNav(Payload, TEXT("endPoint"), FVector(100, 0, 0));
+
+    // Validate required parameters - SmartLink needs location and link geometry
+    if (!Payload->HasField(TEXT("location")))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("location is required for create_smart_link"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+    
+    // Validate that at least startPoint and endPoint are provided (link geometry is essential)
+    if (!Payload->HasField(TEXT("startPoint")) || !Payload->HasField(TEXT("endPoint")))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("startPoint and endPoint are required for create_smart_link to define the navigation link"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate actor name - reject path traversal and invalid characters
+    if (!IsValidActorName(ActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid actorName: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
 
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
@@ -854,8 +1082,10 @@ static bool HandleCreateSmartLink(
     }
 
     // Spawn NavLinkProxy with smart link enabled
+    // Use NameMode::Requested to auto-generate unique name if collision occurs
     FActorSpawnParameters SpawnParams;
     SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
     ANavLinkProxy* NavLink = World->SpawnActor<ANavLinkProxy>(Location, Rotation, SpawnParams);
@@ -874,7 +1104,7 @@ static bool HandleCreateSmartLink(
     if (SmartComp)
     {
         // Parse direction
-        FString DirectionStr = GetJsonStringField(Payload, TEXT("direction"), TEXT("BothWays"));
+        FString DirectionStr = GetJsonStringFieldNav(Payload, TEXT("direction"), TEXT("BothWays"));
         ENavLinkDirection::Type Direction = ENavLinkDirection::BothWays;
         if (DirectionStr == TEXT("LeftToRight"))
         {
@@ -895,6 +1125,7 @@ static bool HandleCreateSmartLink(
     Result->SetStringField(TEXT("actorName"), NavLink->GetActorLabel());
     Result->SetStringField(TEXT("actorPath"), NavLink->GetPathName());
     Result->SetBoolField(TEXT("bSmartLinkIsRelevant"), true);
+    AddActorVerification(Result, NavLink);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         FString::Printf(TEXT("Smart NavLink '%s' created"), *ActorName), Result);
@@ -907,12 +1138,20 @@ static bool HandleConfigureSmartLinkBehavior(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
-    FString ActorName = GetJsonStringField(Payload, TEXT("actorName"));
+    FString ActorName = GetJsonStringFieldNav(Payload, TEXT("actorName"));
 
     if (ActorName.IsEmpty())
     {
         Self->SendAutomationResponse(Socket, RequestId, false,
             TEXT("actorName is required"), nullptr, TEXT("MISSING_PARAM"));
+        return true;
+    }
+
+    // Validate actor name - reject path traversal and invalid characters
+    if (!IsValidActorName(ActorName))
+    {
+        Self->SendAutomationResponse(Socket, RequestId, false,
+            TEXT("Invalid actorName: must not contain path traversal (..), slashes, or drive letters"), nullptr, TEXT("SECURITY_VIOLATION"));
         return true;
     }
 
@@ -955,14 +1194,14 @@ static bool HandleConfigureSmartLinkBehavior(
     // Enable/disable smart link
     if (Payload->HasField(TEXT("linkEnabled")))
     {
-        SmartComp->SetEnabled(GetJsonBoolField(Payload, TEXT("linkEnabled"), true));
+        SmartComp->SetEnabled(GetJsonBoolFieldNav(Payload, TEXT("linkEnabled"), true));
         bModified = true;
     }
 
     // Set enabled area class
     if (Payload->HasField(TEXT("enabledAreaClass")))
     {
-        FString AreaClassPath = GetJsonStringField(Payload, TEXT("enabledAreaClass"));
+        FString AreaClassPath = GetJsonStringFieldNav(Payload, TEXT("enabledAreaClass"));
         UClass* AreaClass = LoadClass<UNavArea>(nullptr, *AreaClassPath);
         if (AreaClass)
         {
@@ -974,7 +1213,7 @@ static bool HandleConfigureSmartLinkBehavior(
     // Set disabled area class
     if (Payload->HasField(TEXT("disabledAreaClass")))
     {
-        FString AreaClassPath = GetJsonStringField(Payload, TEXT("disabledAreaClass"));
+        FString AreaClassPath = GetJsonStringFieldNav(Payload, TEXT("disabledAreaClass"));
         UClass* AreaClass = LoadClass<UNavArea>(nullptr, *AreaClassPath);
         if (AreaClass)
         {
@@ -986,19 +1225,19 @@ static bool HandleConfigureSmartLinkBehavior(
     // Configure broadcast settings
     if (Payload->HasField(TEXT("broadcastRadius")) || Payload->HasField(TEXT("broadcastInterval")))
     {
-        float Radius = GetJsonNumberField(Payload, TEXT("broadcastRadius"), 1000.0f);
-        float Interval = GetJsonNumberField(Payload, TEXT("broadcastInterval"), 0.0f);
+        float Radius = GetJsonNumberFieldNav(Payload, TEXT("broadcastRadius"), 1000.0f);
+        float Interval = GetJsonNumberFieldNav(Payload, TEXT("broadcastInterval"), 0.0f);
         SmartComp->SetBroadcastData(Radius, ECC_Pawn, Interval);
         bModified = true;
     }
 
     // Configure obstacle
-    if (GetJsonBoolField(Payload, TEXT("bCreateBoxObstacle"), false))
+    if (GetJsonBoolFieldNav(Payload, TEXT("bCreateBoxObstacle"), false))
     {
-        FString ObstacleAreaPath = GetJsonStringField(Payload, TEXT("obstacleAreaClass"), TEXT("/Script/NavigationSystem.NavArea_Null"));
+        FString ObstacleAreaPath = GetJsonStringFieldNav(Payload, TEXT("obstacleAreaClass"), TEXT("/Script/NavigationSystem.NavArea_Null"));
         UClass* ObstacleArea = LoadClass<UNavArea>(nullptr, *ObstacleAreaPath);
-        FVector Extent = GetJsonVectorField(Payload, TEXT("obstacleExtent"), FVector(100, 100, 100));
-        FVector Offset = GetJsonVectorField(Payload, TEXT("obstacleOffset"));
+        FVector Extent = GetJsonVectorFieldNav(Payload, TEXT("obstacleExtent"), FVector(100, 100, 100));
+        FVector Offset = GetJsonVectorFieldNav(Payload, TEXT("obstacleOffset"));
         
         if (ObstacleArea)
         {
@@ -1016,6 +1255,9 @@ static bool HandleConfigureSmartLinkBehavior(
     Result->SetStringField(TEXT("actorName"), ActorName);
     Result->SetBoolField(TEXT("linkEnabled"), SmartComp->IsEnabled());
     Result->SetBoolField(TEXT("modified"), bModified);
+    
+    // Add verification data
+    AddActorVerification(Result, NavLink);
 
     Self->SendAutomationResponse(Socket, RequestId, true,
         TEXT("Smart link behavior configured"), Result);
@@ -1032,6 +1274,28 @@ static bool HandleGetNavigationInfo(
     const TSharedPtr<FJsonObject>& Payload,
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
+    // Validate optional blueprintPath parameter if provided
+    FString BlueprintPath = GetJsonStringFieldNav(Payload, TEXT("blueprintPath"));
+    if (!BlueprintPath.IsEmpty())
+    {
+        // Validate path format - reject path traversal and invalid characters
+        if (!IsValidNavigationPath(BlueprintPath))
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                TEXT("Invalid blueprintPath: must not contain path traversal (..) or invalid format"), nullptr, TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+        
+        // Check if blueprint exists
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint)
+        {
+            Self->SendAutomationResponse(Socket, RequestId, false,
+                FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintPath), nullptr, TEXT("NOT_FOUND"));
+            return true;
+        }
+    }
+
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
@@ -1109,7 +1373,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageNavigationAction(
     TSharedPtr<FMcpBridgeWebSocket> Socket)
 {
 #if WITH_EDITOR
-    FString SubAction = GetJsonStringField(Payload, TEXT("subAction"), TEXT(""));
+    FString SubAction = GetJsonStringFieldNav(Payload, TEXT("subAction"), TEXT(""));
     
     UE_LOG(LogMcpNavigationHandlers, Verbose, TEXT("HandleManageNavigationAction: SubAction=%s"), *SubAction);
 

@@ -222,6 +222,7 @@ export interface BlueprintArgs extends HandlerArgs {
     timeoutMs?: number;
     waitForCompletion?: boolean;
     waitForCompletionTimeoutMs?: number;
+    shouldExist?: boolean;
     // Parent class for blueprint creation
     parentClass?: string;
     // SCS operations array
@@ -270,6 +271,8 @@ export interface LevelArgs extends HandlerArgs {
     exportPath?: string;
     packagePath?: string;
     sourcePath?: string;
+    newName?: string;
+    template?: string;
     lightType?: 'Directional' | 'Point' | 'Spot' | 'Rect';
     name?: string;
     location?: Vector3;
@@ -645,6 +648,10 @@ export interface InputArgs extends HandlerArgs {
     inputActionPaths?: string[];
     /** Optional trigger class names to apply during input injection */
     triggers?: string[];
+    triggerType?: string;
+    modifierType?: string;
+    assetPath?: string;
+    priority?: number;
 }
 
 // ============================================================================

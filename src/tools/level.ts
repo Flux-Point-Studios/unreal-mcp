@@ -3,6 +3,7 @@ import { ILevelTools, StandardActionResponse } from '../types/tool-interfaces.js
 import { LevelResponse } from '../types/automation-responses.js';
 import { wasmIntegration as _wasmIntegration } from '../wasm/index.js';
 import { sanitizePath } from '../utils/path-security.js';
+import { sanitizeCommandArgument } from '../utils/validation.js';
 import {
   DEFAULT_OPERATION_TIMEOUT_MS,
   DEFAULT_ASSET_OP_TIMEOUT_MS,
@@ -486,59 +487,70 @@ export class LevelTools extends BaseTool implements ILevelTools {
             level: normalizedPath,
             streaming: false
           } as StandardActionResponse;
+        } else {
+          // Automation bridge returned failure - return the error, don't fallback
+          return {
+            ...response,
+            success: false,
+            error: response.error || 'LOAD_FAILED',
+            message: response.message || `Failed to load level: ${params.levelPath}`,
+            level: normalizedPath
+          } as StandardActionResponse;
         }
-      } catch (_e) {
-        // Fallback to console logic
-      }
-
-      try {
-        // Best-effort existence check using the Automation Bridge when available.
+      } catch (bridgeError) {
+        // Only fallback to console if bridge is unavailable
+        let isBridgeConnected = false;
         try {
           const automation = this.getAutomationBridge();
-          if (automation && typeof automation.sendAutomationRequest === 'function' && automation.isConnected()) {
-            const targetPath = (params.levelPath ?? '').toString();
-            const existsResp = await automation.sendAutomationRequest('execute_editor_function', {
-              functionName: 'ASSET_EXISTS_SIMPLE',
-              path: targetPath
-            }, {
-              timeoutMs: 5000
-            }) as Record<string, unknown>;
-            const result = (existsResp?.result ?? existsResp ?? {}) as Record<string, unknown>;
-            const exists = Boolean(result.exists);
-
-            if (!exists) {
-              const message = typeof result.message === 'string' ? result.message : 'Level not found';
-              return {
-                success: false,
-                error: 'not_found',
-                message,
-                level: normalizedPath
-              } as StandardActionResponse;
-            }
-          }
+          isBridgeConnected = automation && typeof automation.sendAutomationRequest === 'function' && automation.isConnected();
         } catch {
-          // If the existence check fails for any reason, fall back to the console command path below.
+          // getAutomationBridge not available - bridge is not connected
+          isBridgeConnected = false;
         }
 
-        await this.bridge.executeConsoleCommand(`Open ${normalizedPath}`);
-        this.setCurrentLevel(normalizedPath);
-        this.mutateRecord(normalizedPath, {
-          streaming: false,
-          loaded: true,
-          visible: true
-        });
-        return {
-          success: true,
-          message: `Level loaded: ${params.levelPath}`,
-          level: normalizedPath,
-          streaming: false
-        } as StandardActionResponse;
-      } catch (err) {
-        return {
-          success: false,
-          error: `Failed to load level: ${err}`,
-          level: normalizedPath
-        };
+        if (isBridgeConnected) {
+          // Bridge is connected but threw - this is a real error, not a connection issue
+          return {
+            success: false,
+            error: `Bridge error: ${bridgeError instanceof Error ? bridgeError.message : String(bridgeError)}`,
+            level: normalizedPath
+          } as StandardActionResponse;
+        }
+
+        // Bridge not available - use console fallback with existence validation
+        try {
+          // Validate level exists before attempting console load
+          const existsResp = await this.bridge.executeConsoleCommand(`GetLevelPath ${normalizedPath}`);
+          // If GetLevelPath doesn't return a valid path, the level doesn't exist
+          if (!existsResp || (typeof existsResp.message === 'string' && existsResp.message.includes('not found'))) {
+            return {
+              success: false,
+              error: 'LEVEL_NOT_FOUND',
+              message: `Level not found: ${params.levelPath}`,
+              level: normalizedPath
+            } as StandardActionResponse;
+          }
+
+          await this.bridge.executeConsoleCommand(`Open ${normalizedPath}`);
+          this.setCurrentLevel(normalizedPath);
+          this.mutateRecord(normalizedPath, {
+            streaming: false,
+            loaded: true,
+            visible: true
+          });
+          return {
+            success: true,
+            message: `Level loaded: ${params.levelPath}`,
+            level: normalizedPath,
+            streaming: false
+          } as StandardActionResponse;
+        } catch (err) {
+          return {
+            success: false,
+            error: `Failed to load level: ${err}`,
+            level: normalizedPath
+          };
+        }
       }
     }
   }
@@ -812,7 +824,8 @@ export class LevelTools extends BaseTool implements ILevelTools {
     } catch (_error) {
       // Fallback to console command
       const levelIdentifier = levelName ?? levelPath ?? '';
-      const simpleName = levelIdentifier.split('/').filter(Boolean).pop() || levelIdentifier;
+      const rawSimpleName = levelIdentifier.split('/').filter(Boolean).pop() || levelIdentifier;
+      const simpleName = sanitizeCommandArgument(rawSimpleName);
       const loadCmd = params.shouldBeLoaded ? 'Load' : 'Unload';
       const visCmd = shouldBeVisible ? 'Show' : 'Hide';
       const command = `StreamLevel ${simpleName} ${loadCmd} ${visCmd}`;
@@ -854,7 +867,8 @@ export class LevelTools extends BaseTool implements ILevelTools {
       connections?: string[];
     }>;
   }): Promise<StandardActionResponse> {
-    const command = `OpenLevelBlueprint ${params.eventType}`;
+    // strict validation for eventType is redundant due to type definition but safe to sanitize for runtime injection
+    const command = `OpenLevelBlueprint ${sanitizeCommandArgument(params.eventType)}`;
     return this.bridge.executeConsoleCommand(command);
   }
 
@@ -863,7 +877,10 @@ export class LevelTools extends BaseTool implements ILevelTools {
     type: 'Persistent' | 'Streaming' | 'Lighting' | 'Gameplay';
     parent?: string;
   }): Promise<StandardActionResponse> {
-    const command = `CreateSubLevel ${params.name} ${params.type} ${params.parent || 'None'}`;
+    const sanitizedName = sanitizeCommandArgument(params.name);
+    const sanitizedType = sanitizeCommandArgument(params.type);
+    const sanitizedParent = params.parent ? sanitizeCommandArgument(params.parent) : 'None';
+    const command = `CreateSubLevel ${sanitizedName} ${sanitizedType} ${sanitizedParent}`;
     return this.bridge.executeConsoleCommand(command);
   }
 
@@ -883,10 +900,10 @@ export class LevelTools extends BaseTool implements ILevelTools {
       commands.push(`SetWorldToMeters ${params.worldScale}`);
     }
     if (params.gameMode) {
-      commands.push(`SetGameMode ${params.gameMode}`);
+      commands.push(`SetGameMode ${sanitizeCommandArgument(params.gameMode)}`);
     }
     if (params.defaultPawn) {
-      commands.push(`SetDefaultPawn ${params.defaultPawn}`);
+      commands.push(`SetDefaultPawn ${sanitizeCommandArgument(params.defaultPawn)}`);
     }
     if (params.killZ !== undefined) {
       commands.push(`SetKillZ ${params.killZ}`);
@@ -958,7 +975,7 @@ export class LevelTools extends BaseTool implements ILevelTools {
     levelName: string;
     visible: boolean;
   }): Promise<StandardActionResponse> {
-    const command = `SetLevelVisibility ${params.levelName} ${params.visible}`;
+    const command = `SetLevelVisibility ${sanitizeCommandArgument(params.levelName)} ${params.visible}`;
     return this.bridge.executeConsoleCommand(command);
   }
 
@@ -975,7 +992,7 @@ export class LevelTools extends BaseTool implements ILevelTools {
     size: [number, number, number];
     streamingDistance?: number;
   }): Promise<StandardActionResponse> {
-    const command = `CreateStreamingVolume ${params.levelName} ${params.position.join(' ')} ${params.size.join(' ')} ${params.streamingDistance || 0}`;
+    const command = `CreateStreamingVolume ${sanitizeCommandArgument(params.levelName)} ${params.position.join(' ')} ${params.size.join(' ')} ${params.streamingDistance || 0}`;
     return this.bridge.executeConsoleCommand(command);
   }
 
@@ -984,7 +1001,7 @@ export class LevelTools extends BaseTool implements ILevelTools {
     lodLevel: number;
     distance: number;
   }): Promise<StandardActionResponse> {
-    const command = `SetLevelLOD ${params.levelName} ${params.lodLevel} ${params.distance}`;
+    const command = `SetLevelLOD ${sanitizeCommandArgument(params.levelName)} ${params.lodLevel} ${params.distance}`;
     return this.bridge.executeConsoleCommand(command);
   }
 }

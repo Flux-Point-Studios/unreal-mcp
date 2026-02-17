@@ -1,5 +1,7 @@
 #include "McpBridgeWebSocket.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeSubsystem.h"
+#include "McpAutomationBridgeSettings.h"
 
 #include "Async/Async.h"
 #include "Containers/StringConv.h"
@@ -15,9 +17,41 @@
 #include "Misc/SecureHash.h"
 #include "Misc/StringBuilder.h"
 #include "Misc/Timespan.h"
+#include "Misc/Paths.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
 #include "String/LexFromString.h"
+#include "Ssl.h"
+#include "SslModule.h"
+
+#if WITH_SSL
+
+// Work around UI naming conflict: OpenSSL defines UI as a type, but UE defines UI as a namespace
+#define UI OSSL_UI
+
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#endif
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+// Restore UI after OpenSSL headers
+#undef UI
+
+#if PLATFORM_WINDOWS
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
+
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <winsock2.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#else
+#include <unistd.h>
+#endif
+
+#endif // WITH_SSL
 
 
 namespace {
@@ -38,6 +72,7 @@ struct FParsedWebSocketUrl {
   FString Host;
   int32 Port = 80;
   FString PathWithQuery;
+  bool bUseTls = false;
 };
 
 bool ParseWebSocketUrl(const FString &InUrl, FParsedWebSocketUrl &OutParsed,
@@ -49,12 +84,19 @@ bool ParseWebSocketUrl(const FString &InUrl, FParsedWebSocketUrl &OutParsed,
   }
 
   static const FString SchemePrefix(TEXT("ws://"));
-  if (!Trimmed.StartsWith(SchemePrefix, ESearchCase::IgnoreCase)) {
-    OutError = TEXT("Only ws:// scheme is supported.");
+  static const FString SecureSchemePrefix(TEXT("wss://"));
+  FString Remainder;
+  if (Trimmed.StartsWith(SchemePrefix, ESearchCase::IgnoreCase)) {
+    Remainder = Trimmed.Mid(SchemePrefix.Len());
+    OutParsed.bUseTls = false;
+  } else if (Trimmed.StartsWith(SecureSchemePrefix, ESearchCase::IgnoreCase)) {
+    Remainder = Trimmed.Mid(SecureSchemePrefix.Len());
+    OutParsed.bUseTls = true;
+  } else {
+    OutError = TEXT("Only ws:// or wss:// schemes are supported.");
     return false;
   }
 
-  const FString Remainder = Trimmed.Mid(SchemePrefix.Len());
   FString HostPort;
   FString PathRemainder;
   if (!Remainder.Split(TEXT("/"), &HostPort, &PathRemainder,
@@ -199,69 +241,380 @@ FString DescribeSocketError(ISocketSubsystem *SocketSubsystem,
 
 FMcpBridgeWebSocket::FMcpBridgeWebSocket(
     const FString &InUrl, const FString &InProtocols,
-    const TMap<FString, FString> &InHeaders)
+    const TMap<FString, FString> &InHeaders, bool bInEnableTls,
+    const FString &InTlsCertificatePath, const FString &InTlsPrivateKeyPath)
     : Url(InUrl), Socket(nullptr), Port(0), Protocols(InProtocols),
       Headers(InHeaders), ListenHost(), PendingReceived(),
       FragmentAccumulator(), bFragmentMessageActive(false), SelfWeakPtr(),
       bServerMode(false), bServerAcceptedConnection(false),
       ListenSocket(nullptr), Thread(nullptr), StopEvent(nullptr),
       ClientSockets(), ListenBacklog(10), AcceptSleepSeconds(0.01f),
-      bConnected(false), bListening(false), bStopping(false) {
+      bConnected(false), bListening(false), bStopping(false),
+      bUseTls(bInEnableTls), bTlsServer(false), bSslInitialized(false),
+      bOwnsSslContext(false), SslContext(nullptr), SslHandle(nullptr), NativeSocketHandle(0),
+      bNativeSocketReleased(false), TlsCertificatePath(InTlsCertificatePath),
+      TlsPrivateKeyPath(InTlsPrivateKeyPath) {
   HandlerReadyEvent = nullptr;
   bHandlerRegistered = false;
 }
 
 FMcpBridgeWebSocket::FMcpBridgeWebSocket(int32 InPort, const FString &InHost,
                                          int32 InListenBacklog,
-                                         float InAcceptSleepSeconds)
+                                         float InAcceptSleepSeconds,
+                                         bool bInEnableTls,
+                                         const FString &InTlsCertificatePath,
+                                         const FString &InTlsPrivateKeyPath)
     : Url(), Socket(nullptr), Port(InPort), Protocols(TEXT("mcp-automation")),
       Headers(), ListenHost(InHost), PendingReceived(), FragmentAccumulator(),
       bFragmentMessageActive(false), SelfWeakPtr(), bServerMode(true),
       bServerAcceptedConnection(false), ListenSocket(nullptr), Thread(nullptr),
       StopEvent(nullptr), ClientSockets(), ListenBacklog(InListenBacklog),
       AcceptSleepSeconds(InAcceptSleepSeconds), bConnected(false),
-      bListening(false), bStopping(false) {
+      bListening(false), bStopping(false), bUseTls(bInEnableTls),
+      bTlsServer(true), bSslInitialized(false), bOwnsSslContext(false),
+      SslContext(nullptr),
+      SslHandle(nullptr), NativeSocketHandle(0), bNativeSocketReleased(false),
+      TlsCertificatePath(InTlsCertificatePath),
+      TlsPrivateKeyPath(InTlsPrivateKeyPath) {
   HandlerReadyEvent = nullptr;
   bHandlerRegistered = false;
 }
 
-FMcpBridgeWebSocket::FMcpBridgeWebSocket(FSocket *InClientSocket)
+FMcpBridgeWebSocket::FMcpBridgeWebSocket(FSocket *InClientSocket,
+                                         bool bInEnableTls,
+                                         const FString &InTlsCertificatePath,
+                                         const FString &InTlsPrivateKeyPath)
     : Url(), Socket(InClientSocket), Port(0), Protocols(TEXT("mcp-automation")),
       Headers(), ListenHost(), PendingReceived(), FragmentAccumulator(),
       bFragmentMessageActive(false), SelfWeakPtr(), bServerMode(false),
       bServerAcceptedConnection(true), ListenSocket(nullptr), Thread(nullptr),
       StopEvent(nullptr), ClientSockets(), ListenBacklog(10),
       AcceptSleepSeconds(0.01f), bConnected(true), bListening(false),
-      bStopping(false) {
+      bStopping(false), bUseTls(bInEnableTls), bTlsServer(true),
+      bSslInitialized(false), bOwnsSslContext(false), SslContext(nullptr),
+      SslHandle(nullptr),
+      NativeSocketHandle(0), bNativeSocketReleased(false),
+      TlsCertificatePath(InTlsCertificatePath),
+      TlsPrivateKeyPath(InTlsPrivateKeyPath) {
   HandlerReadyEvent = nullptr;
   bHandlerRegistered = false;
 }
 
 FMcpBridgeWebSocket::~FMcpBridgeWebSocket() {
   Close();
+  ShutdownTls();
   if (HandlerReadyEvent) {
     FPlatformProcess::ReturnSynchEventToPool(HandlerReadyEvent);
     HandlerReadyEvent = nullptr;
   }
+  
   if (Thread) {
-    Thread->WaitForCompletion();
+    // Wait for thread completion. The Close() call above should have unblocked
+    // any waiting socket operations by destroying ListenSocket/Socket.
+    // Use Kill() first to request the thread to stop, then wait for completion.
+    Thread->Kill(true); // true = wait for completion
     delete Thread;
     Thread = nullptr;
   }
+  
   if (StopEvent) {
     FPlatformProcess::ReturnSynchEventToPool(StopEvent);
     StopEvent = nullptr;
   }
+
   if (FSocket *LocalSocket = DetachSocket()) {
     LocalSocket->Close();
     ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(LocalSocket);
   }
+  CloseNativeSocket();
 }
 
 FSocket *FMcpBridgeWebSocket::DetachSocket() {
   return static_cast<FSocket *>(FPlatformAtomics::InterlockedExchangePtr(
       reinterpret_cast<void **>(&Socket), nullptr));
 }
+
+#if WITH_SSL
+
+bool FMcpBridgeWebSocket::InitializeTlsContext(bool bServer) {
+  if (!bUseTls) {
+    return true;
+  }
+
+  if (SslContext) {
+    return true;
+  }
+
+  FSslModule &SslModule = FSslModule::Get();
+  ISslManager &SslManager = SslModule.GetSslManager();
+  if (!SslManager.InitializeSsl()) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to initialize SSL module."));
+    return false;
+  }
+
+  bSslInitialized = true;
+
+  if (!bServer) {
+    FSslContextCreateOptions Options;
+    Options.bAllowCompression = false;
+    Options.bAddCertificates = true;
+    SslContext = SslManager.CreateSslContext(Options);
+    if (!SslContext) {
+      UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+             TEXT("Failed to create SSL client context."));
+      return false;
+    }
+    bOwnsSslContext = false;
+    SSL_CTX_set_verify(SslContext, SSL_VERIFY_PEER, nullptr);
+    return true;
+  }
+
+  const SSL_METHOD *Method = TLS_server_method();
+  if (!Method) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to resolve TLS server method."));
+    return false;
+  }
+
+  SslContext = SSL_CTX_new(Method);
+  if (!SslContext) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to create SSL server context."));
+    return false;
+  }
+  bOwnsSslContext = true;
+
+  SSL_CTX_set_min_proto_version(SslContext, TLS1_2_VERSION);
+  SSL_CTX_set_options(SslContext, SSL_OP_NO_COMPRESSION);
+
+  if (TlsCertificatePath.IsEmpty() || TlsPrivateKeyPath.IsEmpty()) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS is enabled but certificate or key path is missing."));
+    return false;
+  }
+
+  if (!FPaths::FileExists(TlsCertificatePath)) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS certificate not found: %s"), *TlsCertificatePath);
+    return false;
+  }
+
+  if (!FPaths::FileExists(TlsPrivateKeyPath)) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS private key not found: %s"), *TlsPrivateKeyPath);
+    return false;
+  }
+
+  const FTCHARToUTF8 CertPathUtf8(*TlsCertificatePath);
+  const FTCHARToUTF8 KeyPathUtf8(*TlsPrivateKeyPath);
+  if (SSL_CTX_use_certificate_file(SslContext, CertPathUtf8.Get(), SSL_FILETYPE_PEM) <= 0) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to load TLS certificate: %s"), *TlsCertificatePath);
+    return false;
+  }
+  if (SSL_CTX_use_PrivateKey_file(SslContext, KeyPathUtf8.Get(), SSL_FILETYPE_PEM) <= 0) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to load TLS private key: %s"), *TlsPrivateKeyPath);
+    return false;
+  }
+  if (SSL_CTX_check_private_key(SslContext) != 1) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS private key does not match certificate."));
+    return false;
+  }
+
+  SSL_CTX_set_verify(SslContext, SSL_VERIFY_NONE, nullptr);
+  return true;
+}
+
+bool FMcpBridgeWebSocket::EstablishTls(bool bServer) {
+  if (!bUseTls) {
+    return true;
+  }
+
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 7
+  if (!Socket || bNativeSocketReleased) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS requested without a valid socket."));
+    return false;
+  }
+
+  if (!InitializeTlsContext(bServer)) {
+    return false;
+  }
+
+  NativeSocketHandle = Socket->ReleaseNativeSocket();
+  bNativeSocketReleased = true;
+  ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(Socket);
+  Socket = nullptr;
+
+  if (NativeSocketHandle == 0) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to obtain native socket handle for TLS."));
+    return false;
+  }
+
+  SslHandle = SSL_new(SslContext);
+  if (!SslHandle) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("Failed to create SSL connection state."));
+    return false;
+  }
+
+  SSL_set_fd(SslHandle, static_cast<int>(NativeSocketHandle));
+  int Result = bServer ? SSL_accept(SslHandle) : SSL_connect(SslHandle);
+  if (Result <= 0) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS handshake failed (mode=%s)."),
+           bServer ? TEXT("server") : TEXT("client"));
+    return false;
+  }
+
+  bTlsServer = bServer;
+  return true;
+#else
+  UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+         TEXT("TLS requires UE 5.7 or later. Current version: %d.%d. Cannot establish TLS connection."),
+         ENGINE_MAJOR_VERSION, ENGINE_MINOR_VERSION);
+  return false;
+#endif
+}
+
+void FMcpBridgeWebSocket::ShutdownTls() {
+  if (SslHandle) {
+    SSL_shutdown(SslHandle);
+    SSL_free(SslHandle);
+    SslHandle = nullptr;
+  }
+
+  if (SslContext && bOwnsSslContext) {
+    SSL_CTX_free(SslContext);
+    SslContext = nullptr;
+  }
+
+  if (bSslInitialized) {
+    FSslModule::Get().GetSslManager().ShutdownSsl();
+    bSslInitialized = false;
+  }
+}
+
+void FMcpBridgeWebSocket::CloseNativeSocket() {
+  if (NativeSocketHandle == 0) {
+    return;
+  }
+#if PLATFORM_WINDOWS
+  closesocket(static_cast<SOCKET>(NativeSocketHandle));
+#else
+  close(static_cast<int>(NativeSocketHandle));
+#endif
+  NativeSocketHandle = 0;
+}
+
+bool FMcpBridgeWebSocket::SendRaw(const uint8 *Data, int32 Length,
+                                 int32 &OutBytesSent) {
+  OutBytesSent = 0;
+  if (bUseTls && SslHandle) {
+    const int Result = SSL_write(SslHandle, Data, Length);
+    if (Result > 0) {
+      OutBytesSent = Result;
+      return true;
+    }
+    const int ErrorCode = SSL_get_error(SslHandle, Result);
+    if (ErrorCode == SSL_ERROR_WANT_READ || ErrorCode == SSL_ERROR_WANT_WRITE) {
+      return true;
+    }
+    return false;
+  }
+
+  if (!Socket) {
+    return false;
+  }
+
+  return Socket->Send(Data, Length, OutBytesSent);
+}
+
+bool FMcpBridgeWebSocket::RecvRaw(uint8 *Data, int32 Length,
+                                 int32 &OutBytesRead) {
+  OutBytesRead = 0;
+  if (bUseTls && SslHandle) {
+    const int Result = SSL_read(SslHandle, Data, Length);
+    if (Result > 0) {
+      OutBytesRead = Result;
+      return true;
+    }
+    const int ErrorCode = SSL_get_error(SslHandle, Result);
+    if (ErrorCode == SSL_ERROR_WANT_READ || ErrorCode == SSL_ERROR_WANT_WRITE) {
+      return true;
+    }
+    return false;
+  }
+
+  if (!Socket) {
+    return false;
+  }
+
+  return Socket->Recv(Data, Length, OutBytesRead);
+}
+
+#else // !WITH_SSL
+
+bool FMcpBridgeWebSocket::InitializeTlsContext(bool bServer) {
+  if (bUseTls) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
+           TEXT("TLS requested but WITH_SSL is not enabled."));
+  }
+  return !bUseTls;
+}
+
+bool FMcpBridgeWebSocket::EstablishTls(bool bServer) {
+  if (bUseTls) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+           TEXT("TLS requested but WITH_SSL is not enabled."));
+    return false;
+  }
+  return true;
+}
+
+void FMcpBridgeWebSocket::ShutdownTls() {
+  // No-op when TLS is not available
+}
+
+void FMcpBridgeWebSocket::CloseNativeSocket() {
+  // Native socket handle is only used when TLS/SSL is enabled.
+  // When WITH_SSL is disabled, this is a no-op.
+#if WITH_SSL
+  if (NativeSocketHandle == 0) {
+    return;
+  }
+#if PLATFORM_WINDOWS
+  closesocket(static_cast<SOCKET>(NativeSocketHandle));
+#else
+  close(static_cast<int>(NativeSocketHandle));
+#endif
+  NativeSocketHandle = 0;
+#endif // WITH_SSL
+}
+
+bool FMcpBridgeWebSocket::SendRaw(const uint8 *Data, int32 Length,
+                                 int32 &OutBytesSent) {
+  OutBytesSent = 0;
+  if (!Socket) {
+    return false;
+  }
+  return Socket->Send(Data, Length, OutBytesSent);
+}
+
+bool FMcpBridgeWebSocket::RecvRaw(uint8 *Data, int32 Length,
+                                 int32 &OutBytesRead) {
+  OutBytesRead = 0;
+  if (!Socket) {
+    return false;
+  }
+  return Socket->Recv(Data, Length, OutBytesRead);
+}
+
+#endif // WITH_SSL
 
 void FMcpBridgeWebSocket::NotifyMessageHandlerRegistered() {
   bHandlerRegistered = true;
@@ -324,10 +677,36 @@ void FMcpBridgeWebSocket::Close(int32 StatusCode, const FString &Reason) {
     StopEvent->Trigger();
   }
 
+  // Close the listen socket to unblock Accept() in RunServer().
+  // IMPORTANT: We only close here, NOT destroy. RunServer() owns the socket and
+  // will destroy it after its loop exits. This avoids a TOCTOU race where we
+  // destroy the socket while RunServer() is between checking ListenSocket and
+  // calling Accept().
+  if (ListenSocket) {
+    ListenSocket->Close();
+  }
+
+  // Close any client sockets that were accepted by this server
+  TArray<TSharedPtr<FMcpBridgeWebSocket>> SocketsToClose;
+  {
+    FScopeLock Lock(&ClientSocketsMutex);
+    SocketsToClose = MoveTemp(ClientSockets);
+  }
+
+  for (TSharedPtr<FMcpBridgeWebSocket>& ClientSock : SocketsToClose) {
+    if (ClientSock.IsValid()) {
+      ClientSock->Close(StatusCode, Reason);
+    }
+  }
+
+  // Close the main socket (for client connections)
   if (FSocket *LocalSocket = DetachSocket()) {
     LocalSocket->Close();
     ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(LocalSocket);
   }
+
+  ShutdownTls();
+  CloseNativeSocket();
 }
 
 bool FMcpBridgeWebSocket::Send(const FString &Data) {
@@ -336,7 +715,14 @@ bool FMcpBridgeWebSocket::Send(const FString &Data) {
 }
 
 bool FMcpBridgeWebSocket::Send(const void *Data, SIZE_T Length) {
-  if (!IsConnected() || !Socket) {
+  if (!IsConnected()) {
+    return false;
+  }
+  if (bUseTls) {
+    if (!SslHandle) {
+      return false;
+    }
+  } else if (!Socket) {
     return false;
   }
 
@@ -424,13 +810,19 @@ uint32 FMcpBridgeWebSocket::RunClient() {
 }
 
 uint32 FMcpBridgeWebSocket::RunServer() {
-  ISocketSubsystem *SocketSubsystem =
-      ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+  // Determine if we need IPv6 socket based on host address
+  const bool bIsIpv6Host = ListenHost.Contains(TEXT(":"));
+  
+  ISocketSubsystem *SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
   UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
-         TEXT("FMcpBridgeWebSocket::RunServer begin (host=%s, port=%d)"),
-         *ListenHost, Port);
+         TEXT("FMcpBridgeWebSocket::RunServer begin (host=%s, port=%d, IPv6=%s)"),
+         *ListenHost, Port, bIsIpv6Host ? TEXT("true") : TEXT("false"));
+  
+  // Create socket with proper protocol family for IPv6 support
+  // Use FName-based protocol specification (non-deprecated API)
+  const FName ProtocolName = bIsIpv6Host ? FName(TEXT("IPv6")) : FName();
   ListenSocket = SocketSubsystem->CreateSocket(
-      NAME_Stream, TEXT("McpAutomationBridgeListenSocket"), false);
+      NAME_Stream, TEXT("McpAutomationBridgeListenSocket"), ProtocolName);
   if (!ListenSocket) {
     const FString ErrorMessage = DescribeSocketError(
         SocketSubsystem, TEXT("Failed to create listen socket"));
@@ -450,36 +842,135 @@ uint32 FMcpBridgeWebSocket::RunServer() {
   TSharedRef<FInternetAddr> ListenAddr = SocketSubsystem->CreateInternetAddr();
 
   bool bResolvedHost = false;
-  bool bExplicitBindAll = false;
 
-  if (!ListenHost.IsEmpty()) {
-    FString HostToBind = ListenHost;
-    if (HostToBind.Equals(TEXT("localhost"), ESearchCase::IgnoreCase)) {
-      HostToBind = TEXT("127.0.0.1");
-    }
-
-    bool bIsValidIp = false;
-    ListenAddr->SetIp(*HostToBind, bIsValidIp);
-    if (bIsValidIp) {
-      bResolvedHost = true;
-    }
-
-    bExplicitBindAll = HostToBind.Equals(TEXT("0.0.0.0"), ESearchCase::IgnoreCase) ||
-                       HostToBind.Equals(TEXT("::"), ESearchCase::IgnoreCase);
+  FString HostToBind = ListenHost.TrimStartAndEnd();
+  if (HostToBind.IsEmpty()) {
+    HostToBind = TEXT("127.0.0.1");
+  }
+  if (HostToBind.Equals(TEXT("localhost"), ESearchCase::IgnoreCase)) {
+    HostToBind = TEXT("127.0.0.1");
   }
 
-  if (!bResolvedHost) {
-    if (!bExplicitBindAll) {
-      UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
-             TEXT("Invalid ListenHost '%s'. Falling back to 127.0.0.1 for safety. To bind all interfaces, explicitly set ListenHost=0.0.0.0."),
-             *ListenHost);
+  const bool bIsLoopback = HostToBind.Equals(TEXT("127.0.0.1"), ESearchCase::IgnoreCase) ||
+                           HostToBind.Equals(TEXT("::1"), ESearchCase::IgnoreCase);
 
+  // Check if non-loopback binding is allowed via settings
+  const UMcpAutomationBridgeSettings* Settings = GetDefault<UMcpAutomationBridgeSettings>();
+  const bool bAllowNonLoopback = Settings ? Settings->bAllowNonLoopback : false;
+
+  if (bIsLoopback) {
+    bool bIsValidIp = false;
+    ListenAddr->SetIp(*HostToBind, bIsValidIp);
+    bResolvedHost = bIsValidIp;
+
+    // Fallback to 127.0.0.1 if IPv6 loopback (::1) fails on systems without IPv6 support
+    if (!bResolvedHost && HostToBind.Equals(TEXT("::1"), ESearchCase::IgnoreCase)) {
+      UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
+             TEXT("IPv6 loopback '::1' not supported on this system. Falling back to 127.0.0.1."));
+      
+      // Re-create socket as IPv4 since we're falling back to IPv4 address
+      SocketSubsystem->DestroySocket(ListenSocket);
+      ListenSocket = SocketSubsystem->CreateSocket(
+          NAME_Stream, TEXT("McpAutomationBridgeListenSocket"), FName());
+      if (!ListenSocket) {
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Error, TEXT("Failed to re-create IPv4 socket for fallback."));
+        return 0;
+      }
+      ListenSocket->SetReuseAddr(true);
+      ListenSocket->SetNonBlocking(false);
+      UE_LOG(LogMcpAutomationBridgeSubsystem, Log, TEXT("Re-created socket for IPv4 fallback."));
+      
       bool bFallbackIsValidIp = false;
       ListenAddr->SetIp(TEXT("127.0.0.1"), bFallbackIsValidIp);
       bResolvedHost = bFallbackIsValidIp;
-    } else {
-      ListenAddr->SetAnyAddress();
     }
+  }
+  else if (bAllowNonLoopback) {
+    // LAN binding enabled - allow non-loopback addresses with security warning
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
+           TEXT("SECURITY: Binding to non-loopback address '%s'. The automation bridge is exposed to your local network."),
+           *HostToBind);
+
+    bool bIsValidIp = false;
+    ListenAddr->SetIp(*HostToBind, bIsValidIp);
+    bResolvedHost = bIsValidIp;
+
+    // If not a valid IP, try to resolve as hostname via DNS
+    if (!bResolvedHost) {
+      UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+             TEXT("'%s' is not a valid IP address. Attempting DNS resolution..."),
+             *HostToBind);
+      
+      FAddressInfoResult AddrInfoResult = SocketSubsystem->GetAddressInfo(
+          *HostToBind, 
+          nullptr, 
+          EAddressInfoFlags::Default,
+          NAME_None,
+          ESocketType::SOCKTYPE_Streaming);
+      
+      if (AddrInfoResult.ReturnCode == SE_NO_ERROR && AddrInfoResult.Results.Num() > 0) {
+        // Use the first resolved address
+        ListenAddr = AddrInfoResult.Results[0].Address;
+        bResolvedHost = true;
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+               TEXT("Successfully resolved '%s' to address '%s'."),
+               *HostToBind, *ListenAddr->ToString(true));
+        
+        // Check if resolved address family matches socket family
+        // UE 5.7 uses GetProtocolType() which returns FName instead of GetProtocolFamily()
+        const FName ProtocolType = ListenAddr->GetProtocolType();
+        const bool bResolvedIsIpv6 = (ProtocolType == FName(TEXT("IPv6")));
+        if (bResolvedIsIpv6 != bIsIpv6Host) {
+          UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
+                 TEXT("DNS resolved to %s but socket is %s. Recreating socket..."),
+                 bResolvedIsIpv6 ? TEXT("IPv6") : TEXT("IPv4"),
+                 bIsIpv6Host ? TEXT("IPv6") : TEXT("IPv4"));
+          
+          SocketSubsystem->DestroySocket(ListenSocket);
+          const FName NewProtocolName = bResolvedIsIpv6 ? FName(TEXT("IPv6")) : FName();
+          ListenSocket = SocketSubsystem->CreateSocket(
+              NAME_Stream, TEXT("McpAutomationBridgeListenSocket"), NewProtocolName);
+          if (!ListenSocket) {
+            UE_LOG(LogMcpAutomationBridgeSubsystem, Error, 
+                   TEXT("Failed to re-create socket for resolved address family."));
+            return 0;
+          }
+          ListenSocket->SetReuseAddr(true);
+          ListenSocket->SetNonBlocking(false);
+        }
+      } else {
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
+               TEXT("Failed to resolve hostname '%s'. Falling back to 127.0.0.1."),
+               *HostToBind);
+        bool bFallbackIsValidIp = false;
+        ListenAddr->SetIp(TEXT("127.0.0.1"), bFallbackIsValidIp);
+        bResolvedHost = bFallbackIsValidIp;
+      }
+    }
+  }
+  else {
+    // Loopback-only mode (default) - reject non-loopback addresses
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
+           TEXT("ListenHost '%s' is not a loopback address and bAllowNonLoopback is false. Falling back to 127.0.0.1. Enable 'Allow Non Loop Back' in Project Settings to use LAN addresses."),
+           *HostToBind);
+
+    // If socket was created as IPv6 but we're falling back to IPv4, recreate it
+    if (bIsIpv6Host) {
+      SocketSubsystem->DestroySocket(ListenSocket);
+      ListenSocket = SocketSubsystem->CreateSocket(
+          NAME_Stream, TEXT("McpAutomationBridgeListenSocket"), FName());
+      if (!ListenSocket) {
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Error, TEXT("Failed to re-create IPv4 socket for fallback."));
+        return 0;
+      }
+      ListenSocket->SetReuseAddr(true);
+      ListenSocket->SetNonBlocking(false);
+      UE_LOG(LogMcpAutomationBridgeSubsystem, Log, TEXT("Re-created socket for IPv4 fallback (non-loopback path)."));
+    }
+
+    bool bFallbackIsValidIp = false;
+    ListenAddr->SetIp(TEXT("127.0.0.1"), bFallbackIsValidIp);
+    bResolvedHost = bFallbackIsValidIp;
   }
 
   ListenAddr->SetPort(Port);
@@ -520,13 +1011,33 @@ uint32 FMcpBridgeWebSocket::RunServer() {
     }
   });
 
-  while (!bStopping) {
-    // Accept incoming connections
+  while (!bStopping && ListenSocket) {
+    // Note: Accept() blocks until a connection arrives or the socket is closed.
+    // Close() calls ListenSocket->Close() to unblock this call during shutdown.
+    // This thread owns ListenSocket destruction (done after loop exits).
     FSocket *ClientSocket =
         ListenSocket->Accept(TEXT("McpAutomationBridgeClient"));
+    
+    // Check again after Accept() returns - socket may have been closed
+    if (bStopping || !ListenSocket) {
+      if (ClientSocket) {
+        // Clean up any socket we accepted during shutdown race
+        ClientSocket->Close();
+        SocketSubsystem->DestroySocket(ClientSocket);
+      }
+      break;
+    }
+    
     if (ClientSocket) {
+      TSharedRef<FInternetAddr> PeerAddr = SocketSubsystem->CreateInternetAddr();
+      if (ClientSocket->GetPeerAddress(*PeerAddr)) {
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+               TEXT("Accepted automation client from %s"),
+               *PeerAddr->ToString(true));
+      }
       // Create a new WebSocket instance for this client connection
-      auto ClientWebSocket = MakeShared<FMcpBridgeWebSocket>(ClientSocket);
+      auto ClientWebSocket = MakeShared<FMcpBridgeWebSocket>(
+          ClientSocket, bUseTls, TlsCertificatePath, TlsPrivateKeyPath);
       ClientWebSocket->InitializeWeakSelf(ClientWebSocket);
       ClientWebSocket->bServerMode =
           false; // Client connections are not in server mode
@@ -634,6 +1145,14 @@ bool FMcpBridgeWebSocket::PerformHandshake() {
     return false;
   }
 
+  if (bUseTls && !ParsedUrl.bUseTls) {
+    TearDown(TEXT("TLS is enabled but ws:// URL was provided."), false, 4000);
+    return false;
+  }
+  if (ParsedUrl.bUseTls) {
+    bUseTls = true;
+  }
+
   HostHeader = ParsedUrl.Host;
   Port = ParsedUrl.Port;
   HandshakePath = ParsedUrl.PathWithQuery;
@@ -660,6 +1179,13 @@ bool FMcpBridgeWebSocket::PerformHandshake() {
   if (!Socket->Connect(*Endpoint)) {
     TearDown(TEXT("Unable to connect to WebSocket endpoint."), false, 4000);
     return false;
+  }
+
+  if (bUseTls) {
+    if (!EstablishTls(false)) {
+      TearDown(TEXT("TLS handshake failed."), false, 4000);
+      return false;
+    }
   }
 
   TArray<uint8> KeyBytes;
@@ -700,8 +1226,8 @@ bool FMcpBridgeWebSocket::PerformHandshake() {
 
   FTCHARToUTF8 HandshakeUtf8(RequestBuilder.ToString());
   int32 BytesSent = 0;
-  if (!Socket->Send(reinterpret_cast<const uint8 *>(HandshakeUtf8.Get()),
-                    HandshakeUtf8.Length(), BytesSent) ||
+  if (!SendRaw(reinterpret_cast<const uint8 *>(HandshakeUtf8.Get()),
+               HandshakeUtf8.Length(), BytesSent) ||
       BytesSent != HandshakeUtf8.Length()) {
     TearDown(TEXT("Failed to send WebSocket handshake."), false, 4000);
     return false;
@@ -717,7 +1243,7 @@ bool FMcpBridgeWebSocket::PerformHandshake() {
       return false;
     }
     int32 BytesRead = 0;
-    if (!Socket->Recv(Temp, TempSize, BytesRead)) {
+    if (!RecvRaw(Temp, TempSize, BytesRead)) {
       TearDown(TEXT("WebSocket handshake failed while reading response."),
                false, 4000);
       return false;
@@ -807,13 +1333,20 @@ bool FMcpBridgeWebSocket::PerformServerHandshake() {
   FString ClientKey;
 
   int32 HeaderEndIndex = -1;
+  if (bUseTls) {
+    if (!EstablishTls(true)) {
+      TearDown(TEXT("TLS handshake failed."), false, 4000);
+      return false;
+    }
+  }
+
   while (!bRequestComplete) {
     if (bStopping) {
       return false;
     }
 
     int32 BytesRead = 0;
-    if (!Socket->Recv(Temp, TempSize, BytesRead)) {
+    if (!RecvRaw(Temp, TempSize, BytesRead)) {
       // This may occur when a client connects but immediately closes
       // or when a non-WebSocket probe connects; log at Verbose to avoid
       // spamming warnings for transient or benign network activity.
@@ -982,8 +1515,8 @@ bool FMcpBridgeWebSocket::PerformServerHandshake() {
 
   FTCHARToUTF8 ResponseUtf8(*Response);
   int32 BytesSent = 0;
-  if (!Socket->Send(reinterpret_cast<const uint8 *>(ResponseUtf8.Get()),
-                    ResponseUtf8.Length(), BytesSent) ||
+  if (!SendRaw(reinterpret_cast<const uint8 *>(ResponseUtf8.Get()),
+               ResponseUtf8.Length(), BytesSent) ||
       BytesSent != ResponseUtf8.Length()) {
     UE_LOG(LogMcpAutomationBridgeSubsystem, Warning,
            TEXT("Server handshake failed: unable to send upgrade response "
@@ -1023,7 +1556,7 @@ bool FMcpBridgeWebSocket::ResolveEndpoint(TSharedPtr<FInternetAddr> &OutAddr) {
 }
 
 bool FMcpBridgeWebSocket::SendFrame(const TArray<uint8> &Frame) {
-  if (!Socket) {
+  if (!Socket && !(bUseTls && SslHandle)) {
     return false;
   }
 
@@ -1032,8 +1565,8 @@ bool FMcpBridgeWebSocket::SendFrame(const TArray<uint8> &Frame) {
 
   while (TotalBytesSent < TotalBytesToSend) {
     int32 BytesSent = 0;
-    if (!Socket->Send(Frame.GetData() + TotalBytesSent,
-                      TotalBytesToSend - TotalBytesSent, BytesSent)) {
+    if (!SendRaw(Frame.GetData() + TotalBytesSent,
+                 TotalBytesToSend - TotalBytesSent, BytesSent)) {
       UE_LOG(LogMcpAutomationBridgeSubsystem, Error,
              TEXT("Socket Send failed after sending %d / %d bytes"),
              TotalBytesSent, TotalBytesToSend);
@@ -1117,7 +1650,7 @@ bool FMcpBridgeWebSocket::SendTextFrame(const void *Data, SIZE_T Length) {
 
 bool FMcpBridgeWebSocket::SendControlFrame(const uint8 ControlOpCode,
                                            const TArray<uint8> &Payload) {
-  if (!Socket) {
+  if (!Socket && !(bUseTls && SslHandle)) {
     return false;
   }
 
@@ -1181,6 +1714,11 @@ bool FMcpBridgeWebSocket::ReceiveFrame() {
   const uint8 OpCode = Header[0] & 0x0F;
   uint64 PayloadLength = Header[1] & 0x7F;
   const bool bMasked = (Header[1] & 0x80) != 0;
+
+  if (bServerAcceptedConnection && !bMasked) {
+    TearDown(TEXT("Client frames must be masked."), false, 1002);
+    return false;
+  }
 
   if (PayloadLength == 126) {
     uint8 Extended[2];
@@ -1318,9 +1856,39 @@ bool FMcpBridgeWebSocket::ReceiveExact(uint8 *Buffer, SIZE_T Length) {
         FMath::Min(static_cast<SIZE_T>(PendingReceived.Num()), Length);
     if (Existing > 0) {
       FMemory::Memcpy(Buffer, PendingReceived.GetData(), Existing);
-      PendingReceived.RemoveAt(0, Existing, EAllowShrinking::No);
+      PendingReceived.RemoveAt(0, Existing
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4
+      // UE 5.4+: Uses EAllowShrinking enum
+      , EAllowShrinking::No
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+      // UE 5.1-5.3: Uses bool bAllowShrinking
+      , false
+#endif
+      );
       Collected += Existing;
     }
+  }
+
+  if (bUseTls && SslHandle) {
+    while (Collected < Length) {
+      if (bStopping) {
+        return false;
+      }
+
+      const int32 Remaining = static_cast<int32>(Length - Collected);
+      int32 BytesRead = 0;
+      if (!RecvRaw(Buffer + Collected, Remaining, BytesRead)) {
+        return false;
+      }
+      if (BytesRead <= 0) {
+        if (StopEvent && StopEvent->Wait(FTimespan::FromMilliseconds(10))) {
+          return false;
+        }
+        continue;
+      }
+      Collected += static_cast<SIZE_T>(BytesRead);
+    }
+    return true;
   }
 
   while (Collected < Length) {
@@ -1340,7 +1908,7 @@ bool FMcpBridgeWebSocket::ReceiveExact(uint8 *Buffer, SIZE_T Length) {
     TArray<uint8> Temp;
     Temp.SetNumUninitialized(ReadSize);
     int32 BytesRead = 0;
-    if (!Socket->Recv(Temp.GetData(), ReadSize, BytesRead)) {
+    if (!RecvRaw(Temp.GetData(), ReadSize, BytesRead)) {
       return false;
     }
 

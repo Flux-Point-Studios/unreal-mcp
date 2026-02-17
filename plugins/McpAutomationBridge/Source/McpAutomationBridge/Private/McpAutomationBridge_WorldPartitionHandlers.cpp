@@ -1,6 +1,8 @@
 #include "McpAutomationBridgeSubsystem.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
+#include "Dom/JsonObject.h"
+
 
 #if WITH_EDITOR
 #include "Editor.h"
@@ -39,24 +41,32 @@
 #include "WorldPartition/DataLayer/DataLayer.h"
 #include "WorldPartition/DataLayer/DataLayerSubsystem.h"
 
-// Check for DataLayerEditorSubsystem
-#if defined(__has_include)
-#  if __has_include("DataLayer/DataLayerEditorSubsystem.h")
-#    include "DataLayer/DataLayerEditorSubsystem.h"
-#    define MCP_HAS_DATALAYER_EDITOR 1
-#  elif __has_include("WorldPartition/DataLayer/DataLayerEditorSubsystem.h")
-#    include "WorldPartition/DataLayer/DataLayerEditorSubsystem.h"
-#    define MCP_HAS_DATALAYER_EDITOR 1
+// Check for DataLayerEditorSubsystem (UE 5.1+ only - DataLayer APIs changed significantly)
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#  if defined(__has_include)
+#    if __has_include("DataLayer/DataLayerEditorSubsystem.h")
+#      include "DataLayer/DataLayerEditorSubsystem.h"
+#      define MCP_HAS_DATALAYER_EDITOR 1
+#    elif __has_include("WorldPartition/DataLayer/DataLayerEditorSubsystem.h")
+#      include "WorldPartition/DataLayer/DataLayerEditorSubsystem.h"
+#      define MCP_HAS_DATALAYER_EDITOR 1
+#    else
+#      define MCP_HAS_DATALAYER_EDITOR 0
+#    endif
 #  else
 #    define MCP_HAS_DATALAYER_EDITOR 0
 #  endif
 #else
+// UE 5.0: DataLayer APIs not available
 #  define MCP_HAS_DATALAYER_EDITOR 0
 #endif
 
+// Note: DataLayerInstance.h, DataLayerManager.h and DataLayerAsset.h were introduced in UE 5.1
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 #include "WorldPartition/DataLayer/DataLayerInstance.h"
 #include "WorldPartition/DataLayer/DataLayerManager.h"
 #include "WorldPartition/DataLayer/DataLayerAsset.h"
+#endif
 #endif
 
 bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& RequestId, const FString& Action, const TSharedPtr<FJsonObject>& Payload, TSharedPtr<FMcpBridgeWebSocket> RequestingSocket)
@@ -87,7 +97,7 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         return true;
     }
 
-    FString SubAction = Payload->GetStringField(TEXT("subAction"));
+    FString SubAction = GetJsonStringField(Payload, TEXT("subAction"));
 
     if (SubAction == TEXT("load_cells"))
     {
@@ -119,7 +129,11 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         if (WPEditorSubsystem)
         {
             WPEditorSubsystem->LoadRegion(Bounds);
-            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested."));
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            Result->SetStringField(TEXT("action"), TEXT("load_region"));
+            Result->SetStringField(TEXT("method"), TEXT("EditorSubsystem"));
+            Result->SetBoolField(TEXT("requested"), true);
+            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested."), Result);
             return true;
         }
 #endif
@@ -134,7 +148,11 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
              {
                  EditorLoaderAdapter->GetLoaderAdapter()->SetUserCreated(true);
                  EditorLoaderAdapter->GetLoaderAdapter()->Load();
-                 SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested via LoaderAdapter."));
+                 TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                 Result->SetStringField(TEXT("action"), TEXT("load_region"));
+                 Result->SetStringField(TEXT("method"), TEXT("LoaderAdapter"));
+                 Result->SetBoolField(TEXT("requested"), true);
+                 SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested via LoaderAdapter."), Result);
                  return true;
              }
         }
@@ -149,8 +167,7 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
     else if (SubAction == TEXT("create_datalayer"))
     {
 #if MCP_HAS_DATALAYER_EDITOR
-        FString DataLayerName;
-        Payload->TryGetStringField(TEXT("dataLayerName"), DataLayerName);
+        FString DataLayerName = GetJsonStringField(Payload, TEXT("dataLayerName"));
 
         if (DataLayerName.IsEmpty())
         {
@@ -224,12 +241,10 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
     }
     else if (SubAction == TEXT("set_datalayer"))
     {
-#if MCP_HAS_DATALAYER_EDITOR
-        FString ActorPath;
-        Payload->TryGetStringField(TEXT("actorPath"), ActorPath);
-        FString DataLayerName;
-        Payload->TryGetStringField(TEXT("dataLayerName"), DataLayerName);
+        FString ActorPath = GetJsonStringField(Payload, TEXT("actorPath"));
+        FString DataLayerName = GetJsonStringField(Payload, TEXT("dataLayerName"));
 
+#if MCP_HAS_DATALAYER_EDITOR
         AActor* Actor = FindObject<AActor>(nullptr, *ActorPath);
         if (!Actor)
         {
@@ -277,9 +292,13 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
                 Actors.Add(Actor);
                 TArray<UDataLayerInstance*> Layers;
                 Layers.Add(TargetLayer);
-                
-                DataLayerSubsystem->AddActorsToDataLayers(Actors, Layers);
-                SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Actor added to DataLayer."));
+
+DataLayerSubsystem->AddActorsToDataLayers(Actors, Layers);
+                TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                Result->SetStringField(TEXT("dataLayerName"), DataLayerName);
+                Result->SetBoolField(TEXT("added"), true);
+                AddActorVerification(Result, Actor);
+                SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Actor added to DataLayer."), Result);
             }
             else
             {
@@ -293,7 +312,12 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
 #else
         // Fallback or simulation
         UE_LOG(LogMcpAutomationBridgeSubsystem, Warning, TEXT("DataLayerEditorSubsystem not available. set_datalayer skipped."));
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Actor added to DataLayer (Simulated - Subsystem missing)."));
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("actorName"), ActorPath);
+        Result->SetStringField(TEXT("dataLayerName"), DataLayerName);
+        Result->SetBoolField(TEXT("added"), false);
+        Result->SetStringField(TEXT("note"), TEXT("Simulated - Subsystem missing"));
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Actor added to DataLayer (Simulated - Subsystem missing)."), Result);
 #endif
         return true;
     }

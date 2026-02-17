@@ -1,4 +1,5 @@
 #include "EngineUtils.h"
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
@@ -23,6 +24,10 @@
 #include "Sound/SoundNodeModulator.h"
 #include "Sound/SoundNodeWavePlayer.h"
 #include "Sound/SoundWave.h"
+#include "Sound/DialogueVoice.h"
+#include "Sound/DialogueWave.h"
+#include "Sound/ReverbEffect.h"
+#include "Sound/SoundEffectSubmix.h"
 
 #endif
 
@@ -93,8 +98,14 @@ static USoundBase *ResolveSoundAsset(const FString &SoundPath) {
       FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
   TArray<FAssetData> AssetData;
   FARFilter Filter;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
   Filter.ClassPaths.Add(USoundWave::StaticClass()->GetClassPathName());
   Filter.ClassPaths.Add(USoundCue::StaticClass()->GetClassPathName());
+#else
+  // UE 5.0 fallback - use ClassNames instead of ClassPaths
+  Filter.ClassNames.Add(USoundWave::StaticClass()->GetFName());
+  Filter.ClassNames.Add(USoundCue::StaticClass()->GetFName());
+#endif
   Filter.bRecursivePaths = true;
   Filter.PackagePaths.Add(TEXT("/Game"));
   AssetRegistryModule.Get().GetAssets(Filter, AssetData);
@@ -146,7 +157,11 @@ static USoundMix *ResolveSoundMix(const FString &MixPath) {
       FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
   TArray<FAssetData> AssetData;
   FARFilter Filter;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
   Filter.ClassPaths.Add(USoundMix::StaticClass()->GetClassPathName());
+#else
+  Filter.ClassNames.Add(USoundMix::StaticClass()->GetFName());
+#endif
   Filter.bRecursivePaths = true;
   Filter.PackagePaths.Add(TEXT("/Game"));
   AssetRegistryModule.Get().GetAssets(Filter, AssetData);
@@ -190,7 +205,11 @@ static USoundClass *ResolveSoundClass(const FString &ClassPath) {
       FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
   TArray<FAssetData> AssetData;
   FARFilter Filter;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
   Filter.ClassPaths.Add(USoundClass::StaticClass()->GetClassPathName());
+#else
+  Filter.ClassNames.Add(USoundClass::StaticClass()->GetFName());
+#endif
   Filter.bRecursivePaths = true;
   Filter.PackagePaths.Add(TEXT("/Game"));
   AssetRegistryModule.Get().GetAssets(Filter, AssetData);
@@ -338,6 +357,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
     TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
     Resp->SetBoolField(TEXT("success"), true);
     Resp->SetStringField(TEXT("path"), SoundCue->GetPathName());
+    AddAssetVerification(Resp, SoundCue);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("SoundCue created"), Resp);
     return true;
@@ -463,6 +483,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
     Resp->SetNumberField(TEXT("volume"), Volume);
     Resp->SetNumberField(TEXT("pitch"), Pitch);
 
+    // Sound played - add sound asset verification
+    AddAssetVerification(Resp, Sound);
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Sound played 2D"), Resp);
     return true;
@@ -512,6 +534,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
       Resp->SetStringField(TEXT("path"), SoundClass->GetPathName());
       Resp->SetStringField(TEXT("name"), SoundClass->GetName());
 
+      AddAssetVerification(Resp, SoundClass);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("SoundClass created"), Resp);
     } else {
@@ -531,9 +554,9 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
 
     FString PackagePath = TEXT("/Game/Audio/Mixes");
     if (Payload->HasField(TEXT("packagePath"))) {
-      PackagePath = Payload->GetStringField(TEXT("packagePath"));
+      PackagePath = GetJsonStringField(Payload, TEXT("packagePath"));
     } else if (Payload->HasField(TEXT("savePath"))) {
-      PackagePath = Payload->GetStringField(TEXT("savePath"));
+      PackagePath = GetJsonStringField(Payload, TEXT("savePath"));
     }
 
     USoundMixFactory *Factory = NewObject<USoundMixFactory>();
@@ -571,6 +594,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
       Resp->SetStringField(TEXT("path"), SoundMix->GetPathName());
       Resp->SetStringField(TEXT("name"), SoundMix->GetName());
 
+      AddAssetVerification(Resp, SoundMix);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("SoundMix created"), Resp);
     } else {
@@ -597,6 +621,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
         TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
         Resp->SetBoolField(TEXT("success"), true);
         Resp->SetStringField(TEXT("mixName"), MixName);
+        AddAssetVerification(Resp, Mix);
         SendAutomationResponse(RequestingSocket, RequestId, true,
                                TEXT("SoundMix pushed"), Resp);
       } else {
@@ -626,6 +651,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
         TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
         Resp->SetBoolField(TEXT("success"), true);
         Resp->SetStringField(TEXT("mixName"), MixName);
+        AddAssetVerification(Resp, Mix);
         SendAutomationResponse(RequestingSocket, RequestId, true,
                                TEXT("SoundMix popped"), Resp);
       } else {
@@ -731,6 +757,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
     TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
     if (AudioComp) {
       Resp->SetStringField(TEXT("componentName"), AudioComp->GetName());
+      AddAssetVerification(Resp, Sound);
+      AddComponentVerification(Resp, AudioComp);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Sound attached"), Resp);
     } else {
@@ -778,6 +806,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
         Resp->SetBoolField(TEXT("success"), true);
         Resp->SetStringField(TEXT("actorName"), ActorName);
         Resp->SetStringField(TEXT("action"), Lower);
+        AddActorVerification(Resp, TargetActor);
         SendAutomationResponse(RequestingSocket, RequestId, true,
                                TEXT("Sound fading"), Resp);
         return true;
@@ -852,6 +881,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
 
       TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
       Resp->SetStringField(TEXT("componentName"), AudioComp->GetName());
+      AddAssetVerification(Resp, Sound);
+      AddComponentVerification(Resp, AudioComp);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Ambient sound created"), Resp);
     } else {
@@ -919,6 +950,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
       TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
       Resp->SetStringField(TEXT("componentName"), AudioComp->GetName());
       Resp->SetStringField(TEXT("componentPath"), AudioComp->GetPathName());
+      AddAssetVerification(Resp, Sound);
+      AddComponentVerification(Resp, AudioComp);
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Sound spawned"), Resp);
     } else {
@@ -1069,6 +1102,28 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
     return true;
   }
 
+  if (Lower == TEXT("create_dialogue_voice")) {
+    return HandleCreateDialogueVoice(RequestId, Payload, RequestingSocket);
+  }
+  if (Lower == TEXT("create_dialogue_wave")) {
+    return HandleCreateDialogueWave(RequestId, Payload, RequestingSocket);
+  }
+  if (Lower == TEXT("set_dialogue_context")) {
+    return HandleSetDialogueContext(RequestId, Payload, RequestingSocket);
+  }
+  if (Lower == TEXT("create_reverb_effect")) {
+    return HandleCreateReverbEffect(RequestId, Payload, RequestingSocket);
+  }
+  if (Lower == TEXT("create_source_effect_chain")) {
+    return HandleCreateSourceEffectChain(RequestId, Payload, RequestingSocket);
+  }
+  if (Lower == TEXT("add_source_effect")) {
+    return HandleAddSourceEffect(RequestId, Payload, RequestingSocket);
+  }
+  if (Lower == TEXT("create_submix_effect")) {
+    return HandleCreateSubmixEffect(RequestId, Payload, RequestingSocket);
+  }
+
   // Fallback for other audio actions not fully implemented yet
   SendAutomationResponse(
       RequestingSocket, RequestId, false,
@@ -1079,6 +1134,487 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
   SendAutomationResponse(RequestingSocket, RequestId, false,
                          TEXT("Audio actions require editor build"), nullptr,
                          TEXT("NOT_IMPLEMENTED"));
+  return true;
+#endif
+}
+
+// Dialogue Voice handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleCreateDialogueVoice(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString VoiceName;
+  if (!Payload->TryGetStringField(TEXT("voiceName"), VoiceName) ||
+      VoiceName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("voiceName required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  FString OutputPath;
+  if (!Payload->TryGetStringField(TEXT("outputPath"), OutputPath) ||
+      OutputPath.IsEmpty()) {
+    OutputPath = TEXT("/Game/Audio/Dialogues");
+  }
+
+  // Parse gender setting
+  FString GenderStr;
+  TEnumAsByte<EGrammaticalGender::Type> Gender = EGrammaticalGender::Masculine;
+  if (Payload->TryGetStringField(TEXT("gender"), GenderStr)) {
+    Gender = GenderStr.Equals(TEXT("Female"), ESearchCase::IgnoreCase)
+                 ? EGrammaticalGender::Feminine
+                 : EGrammaticalGender::Masculine;
+  }
+
+  // Parse pluralization setting
+  FString PluralStr;
+  TEnumAsByte<EGrammaticalNumber::Type> Plurality = EGrammaticalNumber::Singular;
+  if (Payload->TryGetStringField(TEXT("pluralization"), PluralStr)) {
+    Plurality = PluralStr.Equals(TEXT("Plural"), ESearchCase::IgnoreCase)
+                    ? EGrammaticalNumber::Plural
+                    : EGrammaticalNumber::Singular;
+  }
+
+  FString FullPath = FString::Printf(TEXT("%s/%s"), *OutputPath, *VoiceName);
+  FString PackageName = FullPath;
+  if (!PackageName.StartsWith(TEXT("/Game/"))) {
+    PackageName = TEXT("/Game/") + PackageName;
+  }
+
+  UPackage *Package = CreatePackage(*PackageName);
+  if (!Package) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create package"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  UDialogueVoice *NewVoice = NewObject<UDialogueVoice>(Package, FName(*VoiceName), RF_Public | RF_Standalone);
+  if (!NewVoice) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create dialogue voice"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  // UE 5.7: VoiceName removed, Gender uses EGrammaticalGender, bIsPlural replaced with Plurality
+  NewVoice->Gender = Gender;
+  NewVoice->Plurality = Plurality;
+
+  Package->MarkPackageDirty();
+  FAssetRegistryModule::AssetCreated(NewVoice);
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("voicePath"), NewVoice->GetPathName());
+  Resp->SetStringField(TEXT("voiceName"), VoiceName);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Dialogue voice created"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
+  return true;
+#endif
+}
+
+// Dialogue Wave handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleCreateDialogueWave(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString WaveName;
+  if (!Payload->TryGetStringField(TEXT("waveName"), WaveName) ||
+      WaveName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("waveName required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  FString SoundPath;
+  if (!Payload->TryGetStringField(TEXT("soundPath"), SoundPath) ||
+      SoundPath.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("soundPath required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  USoundBase *Sound = ResolveSoundAsset(SoundPath);
+  if (!Sound) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Sound asset not found"), TEXT("ASSET_NOT_FOUND"));
+    return true;
+  }
+
+  FString OutputPath;
+  if (!Payload->TryGetStringField(TEXT("outputPath"), OutputPath) ||
+      OutputPath.IsEmpty()) {
+    OutputPath = TEXT("/Game/Audio/Dialogues");
+  }
+
+  FString FullPath = FString::Printf(TEXT("%s/%s"), *OutputPath, *WaveName);
+  if (!FullPath.StartsWith(TEXT("/Game/"))) {
+    FullPath = TEXT("/Game/") + FullPath;
+  }
+
+  UPackage *Package = CreatePackage(*FullPath);
+  if (!Package) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create package"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  UDialogueWave *DialogueWave = NewObject<UDialogueWave>(Package, FName(*WaveName), RF_Public | RF_Standalone);
+  if (!DialogueWave) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create dialogue wave"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  // UE 5.7: DialogueVoice renamed to Speaker, SoundWave needs explicit cast from USoundBase
+  FDialogueContextMapping Context;
+  Context.Context.Speaker = nullptr;
+  Context.SoundWave = Cast<USoundWave>(Sound);
+  DialogueWave->ContextMappings.Add(Context);
+
+  Package->MarkPackageDirty();
+  FAssetRegistryModule::AssetCreated(DialogueWave);
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("wavePath"), DialogueWave->GetPathName());
+  Resp->SetStringField(TEXT("waveName"), WaveName);
+  Resp->SetStringField(TEXT("soundPath"), SoundPath);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Dialogue wave created"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
+  return true;
+#endif
+}
+
+// Set Dialogue Context handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleSetDialogueContext(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString WavePath;
+  if (!Payload->TryGetStringField(TEXT("wavePath"), WavePath) ||
+      WavePath.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("wavePath required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  UDialogueWave *DialogueWave = LoadObject<UDialogueWave>(nullptr, *WavePath);
+  if (!DialogueWave) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Dialogue wave not found"), TEXT("ASSET_NOT_FOUND"));
+    return true;
+  }
+
+  FString VoicePath;
+  if (!Payload->TryGetStringField(TEXT("voicePath"), VoicePath) ||
+      VoicePath.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("voicePath required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  UDialogueVoice *Voice = LoadObject<UDialogueVoice>(nullptr, *VoicePath);
+  if (!Voice) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Dialogue voice not found"), TEXT("ASSET_NOT_FOUND"));
+    return true;
+  }
+
+  int32 ContextIndex = 0;
+  Payload->TryGetNumberField(TEXT("contextIndex"), ContextIndex);
+
+  if (ContextIndex < 0 || ContextIndex >= DialogueWave->ContextMappings.Num()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Invalid context index"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  // UE 5.7: DialogueVoice renamed to Speaker
+  DialogueWave->ContextMappings[ContextIndex].Context.Speaker = Voice;
+  DialogueWave->MarkPackageDirty();
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("wavePath"), DialogueWave->GetPathName());
+  Resp->SetStringField(TEXT("voicePath"), VoicePath);
+  Resp->SetNumberField(TEXT("contextIndex"), ContextIndex);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Dialogue context set"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
+  return true;
+#endif
+}
+
+// Create Reverb Effect handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleCreateReverbEffect(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString EffectName;
+  if (!Payload->TryGetStringField(TEXT("effectName"), EffectName) ||
+      EffectName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("effectName required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  FString OutputPath;
+  if (!Payload->TryGetStringField(TEXT("outputPath"), OutputPath) ||
+      OutputPath.IsEmpty()) {
+    OutputPath = TEXT("/Game/Audio/Effects");
+  }
+
+  float Density = 1.0f;
+  Payload->TryGetNumberField(TEXT("density"), Density);
+  float Diffusion = 1.0f;
+  Payload->TryGetNumberField(TEXT("diffusion"), Diffusion);
+  float Gain = 0.32f;
+  Payload->TryGetNumberField(TEXT("gain"), Gain);
+  float GainHF = 0.89f;
+  Payload->TryGetNumberField(TEXT("gainHF"), GainHF);
+  float DecayTime = 1.49f;
+  Payload->TryGetNumberField(TEXT("decayTime"), DecayTime);
+  float DecayHFRatio = 0.83f;
+  Payload->TryGetNumberField(TEXT("decayHFRatio"), DecayHFRatio);
+  float ReflectionsGain = 0.05f;
+  Payload->TryGetNumberField(TEXT("reflectionsGain"), ReflectionsGain);
+  float LateGain = 1.26f;
+  Payload->TryGetNumberField(TEXT("lateGain"), LateGain);
+
+  FString FullPath = FString::Printf(TEXT("%s/%s"), *OutputPath, *EffectName);
+  if (!FullPath.StartsWith(TEXT("/Game/"))) {
+    FullPath = TEXT("/Game/") + FullPath;
+  }
+
+  UPackage *Package = CreatePackage(*FullPath);
+  if (!Package) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create package"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  UReverbEffect *ReverbEffect = NewObject<UReverbEffect>(Package, FName(*EffectName), RF_Public | RF_Standalone);
+  if (!ReverbEffect) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create reverb effect"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  ReverbEffect->Density = Density;
+  ReverbEffect->Diffusion = Diffusion;
+  ReverbEffect->Gain = Gain;
+  ReverbEffect->GainHF = GainHF;
+  ReverbEffect->DecayTime = DecayTime;
+  ReverbEffect->DecayHFRatio = DecayHFRatio;
+  ReverbEffect->ReflectionsGain = ReflectionsGain;
+  ReverbEffect->LateGain = LateGain;
+
+  Package->MarkPackageDirty();
+  FAssetRegistryModule::AssetCreated(ReverbEffect);
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("effectPath"), ReverbEffect->GetPathName());
+  Resp->SetStringField(TEXT("effectName"), EffectName);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Reverb effect created"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
+  return true;
+#endif
+}
+
+// Create Source Effect Chain handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleCreateSourceEffectChain(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString ChainName;
+  if (!Payload->TryGetStringField(TEXT("chainName"), ChainName) ||
+      ChainName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("chainName required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  FString OutputPath;
+  if (!Payload->TryGetStringField(TEXT("outputPath"), OutputPath) ||
+      OutputPath.IsEmpty()) {
+    OutputPath = TEXT("/Game/Audio/Effects");
+  }
+
+  FString FullPath = FString::Printf(TEXT("%s/%s"), *OutputPath, *ChainName);
+  if (!FullPath.StartsWith(TEXT("/Game/"))) {
+    FullPath = TEXT("/Game/") + FullPath;
+  }
+
+  UPackage *Package = CreatePackage(*FullPath);
+  if (!Package) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create package"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  USoundEffectSourcePresetChain *Chain = NewObject<USoundEffectSourcePresetChain>(Package, FName(*ChainName), RF_Public | RF_Standalone);
+  if (!Chain) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create source effect chain"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  Package->MarkPackageDirty();
+  FAssetRegistryModule::AssetCreated(Chain);
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("chainPath"), Chain->GetPathName());
+  Resp->SetStringField(TEXT("chainName"), ChainName);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Source effect chain created"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
+  return true;
+#endif
+}
+
+// Add Source Effect handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleAddSourceEffect(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString ChainPath;
+  if (!Payload->TryGetStringField(TEXT("chainPath"), ChainPath) ||
+      ChainPath.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("chainPath required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  USoundEffectSourcePresetChain *Chain = LoadObject<USoundEffectSourcePresetChain>(nullptr, *ChainPath);
+  if (!Chain) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Source effect chain not found"), TEXT("ASSET_NOT_FOUND"));
+    return true;
+  }
+
+  FString EffectType;
+  if (!Payload->TryGetStringField(TEXT("effectType"), EffectType) ||
+      EffectType.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("effectType required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  FString EffectName;
+  Payload->TryGetStringField(TEXT("effectName"), EffectName);
+  if (EffectName.IsEmpty()) {
+    EffectName = FString::Printf(TEXT("Effect_%d"), Chain->Chain.Num());
+  }
+
+  FSourceEffectChainEntry Entry;
+  Entry.bBypass = false;
+
+  if (EffectType.Equals(TEXT("EQ"), ESearchCase::IgnoreCase)) {
+    USoundEffectSourcePreset *EQPreset = NewObject<USoundEffectSourcePreset>();
+    Entry.Preset = EQPreset;
+  } else if (EffectType.Equals(TEXT("Reverb"), ESearchCase::IgnoreCase)) {
+    USoundEffectSourcePreset *ReverbPreset = NewObject<USoundEffectSourcePreset>();
+    Entry.Preset = ReverbPreset;
+  } else if (EffectType.Equals(TEXT("Delay"), ESearchCase::IgnoreCase)) {
+    USoundEffectSourcePreset *DelayPreset = NewObject<USoundEffectSourcePreset>();
+    Entry.Preset = DelayPreset;
+  } else {
+    SendAutomationError(RequestingSocket, RequestId,
+                        FString::Printf(TEXT("Unknown effect type: %s"), *EffectType),
+                        TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  Chain->Chain.Add(Entry);
+  Chain->MarkPackageDirty();
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("chainPath"), Chain->GetPathName());
+  Resp->SetStringField(TEXT("effectType"), EffectType);
+  Resp->SetStringField(TEXT("effectName"), EffectName);
+  Resp->SetNumberField(TEXT("effectIndex"), Chain->Chain.Num() - 1);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Source effect added to chain"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
+  return true;
+#endif
+}
+
+// Create Submix Effect handler implementation
+bool UMcpAutomationBridgeSubsystem::HandleCreateSubmixEffect(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+#if WITH_EDITOR
+  FString EffectName;
+  if (!Payload->TryGetStringField(TEXT("effectName"), EffectName) ||
+      EffectName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("effectName required"), TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  FString OutputPath;
+  if (!Payload->TryGetStringField(TEXT("outputPath"), OutputPath) ||
+      OutputPath.IsEmpty()) {
+    OutputPath = TEXT("/Game/Audio/Effects");
+  }
+
+  FString EffectType;
+  if (!Payload->TryGetStringField(TEXT("effectType"), EffectType) ||
+      EffectType.IsEmpty()) {
+    EffectType = TEXT("Reverb");
+  }
+
+  FString FullPath = FString::Printf(TEXT("%s/%s"), *OutputPath, *EffectName);
+  if (!FullPath.StartsWith(TEXT("/Game/"))) {
+    FullPath = TEXT("/Game/") + FullPath;
+  }
+
+  UPackage *Package = CreatePackage(*FullPath);
+  if (!Package) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create package"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  USoundEffectSubmixPreset *SubmixEffect = NewObject<USoundEffectSubmixPreset>(Package, FName(*EffectName), RF_Public | RF_Standalone);
+  if (!SubmixEffect) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create submix effect"), TEXT("CREATE_FAILED"));
+    return true;
+  }
+
+  Package->MarkPackageDirty();
+  FAssetRegistryModule::AssetCreated(SubmixEffect);
+
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("effectPath"), SubmixEffect->GetPathName());
+  Resp->SetStringField(TEXT("effectName"), EffectName);
+  Resp->SetStringField(TEXT("effectType"), EffectType);
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Submix effect created"), Resp);
+  return true;
+#else
+  SendAutomationError(RequestingSocket, RequestId,
+                      TEXT("Editor build required"), TEXT("NOT_SUPPORTED"));
   return true;
 #endif
 }

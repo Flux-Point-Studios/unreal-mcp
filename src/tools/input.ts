@@ -302,7 +302,13 @@ Example - Clearing injected inputs:
                     'remove_mapping',
                     'inject_input_for_action',
                     'clear_injected_inputs',
-                    'get_injected_input_status'
+                    'get_injected_input_status',
+                    'map_input_action',
+                    'set_input_trigger',
+                    'set_input_modifier',
+                    'enable_input_mapping',
+                    'disable_input_action',
+                    'get_input_info'
                 ],
                 description: 'Action to perform'
             },
@@ -365,7 +371,11 @@ Example - Clearing injected inputs:
                 type: 'array',
                 items: { type: 'string' },
                 description: 'Optional trigger class names to apply during input injection.'
-            }
+            },
+            triggerType: { type: 'string', description: 'Trigger type (e.g. "Pressed", "Released", "Hold").' },
+            modifierType: { type: 'string', description: 'Modifier type (e.g. "Negate", "Swizzle", "DeadZone").' },
+            assetPath: { type: 'string', description: 'Path to input asset for queries.' },
+            priority: { type: 'number', description: 'Priority for input mapping context (default: 0).' }
         },
         required: ['action']
     },

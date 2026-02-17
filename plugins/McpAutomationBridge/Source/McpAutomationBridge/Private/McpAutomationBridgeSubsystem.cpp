@@ -1,5 +1,12 @@
 // Ensure the subsystem type and bridge socket types are available
+// Include helpers first to ensure MCP_HAS_CONTROLRIG_FACTORY is properly defined
+// before McpAutomationBridgeSubsystem.h sets default values
+#if WITH_EDITOR
+#include "McpAutomationBridgeHelpers.h"
+#endif
+
 #include "McpAutomationBridgeSubsystem.h"
+#include "Dom/JsonObject.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "Async/Async.h"
 #include "HAL/PlatformFilemanager.h"
@@ -17,7 +24,7 @@
 // Editor-only includes for ExecuteEditorCommands
 #if WITH_EDITOR
 #include "Editor.h"
-#include "McpAutomationBridgeHelpers.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #endif
 
 // Define the subsystem log category declared in the public header.
@@ -63,12 +70,26 @@ static inline FString SanitizeForLog(const FString &In) {
  * handlers and a message-received callback, starts the connection manager, and
  * registers a recurring ticker to process pending automation requests.
  *
+ * NOTE: This subsystem is intentionally disabled during commandlet execution
+ * (cooking, packaging, etc.) to prevent the WebSocket server from interfering
+ * with cook operations and blocking writes to the staged build directory.
+ *
  * @param Collection Subsystem collection provided by the engine during
  * initialization.
  */
 void UMcpAutomationBridgeSubsystem::Initialize(
     FSubsystemCollectionBase &Collection) {
   Super::Initialize(Collection);
+
+  // Skip initialization during commandlet execution (cooking, packaging, etc.)
+  // The WebSocket server and background threads can interfere with cook
+  // operations, particularly file I/O to the staged build directory.
+  if (IsRunningCommandlet()) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+           TEXT("McpAutomationBridgeSubsystem skipping initialization - running "
+                "as commandlet (cook/package mode)."));
+    return;
+  }
 
   UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
          TEXT("McpAutomationBridgeSubsystem initializing."));
@@ -110,15 +131,24 @@ void UMcpAutomationBridgeSubsystem::Initialize(
  * Removes the registered ticker, stops and clears the connection manager,
  * detaches and clears the log capture device, and calls the superclass
  * deinitialization.
+ *
+ * NOTE: During commandlet execution (cooking, packaging), the subsystem
+ * may not have fully initialized, so cleanup checks are defensive.
  */
 void UMcpAutomationBridgeSubsystem::Deinitialize() {
+  // Remove ticker if it was registered (won't be valid if we skipped init
+  // during commandlet)
   if (TickHandle.IsValid()) {
     FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
     TickHandle.Reset();
   }
 
-  UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
-         TEXT("McpAutomationBridgeSubsystem deinitializing."));
+  // Skip verbose logging during commandlet mode since we didn't fully
+  // initialize
+  if (!IsRunningCommandlet()) {
+    UE_LOG(LogMcpAutomationBridgeSubsystem, Log,
+           TEXT("McpAutomationBridgeSubsystem deinitializing."));
+  }
 
   if (ConnectionManager.IsValid()) {
     ConnectionManager->Stop();
@@ -256,6 +286,25 @@ void UMcpAutomationBridgeSubsystem::SendAutomationError(
          *SanitizeForLog(Message));
   SendAutomationResponse(TargetSocket, RequestId, false, Message, nullptr,
                          ResolvedError);
+}
+
+/**
+ * @brief Send a progress update during long-running operations.
+ *
+ * Sends a progress_update message to the MCP server to extend the request
+ * timeout and provide status feedback. This prevents timeout errors when
+ * UE is actively working on a task.
+ *
+ * @param RequestId The request ID being tracked
+ * @param Percent Optional progress percent (0-100), use negative to omit
+ * @param Message Optional status message describing current operation
+ * @param bStillWorking True if operation is still in progress
+ */
+void UMcpAutomationBridgeSubsystem::SendProgressUpdate(
+    const FString &RequestId, float Percent, const FString &Message, bool bStillWorking) {
+  if (ConnectionManager.IsValid()) {
+    ConnectionManager->SendProgressUpdate(RequestId, Percent, Message, bStillWorking);
+  }
 }
 
 /**
@@ -609,6 +658,12 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                          TSharedPtr<FMcpBridgeWebSocket> S) {
                     return HandleSetupRagdoll(R, A, P, S);
                   });
+  RegisterHandler(TEXT("activate_ragdoll"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleActivateRagdoll(R, A, P, S);
+                  });
 
   // Material Graph
   RegisterHandler(TEXT("add_material_texture_sample"),
@@ -765,11 +820,110 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                     return HandleAssetAction(R, A, P, S);
                   });
 
-  RegisterHandler(TEXT("rebuild_material"),
+  RegisterHandler(TEXT("manage_material_authoring"),
                   [this](const FString &R, const FString &A,
                          const TSharedPtr<FJsonObject> &P,
                          TSharedPtr<FMcpBridgeWebSocket> S) {
-                    return HandleRebuildMaterial(R, P, S);
+                    return HandleManageMaterialAuthoringAction(R, A, P, S);
+                  });
+
+  // === Missing registrations for Phase 35+ tools ===
+  RegisterHandler(TEXT("manage_blueprint"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleBlueprintAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_geometry"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleGeometryAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_skeleton"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageSkeleton(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_texture"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageTextureAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_gas"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageGASAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_character"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageCharacterAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_combat"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageCombatAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_ai"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageAIAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_inventory"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageInventoryAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_interaction"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageInteractionAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_widget_authoring"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageWidgetAuthoringAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_networking"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageNetworkingAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_splines"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleManageSplinesAction(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("manage_pipeline"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandlePipelineAction(R, A, P, S);
                   });
 
   RegisterHandler(TEXT("manage_behavior_tree"),
@@ -884,6 +1038,47 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                          TSharedPtr<FMcpBridgeWebSocket> S) {
                     return HandleQuitEditor(R, P, S);
                   });
+
+  // Phase 27: Misc (camera, viewport, bookmarks, post-process, networking helpers)
+  RegisterHandler(TEXT("manage_misc"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleMiscAction(R, A, P, S);
+                  });
+
+  // Direct action aliases for misc handlers
+  // Note: create_post_process_volume is handled via manage_volumes tool
+  RegisterHandler(TEXT("create_camera"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleMiscAction(R, A, P, S);
+                  });
+  RegisterHandler(TEXT("set_camera_fov"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleMiscAction(R, A, P, S);
+                  });
+  RegisterHandler(TEXT("set_viewport_resolution"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleMiscAction(R, A, P, S);
+                  });
+  RegisterHandler(TEXT("set_game_speed"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleMiscAction(R, A, P, S);
+                  });
+  RegisterHandler(TEXT("create_bookmark"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleMiscAction(R, A, P, S);
+                  });
 }
 
 // Drain and process any automation requests that were enqueued while the
@@ -981,16 +1176,30 @@ bool UMcpAutomationBridgeSubsystem::ExecuteEditorCommands(
 // ============================================================================
 // CreateControlRigBlueprint Implementation
 // ============================================================================
+// Note: ControlRigBlueprintFactory is only available in UE 5.1+ or as private API
+// The MCP_HAS_CONTROLRIG_FACTORY macro is defined in McpAutomationBridgeHelpers.h
+
 #if MCP_HAS_CONTROLRIG_FACTORY
+// Animation/Skeleton types needed for ControlRig blueprint creation
+#include "Animation/Skeleton.h"
+#include "Engine/SkeletalMesh.h"
+
+// ControlRig includes - these are only available when ControlRig plugin is enabled
 // UE 5.7 renamed ControlRigBlueprint.h to ControlRigBlueprintLegacy.h
-#if __has_include("ControlRigBlueprintLegacy.h")
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
 #include "ControlRigBlueprintLegacy.h"
 #else
 #include "ControlRigBlueprint.h"
 #endif
-#include "ControlRigBlueprintFactory.h"
+// Note: ControlRigBlueprintFactory header is Public only in UE 5.5+
+// For UE 5.1-5.4 we use a fallback implementation with FKismetEditorUtilities
+#if MCP_HAS_CONTROLRIG_FACTORY && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+  #include "ControlRigBlueprintFactory.h"
+#endif
 #include "AssetRegistry/AssetRegistryModule.h"
+#endif
 
+#if MCP_HAS_CONTROLRIG_FACTORY
 /**
  * @brief Creates a new Control Rig Blueprint asset.
  *
@@ -1046,19 +1255,17 @@ UBlueprint *UMcpAutomationBridgeSubsystem::CreateControlRigBlueprint(
 
   Package->FullyLoad();
 
-  // Create the factory
-  UControlRigBlueprintFactory *Factory =
-      NewObject<UControlRigBlueprintFactory>();
-  if (!Factory) {
-    OutError = TEXT("Failed to create ControlRigBlueprintFactory");
-    return nullptr;
-  }
-
-  // Create the Control Rig Blueprint
+  // Create the Control Rig Blueprint using FKismetEditorUtilities
+  // This works across all UE versions without needing ControlRigBlueprintFactory
   UControlRigBlueprint *NewBlueprint = Cast<UControlRigBlueprint>(
-      Factory->FactoryCreateNew(UControlRigBlueprint::StaticClass(), Package,
-                                *AssetName, RF_Public | RF_Standalone, nullptr,
-                                GWarn));
+      FKismetEditorUtilities::CreateBlueprint(
+          UControlRig::StaticClass(),  // Parent class
+          Package,                      // Outer
+          *AssetName,                   // Name
+          BPTYPE_Normal,                // Blueprint type
+          UControlRigBlueprint::StaticClass(),  // Blueprint class
+          URigVMBlueprintGeneratedClass::StaticClass(),  // Generated class
+          NAME_None));
 
   if (!NewBlueprint) {
     OutError = TEXT("Factory failed to create Control Rig Blueprint");
@@ -1091,6 +1298,6 @@ UBlueprint *UMcpAutomationBridgeSubsystem::CreateControlRigBlueprint(
 #else
   OutError = TEXT("Control Rig creation only available in editor builds");
   return nullptr;
-#endif
+#endif // WITH_EDITOR
 }
 #endif // MCP_HAS_CONTROLRIG_FACTORY

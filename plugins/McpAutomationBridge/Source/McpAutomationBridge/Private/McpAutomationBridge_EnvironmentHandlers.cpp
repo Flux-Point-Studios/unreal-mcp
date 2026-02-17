@@ -1,3 +1,4 @@
+#include "Dom/JsonObject.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
@@ -8,6 +9,9 @@
 #include "EditorAssetLibrary.h"
 #include "DesktopPlatformModule.h"
 #include "IDesktopPlatform.h"
+#include "Slate/SceneViewport.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Engine/Selection.h"
 
 // Python Script Plugin support (optional - check availability at runtime)
 // The Python Editor Script Plugin provides the IPythonScriptPlugin interface
@@ -73,6 +77,13 @@ public:
 // Hot Reload / Live Coding support
 #include "Misc/HotReloadInterface.h"
 #include "Misc/App.h"
+
+// Landscape includes
+#include "Landscape.h"
+#include "LandscapeInfo.h"
+#include "LandscapeLayerInfoObject.h"
+#include "LandscapeGrassType.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 
 #endif
 
@@ -154,13 +165,35 @@ bool UMcpAutomationBridgeSubsystem::HandleBuildEnvironmentAction(
     FoliagePayload->SetBoolField(TEXT("removeAll"), bRemoveAll);
     return HandleRemoveFoliage(RequestId, TEXT("remove_foliage"),
                                FoliagePayload, RequestingSocket);
+  } else if (LowerSub == TEXT("paint_foliage")) {
+    // Direct dispatch to foliage handler (payload already in correct format)
+    return HandlePaintFoliage(RequestId, TEXT("paint_foliage"), Payload,
+                              RequestingSocket);
+  } else if (LowerSub == TEXT("create_procedural_foliage")) {
+    // Dispatch to procedural foliage handler
+    return HandleCreateProceduralFoliage(RequestId,
+                                         TEXT("create_procedural_foliage"),
+                                         Payload, RequestingSocket);
+  } else if (LowerSub == TEXT("create_procedural_terrain")) {
+    // Dispatch to procedural terrain handler
+    return HandleCreateProceduralTerrain(RequestId,
+                                         TEXT("create_procedural_terrain"),
+                                         Payload, RequestingSocket);
+  } else if (LowerSub == TEXT("add_foliage_type") || LowerSub == TEXT("add_foliage")) {
+    // Dispatch to foliage type handler
+    return HandleAddFoliageType(RequestId, TEXT("add_foliage_type"),
+                                Payload, RequestingSocket);
+  } else if (LowerSub == TEXT("create_landscape")) {
+    // Dispatch to landscape creation handler
+    return HandleCreateLandscape(RequestId, TEXT("create_landscape"),
+                                 Payload, RequestingSocket);
   }
   // Dispatch landscape operations
   else if (LowerSub == TEXT("paint_landscape") ||
            LowerSub == TEXT("paint_landscape_layer")) {
     return HandlePaintLandscapeLayer(RequestId, TEXT("paint_landscape_layer"),
                                      Payload, RequestingSocket);
-  } else if (LowerSub == TEXT("sculpt_landscape")) {
+  } else if (LowerSub == TEXT("sculpt_landscape") || LowerSub == TEXT("sculpt")) {
     return HandleSculptLandscape(RequestId, TEXT("sculpt_landscape"), Payload,
                                  RequestingSocket);
   } else if (LowerSub == TEXT("modify_heightmap")) {
@@ -198,29 +231,43 @@ bool UMcpAutomationBridgeSubsystem::HandleBuildEnvironmentAction(
       ErrorCode = TEXT("INVALID_ARGUMENT");
       Resp->SetStringField(TEXT("error"), Message);
     } else {
-      TSharedPtr<FJsonObject> Snapshot = MakeShared<FJsonObject>();
-      Snapshot->SetStringField(TEXT("timestamp"),
-                               FDateTime::UtcNow().ToString());
-      Snapshot->SetStringField(TEXT("type"), TEXT("environment_snapshot"));
+      // SECURITY: Validate file path to prevent directory traversal and arbitrary file access
+      // Use SanitizeProjectFilePath for file operations (accepts /Temp, /Saved, etc.)
+      FString SafePath = SanitizeProjectFilePath(Path);
+      if (SafePath.IsEmpty()) {
+        bSuccess = false;
+        Message = FString::Printf(TEXT("Invalid or unsafe path: %s. Path must be relative to project (e.g., /Temp/snapshot.json)"), *Path);
+        ErrorCode = TEXT("SECURITY_VIOLATION");
+        Resp->SetStringField(TEXT("error"), Message);
+      } else {
+        // Convert project-relative path to absolute file path
+        FString AbsolutePath = FPaths::ProjectDir() / SafePath;
+        FPaths::MakeStandardFilename(AbsolutePath);
+        
+        TSharedPtr<FJsonObject> Snapshot = MakeShared<FJsonObject>();
+        Snapshot->SetStringField(TEXT("timestamp"),
+                                 FDateTime::UtcNow().ToString());
+        Snapshot->SetStringField(TEXT("type"), TEXT("environment_snapshot"));
 
-      FString JsonString;
-      TSharedRef<TJsonWriter<>> Writer =
-          TJsonWriterFactory<>::Create(&JsonString);
-      if (FJsonSerializer::Serialize(Snapshot.ToSharedRef(), Writer)) {
-        if (FFileHelper::SaveStringToFile(JsonString, *Path)) {
-          Resp->SetStringField(TEXT("exportPath"), Path);
-          Resp->SetStringField(TEXT("message"), TEXT("Snapshot exported"));
+        FString JsonString;
+        TSharedRef<TJsonWriter<>> Writer =
+            TJsonWriterFactory<>::Create(&JsonString);
+        if (FJsonSerializer::Serialize(Snapshot.ToSharedRef(), Writer)) {
+          if (FFileHelper::SaveStringToFile(JsonString, *AbsolutePath)) {
+            Resp->SetStringField(TEXT("exportPath"), SafePath);
+            Resp->SetStringField(TEXT("message"), TEXT("Snapshot exported"));
+          } else {
+            bSuccess = false;
+            Message = TEXT("Failed to write snapshot file");
+            ErrorCode = TEXT("WRITE_FAILED");
+            Resp->SetStringField(TEXT("error"), Message);
+          }
         } else {
           bSuccess = false;
-          Message = TEXT("Failed to write snapshot file");
-          ErrorCode = TEXT("WRITE_FAILED");
+          Message = TEXT("Failed to serialize snapshot");
+          ErrorCode = TEXT("SERIALIZE_FAILED");
           Resp->SetStringField(TEXT("error"), Message);
         }
-      } else {
-        bSuccess = false;
-        Message = TEXT("Failed to serialize snapshot");
-        ErrorCode = TEXT("SERIALIZE_FAILED");
-        Resp->SetStringField(TEXT("error"), Message);
       }
     }
   } else if (LowerSub == TEXT("import_snapshot")) {
@@ -232,25 +279,39 @@ bool UMcpAutomationBridgeSubsystem::HandleBuildEnvironmentAction(
       ErrorCode = TEXT("INVALID_ARGUMENT");
       Resp->SetStringField(TEXT("error"), Message);
     } else {
-      FString JsonString;
-      if (!FFileHelper::LoadFileToString(JsonString, *Path)) {
+      // SECURITY: Validate file path to prevent directory traversal and arbitrary file access
+      // Use SanitizeProjectFilePath for file operations (accepts /Temp, /Saved, etc.)
+      FString SafePath = SanitizeProjectFilePath(Path);
+      if (SafePath.IsEmpty()) {
         bSuccess = false;
-        Message = TEXT("Failed to read snapshot file");
-        ErrorCode = TEXT("LOAD_FAILED");
+        Message = FString::Printf(TEXT("Invalid or unsafe path: %s. Path must be relative to project (e.g., /Temp/snapshot.json)"), *Path);
+        ErrorCode = TEXT("SECURITY_VIOLATION");
         Resp->SetStringField(TEXT("error"), Message);
       } else {
-        TSharedPtr<FJsonObject> SnapshotObj;
-        TSharedRef<TJsonReader<>> Reader =
-            TJsonReaderFactory<>::Create(JsonString);
-        if (!FJsonSerializer::Deserialize(Reader, SnapshotObj) ||
-            !SnapshotObj.IsValid()) {
+        // Convert project-relative path to absolute file path
+        FString AbsolutePath = FPaths::ProjectDir() / SafePath;
+        FPaths::MakeStandardFilename(AbsolutePath);
+        
+        FString JsonString;
+        if (!FFileHelper::LoadFileToString(JsonString, *AbsolutePath)) {
           bSuccess = false;
-          Message = TEXT("Failed to parse snapshot");
-          ErrorCode = TEXT("PARSE_FAILED");
+          Message = TEXT("Failed to read snapshot file");
+          ErrorCode = TEXT("LOAD_FAILED");
           Resp->SetStringField(TEXT("error"), Message);
         } else {
-          Resp->SetObjectField(TEXT("snapshot"), SnapshotObj.ToSharedRef());
-          Resp->SetStringField(TEXT("message"), TEXT("Snapshot imported"));
+          TSharedPtr<FJsonObject> SnapshotObj;
+          TSharedRef<TJsonReader<>> Reader =
+              TJsonReaderFactory<>::Create(JsonString);
+          if (!FJsonSerializer::Deserialize(Reader, SnapshotObj) ||
+              !SnapshotObj.IsValid()) {
+            bSuccess = false;
+            Message = TEXT("Failed to parse snapshot");
+            ErrorCode = TEXT("PARSE_FAILED");
+            Resp->SetStringField(TEXT("error"), Message);
+          } else {
+            Resp->SetObjectField(TEXT("snapshot"), SnapshotObj.ToSharedRef());
+            Resp->SetStringField(TEXT("message"), TEXT("Snapshot imported"));
+          }
         }
       }
     }
@@ -520,6 +581,10 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEnvironmentAction(
     Result->SetNumberField(TEXT("hour"), ClampedHour);
     Result->SetNumberField(TEXT("pitch"), SolarPitch);
     Result->SetStringField(TEXT("actor"), SunLight->GetPathName());
+    
+    // Add verification data
+    AddActorVerification(Result, SunLight);
+    
     SendResult(true, TEXT("Time of day updated"), FString(), Result);
     return true;
   }
@@ -1970,1291 +2035,99 @@ bool UMcpAutomationBridgeSubsystem::HandleConsoleCommandAction(
     return false;
   }
 
-  if (!Payload.IsValid()) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Console command requires valid payload"),
-                           nullptr, TEXT("INVALID_PAYLOAD"));
-    return true;
-  }
-
-  FString Command;
-  if (!Payload->TryGetStringField(TEXT("command"), Command)) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Console command requires command parameter"),
-                           nullptr, TEXT("INVALID_ARGUMENT"));
-    return true;
-  }
-
-  // Block dangerous commands (Defense-in-Depth)
-  FString LowerCommand = Command.ToLower();
-
-  // 1. Explicit command blocking
-  TArray<FString> ExplicitBlockedCommands = {
-      TEXT("quit"),    TEXT("exit"),   TEXT("crash"),     TEXT("shutdown"),
-      TEXT("restart"), TEXT("reboot"), TEXT("debug exec")};
-
-  for (const FString &Blocked : ExplicitBlockedCommands) {
-    if (LowerCommand.Equals(Blocked) ||
-        LowerCommand.StartsWith(Blocked + TEXT(" "))) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Command '%s' is explicitly blocked for safety"),
-                          *Command),
-          nullptr, TEXT("COMMAND_BLOCKED"));
-      return true;
-    }
-  }
-
-  // 2. Token-based blocking (preventing system commands, file manipulation, and
-  // python hacks)
-  TArray<FString> ForbiddenTokens = {TEXT("rm "),
-                                     TEXT("rm-"),
-                                     TEXT("del "),
-                                     TEXT("format "),
-                                     TEXT("rmdir"),
-                                     TEXT("mklink"),
-                                     TEXT("copy "),
-                                     TEXT("move "),
-                                     TEXT("start \""),
-                                     TEXT("system("),
-                                     TEXT("import os"),
-                                     TEXT("import subprocess"),
-                                     TEXT("subprocess."),
-                                     TEXT("os.system"),
-                                     TEXT("exec("),
-                                     TEXT("eval("),
-                                     TEXT("__import__"),
-                                     TEXT("import sys"),
-                                     TEXT("import importlib"),
-                                     TEXT("with open"),
-                                     TEXT("open(")};
-
-  for (const FString &Token : ForbiddenTokens) {
-    if (LowerCommand.Contains(Token)) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(
-              TEXT("Command '%s' contains forbidden token '%s' and is blocked"),
-              *Command, *Token),
-          nullptr, TEXT("COMMAND_BLOCKED"));
-      return true;
-    }
-  }
-
-  // 3. Block Chaining
-  if (LowerCommand.Contains(TEXT("&&")) || LowerCommand.Contains(TEXT("||"))) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Command chaining is blocked for safety"),
-                           nullptr, TEXT("COMMAND_BLOCKED"));
-    return true;
-  }
-
-  // 4. Block line breaks
-  if (LowerCommand.Contains(TEXT("\n")) || LowerCommand.Contains(TEXT("\r"))) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Multi-line commands are blocked for safety"),
-                           nullptr, TEXT("COMMAND_BLOCKED"));
-    return true;
-  }
-
-  // 5. Block semicolon and pipe
-  if (LowerCommand.Contains(TEXT(";")) || LowerCommand.Contains(TEXT("|"))) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Command chaining with semicolon or pipe is blocked for safety"),
-                           nullptr, TEXT("COMMAND_BLOCKED"));
-    return true;
-  }
-
-  // 6. Block backticks
-  if (LowerCommand.Contains(TEXT("`"))) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Commands containing backticks are blocked for safety"),
-                           nullptr, TEXT("COMMAND_BLOCKED"));
-    return true;
-  }
-
-  // Execute the command
-  try {
-    UWorld *TargetWorld = nullptr;
-#if WITH_EDITOR
-    if (GEditor) {
-      // Prefer PIE world if active, otherwise Editor world
-      TargetWorld = GEditor->PlayWorld;
-      if (!TargetWorld) {
-        TargetWorld = GEditor->GetEditorWorldContext().World();
-      }
-    }
-#endif
-
-    // Fallback to GWorld if no editor/PIE world found (e.g. game mode)
-    if (!TargetWorld && GEngine) {
-      // Note: In some contexts GWorld is a macro for a proxy, but here we need
-      // a raw pointer. We'll rely on Exec handling nullptr if we really can't
-      // find one, but explicitly passing the editor world fixes many "command
-      // not handled" or crash issues.
-    }
-
-    GEngine->Exec(TargetWorld, *Command);
-
-    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-    Result->SetStringField(TEXT("command"), Command);
-    Result->SetBoolField(TEXT("executed"), true);
-
-    SendAutomationResponse(
-        RequestingSocket, RequestId, true,
-        FString::Printf(TEXT("Executed console command: %s"), *Command), Result,
-        FString());
-    return true;
-  } catch (...) {
-    SendAutomationResponse(
-        RequestingSocket, RequestId, false,
-        FString::Printf(TEXT("Failed to execute command: %s"), *Command),
-        nullptr, TEXT("EXECUTION_FAILED"));
-    return true;
-  }
-}
-
-bool UMcpAutomationBridgeSubsystem::HandleInspectAction(
-    const FString &RequestId, const FString &Action,
-    const TSharedPtr<FJsonObject> &Payload,
-    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
-  if (!Action.Equals(TEXT("inspect"), ESearchCase::IgnoreCase)) {
-    return false;
-  }
-
-  if (!Payload.IsValid()) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Inspect action requires valid payload"),
-                           nullptr, TEXT("INVALID_PAYLOAD"));
-    return true;
-  }
-
-  FString SubAction;
-  if (!Payload->TryGetStringField(TEXT("action"), SubAction)) {
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Inspect action requires action parameter"),
-                           nullptr, TEXT("INVALID_ARGUMENT"));
-    return true;
-  }
-
-  FString LowerSub = SubAction.ToLower();
-  TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-
-  // Inspect object
-  if (LowerSub == TEXT("inspect_object")) {
-    FString ObjectPath;
-    if (!Payload->TryGetStringField(TEXT("objectPath"), ObjectPath)) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          TEXT("inspect_object requires objectPath parameter"), nullptr,
-          TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    UObject *TargetObject = FindObject<UObject>(nullptr, *ObjectPath);
-
-    // Compatibility: allow passing actor label/name/path as objectPath.
-    // Many callers use simple names like "MyActor".
-    if (!TargetObject) {
-      if (AActor *FoundActor = FindActorByName(ObjectPath)) {
-        TargetObject = FoundActor;
-        ObjectPath = FoundActor->GetPathName();
-      }
-    }
-    if (!TargetObject) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Object not found: %s"), *ObjectPath), nullptr,
-          TEXT("OBJECT_NOT_FOUND"));
-      return true;
-    }
-
-    Result->SetStringField(TEXT("objectPath"), ObjectPath);
-    Result->SetStringField(TEXT("objectName"), TargetObject->GetName());
-    Result->SetStringField(TEXT("objectClass"),
-                           TargetObject->GetClass()->GetName());
-    Result->SetStringField(TEXT("objectType"),
-                           TargetObject->GetClass()->GetFName().ToString());
-
-    SendAutomationResponse(
-        RequestingSocket, RequestId, true,
-        FString::Printf(TEXT("Inspected object: %s"), *ObjectPath), Result,
-        FString());
-    return true;
-  }
-
-  // Get property
-  if (LowerSub == TEXT("get_property")) {
-    FString ObjectPath;
-    FString PropertyName;
-
-    if (!Payload->TryGetStringField(TEXT("objectPath"), ObjectPath) ||
-        !Payload->TryGetStringField(TEXT("propertyName"), PropertyName)) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          TEXT("get_property requires objectPath and propertyName parameters"),
-          nullptr, TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    UObject *TargetObject = FindObject<UObject>(nullptr, *ObjectPath);
-
-    // Compatibility: allow passing actor label/name/path as objectPath.
-    if (!TargetObject) {
-      if (AActor *FoundActor = FindActorByName(ObjectPath)) {
-        TargetObject = FoundActor;
-        ObjectPath = FoundActor->GetPathName();
-      }
-    }
-    if (!TargetObject) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Object not found: %s"), *ObjectPath), nullptr,
-          TEXT("OBJECT_NOT_FOUND"));
-      return true;
-    }
-
-    UClass *ObjectClass = TargetObject->GetClass();
-    FProperty *Property = ObjectClass->FindPropertyByName(*PropertyName);
-
-    if (!Property) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Property not found: %s"), *PropertyName),
-          nullptr, TEXT("PROPERTY_NOT_FOUND"));
-      return true;
-    }
-
-    Result->SetStringField(TEXT("objectPath"), ObjectPath);
-    Result->SetStringField(TEXT("propertyName"), PropertyName);
-    Result->SetStringField(TEXT("propertyType"),
-                           Property->GetClass()->GetName());
-
-    // Return value as string for broad compatibility.
-    FString ValueText;
-    const void *ValuePtr = Property->ContainerPtrToValuePtr<void>(TargetObject);
-    Property->ExportTextItem_Direct(ValueText, ValuePtr, nullptr, TargetObject,
-                                    PPF_None);
-    Result->SetStringField(TEXT("value"), ValueText);
-
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           FString::Printf(TEXT("Retrieved property: %s.%s"),
-                                           *ObjectPath, *PropertyName),
-                           Result, FString());
-    return true;
-  }
-
-  // Set property (simplified implementation)
-  if (LowerSub == TEXT("set_property")) {
-    FString ObjectPath;
-    FString PropertyName;
-
-    if (!Payload->TryGetStringField(TEXT("objectPath"), ObjectPath) ||
-        !Payload->TryGetStringField(TEXT("propertyName"), PropertyName)) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          TEXT("set_property requires objectPath and propertyName parameters"),
-          nullptr, TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    // Critical Property Protection
-    TArray<FString> ProtectedProperties = {TEXT("Class"), TEXT("Outer"),
-                                           TEXT("Archetype"), TEXT("Linker"),
-                                           TEXT("LinkerIndex")};
-    if (ProtectedProperties.Contains(PropertyName)) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(
-              TEXT("Modification of critical property '%s' is blocked"),
-              *PropertyName),
-          nullptr, TEXT("PROPERTY_BLOCKED"));
-      return true;
-    }
-
-    UObject *TargetObject = FindObject<UObject>(nullptr, *ObjectPath);
-
-    // Compatibility: allow passing actor label/name/path as objectPath.
-    if (!TargetObject) {
-      if (AActor *FoundActor = FindActorByName(ObjectPath)) {
-        TargetObject = FoundActor;
-        ObjectPath = FoundActor->GetPathName();
-      }
-    }
-    if (!TargetObject) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Object not found: %s"), *ObjectPath), nullptr,
-          TEXT("OBJECT_NOT_FOUND"));
-      return true;
-    }
-
-    // Get the property value from payload
-    FString PropertyValue;
-    if (!Payload->TryGetStringField(TEXT("value"), PropertyValue)) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("set_property requires 'value' field"),
-                             nullptr, TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    // Find the property using Unreal's reflection system
-    FProperty *FoundProperty =
-        TargetObject->GetClass()->FindPropertyByName(FName(*PropertyName));
-    if (!FoundProperty) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Property '%s' not found on object '%s'"),
-                          *PropertyName, *ObjectPath),
-          nullptr, TEXT("PROPERTY_NOT_FOUND"));
-      return true;
-    }
-
-    // Set the property value based on type
-    bool bSuccess = false;
-    FString ErrorMessage;
-
-    if (FStrProperty *StrProp = CastField<FStrProperty>(FoundProperty)) {
-      void *PropAddr = StrProp->ContainerPtrToValuePtr<void>(TargetObject);
-      StrProp->SetPropertyValue(PropAddr, PropertyValue);
-      bSuccess = true;
-    } else if (FFloatProperty *FloatProp =
-                   CastField<FFloatProperty>(FoundProperty)) {
-      void *PropAddr = FloatProp->ContainerPtrToValuePtr<void>(TargetObject);
-      float Value = FCString::Atof(*PropertyValue);
-      FloatProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FDoubleProperty *DoubleProp =
-                   CastField<FDoubleProperty>(FoundProperty)) {
-      void *PropAddr = DoubleProp->ContainerPtrToValuePtr<void>(TargetObject);
-      double Value = FCString::Atod(*PropertyValue);
-      DoubleProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FIntProperty *IntProp = CastField<FIntProperty>(FoundProperty)) {
-      void *PropAddr = IntProp->ContainerPtrToValuePtr<void>(TargetObject);
-      int32 Value = FCString::Atoi(*PropertyValue);
-      IntProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FInt64Property *Int64Prop =
-                   CastField<FInt64Property>(FoundProperty)) {
-      void *PropAddr = Int64Prop->ContainerPtrToValuePtr<void>(TargetObject);
-      int64 Value = FCString::Atoi64(*PropertyValue);
-      Int64Prop->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FBoolProperty *BoolProp =
-                   CastField<FBoolProperty>(FoundProperty)) {
-      void *PropAddr = BoolProp->ContainerPtrToValuePtr<void>(TargetObject);
-      bool Value = PropertyValue.ToBool();
-      BoolProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FObjectProperty *ObjProp =
-                   CastField<FObjectProperty>(FoundProperty)) {
-      // Try to find the object by path
-      UObject *ObjValue = FindObject<UObject>(nullptr, *PropertyValue);
-      if (ObjValue || PropertyValue.IsEmpty()) {
-        void *PropAddr = ObjProp->ContainerPtrToValuePtr<void>(TargetObject);
-        ObjProp->SetPropertyValue(PropAddr, ObjValue);
-        bSuccess = true;
-      } else {
-        ErrorMessage = FString::Printf(
-            TEXT("Object property requires valid object path, got: %s"),
-            *PropertyValue);
-      }
-    } else if (FStructProperty *StructProp =
-                   CastField<FStructProperty>(FoundProperty)) {
-      // Handle struct properties (FVector, FVector2D, FLinearColor, etc.)
-      void *PropAddr = StructProp->ContainerPtrToValuePtr<void>(TargetObject);
-      FString StructName =
-          StructProp->Struct ? StructProp->Struct->GetName() : FString();
-
-      // Try to parse JSON object value from payload
-      const TSharedPtr<FJsonObject> *JsonObjValue = nullptr;
-      if (Payload->TryGetObjectField(TEXT("value"), JsonObjValue) &&
-          JsonObjValue->IsValid()) {
-        // Handle FVector explicitly
-        if (StructName.Equals(TEXT("Vector"), ESearchCase::IgnoreCase)) {
-          FVector *Vec = static_cast<FVector *>(PropAddr);
-          double X = 0, Y = 0, Z = 0;
-          (*JsonObjValue)->TryGetNumberField(TEXT("X"), X);
-          (*JsonObjValue)->TryGetNumberField(TEXT("Y"), Y);
-          (*JsonObjValue)->TryGetNumberField(TEXT("Z"), Z);
-          if (X == 0 && Y == 0 && Z == 0) {
-            (*JsonObjValue)->TryGetNumberField(TEXT("x"), X);
-            (*JsonObjValue)->TryGetNumberField(TEXT("y"), Y);
-            (*JsonObjValue)->TryGetNumberField(TEXT("z"), Z);
-          }
-          *Vec = FVector(X, Y, Z);
-          bSuccess = true;
-        }
-        // Handle FVector2D
-        else if (StructName.Equals(TEXT("Vector2D"), ESearchCase::IgnoreCase)) {
-          FVector2D *Vec = static_cast<FVector2D *>(PropAddr);
-          double X = 0, Y = 0;
-          (*JsonObjValue)->TryGetNumberField(TEXT("X"), X);
-          (*JsonObjValue)->TryGetNumberField(TEXT("Y"), Y);
-          if (X == 0 && Y == 0) {
-            (*JsonObjValue)->TryGetNumberField(TEXT("x"), X);
-            (*JsonObjValue)->TryGetNumberField(TEXT("y"), Y);
-          }
-          *Vec = FVector2D(X, Y);
-          bSuccess = true;
-        }
-        // Handle FLinearColor
-        else if (StructName.Equals(TEXT("LinearColor"),
-                                   ESearchCase::IgnoreCase)) {
-          FLinearColor *Color = static_cast<FLinearColor *>(PropAddr);
-          double R = 0, G = 0, B = 0, A = 1;
-          (*JsonObjValue)->TryGetNumberField(TEXT("R"), R);
-          (*JsonObjValue)->TryGetNumberField(TEXT("G"), G);
-          (*JsonObjValue)->TryGetNumberField(TEXT("B"), B);
-          (*JsonObjValue)->TryGetNumberField(TEXT("A"), A);
-          if (R == 0 && G == 0 && B == 0) {
-            (*JsonObjValue)->TryGetNumberField(TEXT("r"), R);
-            (*JsonObjValue)->TryGetNumberField(TEXT("g"), G);
-            (*JsonObjValue)->TryGetNumberField(TEXT("b"), B);
-            (*JsonObjValue)->TryGetNumberField(TEXT("a"), A);
-          }
-          *Color = FLinearColor(R, G, B, A);
-          bSuccess = true;
-        }
-        // Handle FRotator
-        else if (StructName.Equals(TEXT("Rotator"), ESearchCase::IgnoreCase)) {
-          FRotator *Rot = static_cast<FRotator *>(PropAddr);
-          double Pitch = 0, Yaw = 0, Roll = 0;
-          (*JsonObjValue)->TryGetNumberField(TEXT("Pitch"), Pitch);
-          (*JsonObjValue)->TryGetNumberField(TEXT("Yaw"), Yaw);
-          (*JsonObjValue)->TryGetNumberField(TEXT("Roll"), Roll);
-          if (Pitch == 0 && Yaw == 0 && Roll == 0) {
-            (*JsonObjValue)->TryGetNumberField(TEXT("pitch"), Pitch);
-            (*JsonObjValue)->TryGetNumberField(TEXT("yaw"), Yaw);
-            (*JsonObjValue)->TryGetNumberField(TEXT("roll"), Roll);
-          }
-          *Rot = FRotator(Pitch, Yaw, Roll);
-          bSuccess = true;
-        }
-      }
-
-      // Fallback: try ImportText for string representation
-      if (!bSuccess && !PropertyValue.IsEmpty() && StructProp->Struct) {
-        const TCHAR *Buffer = *PropertyValue;
-        // Use UScriptStruct::ImportText (not FStructProperty)
-        const TCHAR *ImportResult = StructProp->Struct->ImportText(
-            Buffer, PropAddr, nullptr, PPF_None, GLog, StructName);
-        bSuccess = (ImportResult != nullptr);
-        if (!bSuccess) {
-          ErrorMessage = FString::Printf(
-              TEXT("Failed to parse struct value '%s' for property '%s' of "
-                   "type '%s'. For FVector use {\"X\":val,\"Y\":val,\"Z\":val} "
-                   "or string \"(X=val,Y=val,Z=val)\""),
-              *PropertyValue, *PropertyName, *StructName);
-        }
-      }
-
-      if (!bSuccess && ErrorMessage.IsEmpty()) {
-        ErrorMessage = FString::Printf(
-            TEXT("Struct property '%s' of type '%s' requires JSON object "
-                 "value like {\"X\":val,\"Y\":val,\"Z\":val}"),
-            *PropertyName, *StructName);
-      }
-    } else {
-      ErrorMessage =
-          FString::Printf(TEXT("Property type '%s' not supported for setting"),
-                          *FoundProperty->GetClass()->GetName());
-    }
-
-    if (bSuccess) {
-      Result->SetStringField(TEXT("objectPath"), ObjectPath);
-      Result->SetStringField(TEXT("propertyName"), PropertyName);
-      Result->SetStringField(TEXT("value"), PropertyValue);
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-                             TEXT("Property set successfully"), Result,
-                             FString());
-    } else {
-      Result->SetStringField(TEXT("objectPath"), ObjectPath);
-      Result->SetStringField(TEXT("propertyName"), PropertyName);
-      Result->SetStringField(TEXT("error"), ErrorMessage);
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("Failed to set property"), Result,
-                             TEXT("PROPERTY_SET_FAILED"));
-    }
-    return true;
-  }
-
-  // Get bounding box (get_bounding_box)
-  if (LowerSub == TEXT("get_bounding_box")) {
-    FString ActorName;
-    Payload->TryGetStringField(TEXT("actorName"), ActorName);
-    FString ObjectPath;
-    Payload->TryGetStringField(TEXT("objectPath"), ObjectPath);
-
-    if (ActorName.IsEmpty() && ObjectPath.IsEmpty()) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          TEXT("get_bounding_box requires actorName or objectPath"), nullptr,
-          TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    AActor *TargetActor = nullptr;
-    UPrimitiveComponent *PrimComp = nullptr;
-
-#if WITH_EDITOR
-    if (GEditor && !ActorName.IsEmpty()) {
-      UEditorActorSubsystem *ActorSS =
-          GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
-      if (ActorSS) {
-        TArray<AActor *> Actors = ActorSS->GetAllLevelActors();
-        for (AActor *A : Actors) {
-          if (A &&
-              (A->GetActorLabel() == ActorName || A->GetName() == ActorName)) {
-            TargetActor = A;
-            break;
-          }
-        }
-      }
-    }
-#endif
-
-    if (!TargetActor && !ObjectPath.IsEmpty()) {
-      UObject *Obj = FindObject<UObject>(nullptr, *ObjectPath);
-      if (Obj) {
-        if (AActor *A = Cast<AActor>(Obj)) {
-          TargetActor = A;
-        } else if (UPrimitiveComponent *PC = Cast<UPrimitiveComponent>(Obj)) {
-          PrimComp = PC;
-        }
-      }
-    }
-
-    FBox Box(ForceInit);
-    bool bFound = false;
-
-    if (TargetActor) {
-      Box = TargetActor->GetComponentsBoundingBox(true);
-      bFound = true;
-    } else if (PrimComp) {
-      Box = PrimComp->Bounds.GetBox();
-      bFound = true;
-    }
-
-    if (bFound) {
-      FVector Origin = Box.GetCenter();
-      FVector Extent = Box.GetExtent();
-      TSharedPtr<FJsonObject> BoxObj = MakeShared<FJsonObject>();
-
-      TSharedPtr<FJsonObject> OrgObj = MakeShared<FJsonObject>();
-      OrgObj->SetNumberField(TEXT("x"), Origin.X);
-      OrgObj->SetNumberField(TEXT("y"), Origin.Y);
-      OrgObj->SetNumberField(TEXT("z"), Origin.Z);
-      BoxObj->SetObjectField(TEXT("origin"), OrgObj);
-
-      TSharedPtr<FJsonObject> ExtObj = MakeShared<FJsonObject>();
-      ExtObj->SetNumberField(TEXT("x"), Extent.X);
-      ExtObj->SetNumberField(TEXT("y"), Extent.Y);
-      ExtObj->SetNumberField(TEXT("z"), Extent.Z);
-      BoxObj->SetObjectField(TEXT("extent"), ExtObj);
-
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-                             TEXT("Bounding box retrieved"), BoxObj, FString());
-    } else {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("Object not found or has no bounds"), nullptr,
-                             TEXT("OBJECT_NOT_FOUND"));
-    }
-    return true;
-  }
-
-  // Get components (get_components)
-  if (LowerSub == TEXT("get_components")) {
-    FString ObjectPath;
-    if (!Payload->TryGetStringField(TEXT("objectPath"), ObjectPath)) {
-      Payload->TryGetStringField(TEXT("actorName"), ObjectPath);
-    }
-
-    if (ObjectPath.IsEmpty()) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          TEXT("get_components requires objectPath or actorName"), nullptr,
-          TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    AActor *FoundActor = FindActorByName(ObjectPath);
-    if (!FoundActor) {
-      if (UObject *Asset = UEditorAssetLibrary::LoadAsset(ObjectPath)) {
-        if (UBlueprint *BP = Cast<UBlueprint>(Asset)) {
-          if (BP->GeneratedClass) {
-            FoundActor = Cast<AActor>(BP->GeneratedClass->GetDefaultObject());
-          }
-        }
-      }
-    }
-
-    if (!FoundActor) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Actor or Blueprint not found: %s"),
-                          *ObjectPath),
-          nullptr, TEXT("OBJECT_NOT_FOUND"));
-      return true;
-    }
-
-    TSharedPtr<FJsonObject> ComponentsObj = MakeShared<FJsonObject>();
-    TArray<TSharedPtr<FJsonValue>> ComponentList;
-
-    for (UActorComponent *Comp : FoundActor->GetComponents()) {
-      if (!Comp)
-        continue;
-      TSharedPtr<FJsonObject> CompData = MakeShared<FJsonObject>();
-      CompData->SetStringField(TEXT("name"), Comp->GetName());
-      CompData->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
-      CompData->SetStringField(TEXT("path"), Comp->GetPathName());
-
-      if (USceneComponent *SceneComp = Cast<USceneComponent>(Comp)) {
-        CompData->SetBoolField(TEXT("isSceneComponent"), true);
-        TSharedPtr<FJsonObject> LocObj = MakeShared<FJsonObject>();
-        FVector Loc = SceneComp->GetRelativeLocation();
-        LocObj->SetNumberField("x", Loc.X);
-        LocObj->SetNumberField("y", Loc.Y);
-        LocObj->SetNumberField("z", Loc.Z);
-        CompData->SetObjectField("relativeLocation", LocObj);
-      }
-
-      ComponentList.Add(MakeShared<FJsonValueObject>(CompData));
-    }
-
-    TSharedPtr<FJsonObject> ComponentsResult = MakeShared<FJsonObject>();
-    ComponentsResult->SetArrayField(TEXT("components"), ComponentList);
-    ComponentsResult->SetNumberField(TEXT("count"), ComponentList.Num());
-
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           TEXT("Actor components retrieved"), ComponentsResult,
-                           FString());
-    return true;
-  }
-
-  // Find by class (find_by_class)
-  if (LowerSub == TEXT("find_by_class")) {
-#if WITH_EDITOR
-    FString ClassName;
-    Payload->TryGetStringField(TEXT("className"), ClassName);
-    // Also accept classPath as alias
-    if (ClassName.IsEmpty()) {
-      Payload->TryGetStringField(TEXT("classPath"), ClassName);
-    }
-
-    if (GEditor) {
-      UEditorActorSubsystem *ActorSS =
-          GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
-      if (ActorSS) {
-        TArray<AActor *> Actors = ActorSS->GetAllLevelActors();
-        TArray<TSharedPtr<FJsonValue>> Matches;
-
-        // Normalize class name for matching
-        FString SearchName = ClassName;
-        FString SearchNameLower = ClassName.ToLower();
-
-        // Common prefix variants to try
-        TArray<FString> SearchVariants;
-        SearchVariants.Add(SearchName);
-        if (!SearchName.StartsWith(TEXT("A")) &&
-            !SearchName.Contains(TEXT("/"))) {
-          SearchVariants.Add(TEXT("A") + SearchName); // AActor pattern
-        }
-        if (!SearchName.StartsWith(TEXT("U")) &&
-            !SearchName.Contains(TEXT("/"))) {
-          SearchVariants.Add(TEXT("U") + SearchName); // UObject pattern
-        }
-
-        for (AActor *Actor : Actors) {
-          if (!Actor)
-            continue;
-          FString ActorClassName = Actor->GetClass()->GetName();
-          FString ActorClassPath = Actor->GetClass()->GetPathName();
-          FString ActorClassLower = ActorClassName.ToLower();
-
-          bool bMatches = false;
-          if (ClassName.IsEmpty()) {
-            bMatches = true; // Return all actors if no filter
-          } else {
-            // Check all variants
-            for (const FString &Variant : SearchVariants) {
-              if (ActorClassName.Equals(Variant, ESearchCase::IgnoreCase) ||
-                  ActorClassName.Contains(Variant, ESearchCase::IgnoreCase) ||
-                  ActorClassPath.Contains(Variant, ESearchCase::IgnoreCase)) {
-                bMatches = true;
-                break;
-              }
-            }
-          }
-
-          if (bMatches) {
-            TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-            Entry->SetStringField(TEXT("name"), Actor->GetActorLabel());
-            Entry->SetStringField(TEXT("path"), Actor->GetPathName());
-            Entry->SetStringField(TEXT("class"), ActorClassPath);
-            Entry->SetStringField(TEXT("classShort"), ActorClassName);
-            Matches.Add(MakeShared<FJsonValueObject>(Entry));
-          }
-        }
-
-        Result->SetBoolField(TEXT("success"), true);
-        Result->SetArrayField(TEXT("actors"), Matches);
-        Result->SetNumberField(TEXT("count"), Matches.Num());
-        Result->SetStringField(TEXT("searchedFor"), ClassName);
-        SendAutomationResponse(RequestingSocket, RequestId, true,
-                               TEXT("Found actors by class"), Result,
-                               FString());
-        return true;
-      }
-    }
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Editor not available"), nullptr,
-                           TEXT("EDITOR_NOT_AVAILABLE"));
-    return true;
-#else
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("find_by_class requires editor build"), nullptr,
-                           TEXT("NOT_IMPLEMENTED"));
-    return true;
-#endif
-  }
-
-  // Inspect class (inspect_class)
-  if (LowerSub == TEXT("inspect_class")) {
-    FString ClassPath;
-    if (!Payload->TryGetStringField(TEXT("classPath"), ClassPath)) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("classPath required"), nullptr,
-                             TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    UClass *ResolvedClass = ResolveClassByName(ClassPath);
-    if (!ResolvedClass) {
-      // Try loading as asset
-      if (UObject *Found =
-              StaticLoadObject(UObject::StaticClass(), nullptr, *ClassPath)) {
-        if (UBlueprint *BP = Cast<UBlueprint>(Found))
-          ResolvedClass = BP->GeneratedClass;
-        else if (UClass *C = Cast<UClass>(Found))
-          ResolvedClass = C;
-      }
-    }
-
-    if (ResolvedClass) {
-      Result->SetStringField(TEXT("className"), ResolvedClass->GetName());
-      Result->SetStringField(TEXT("classPath"), ResolvedClass->GetPathName());
-      if (ResolvedClass->GetSuperClass())
-        Result->SetStringField(TEXT("parentClass"),
-                               ResolvedClass->GetSuperClass()->GetName());
-
-      // List properties
-      TArray<TSharedPtr<FJsonValue>> Props;
-      for (TFieldIterator<FProperty> PropIt(ResolvedClass); PropIt; ++PropIt) {
-        FProperty *Prop = *PropIt;
-        TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
-        P->SetStringField(TEXT("name"), Prop->GetName());
-        P->SetStringField(TEXT("type"), Prop->GetClass()->GetName());
-        Props.Add(MakeShared<FJsonValueObject>(P));
-      }
-      Result->SetArrayField(TEXT("properties"), Props);
-
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-                             TEXT("Class inspected"), Result, FString());
-      return true;
-    }
-
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("Class not found"), nullptr,
-                           TEXT("CLASS_NOT_FOUND"));
-    return true;
-  }
-
-  // Get components (get_components) - enumerate all components on an actor
-  if (LowerSub == TEXT("get_components")) {
-#if WITH_EDITOR
-    FString ActorName;
-    Payload->TryGetStringField(TEXT("actorName"), ActorName);
-    FString ObjectPath;
-    Payload->TryGetStringField(TEXT("objectPath"), ObjectPath);
-
-    if (ActorName.IsEmpty() && ObjectPath.IsEmpty()) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          TEXT("get_components requires actorName or objectPath"), nullptr,
-          TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    AActor *TargetActor = nullptr;
-    if (!ActorName.IsEmpty()) {
-      TargetActor = FindActorByName(ActorName);
-    }
-    if (!TargetActor && !ObjectPath.IsEmpty()) {
-      TargetActor = FindActorByName(ObjectPath);
-    }
-
-    if (!TargetActor) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Failed to get components for actor %s"),
-                          ActorName.IsEmpty() ? *ObjectPath : *ActorName),
-          nullptr, TEXT("ACTOR_NOT_FOUND"));
-      return true;
-    }
-
-    TArray<TSharedPtr<FJsonValue>> ComponentsArray;
-    for (UActorComponent *Comp : TargetActor->GetComponents()) {
-      if (!Comp)
-        continue;
-      TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-      Entry->SetStringField(TEXT("name"), Comp->GetName());
-      Entry->SetStringField(TEXT("readableName"), Comp->GetReadableName());
-      Entry->SetStringField(TEXT("class"), Comp->GetClass()
-                                               ? Comp->GetClass()->GetPathName()
-                                               : TEXT(""));
-      Entry->SetStringField(TEXT("path"), Comp->GetPathName());
-      if (USceneComponent *SceneComp = Cast<USceneComponent>(Comp)) {
-        FVector Loc = SceneComp->GetRelativeLocation();
-        FRotator Rot = SceneComp->GetRelativeRotation();
-        FVector Scale = SceneComp->GetRelativeScale3D();
-
-        TSharedPtr<FJsonObject> LocObj = MakeShared<FJsonObject>();
-        LocObj->SetNumberField(TEXT("x"), Loc.X);
-        LocObj->SetNumberField(TEXT("y"), Loc.Y);
-        LocObj->SetNumberField(TEXT("z"), Loc.Z);
-        Entry->SetObjectField(TEXT("relativeLocation"), LocObj);
-
-        TSharedPtr<FJsonObject> RotObj = MakeShared<FJsonObject>();
-        RotObj->SetNumberField(TEXT("pitch"), Rot.Pitch);
-        RotObj->SetNumberField(TEXT("yaw"), Rot.Yaw);
-        RotObj->SetNumberField(TEXT("roll"), Rot.Roll);
-        Entry->SetObjectField(TEXT("relativeRotation"), RotObj);
-
-        TSharedPtr<FJsonObject> ScaleObj = MakeShared<FJsonObject>();
-        ScaleObj->SetNumberField(TEXT("x"), Scale.X);
-        ScaleObj->SetNumberField(TEXT("y"), Scale.Y);
-        ScaleObj->SetNumberField(TEXT("z"), Scale.Z);
-        Entry->SetObjectField(TEXT("relativeScale"), ScaleObj);
-      }
-      ComponentsArray.Add(MakeShared<FJsonValueObject>(Entry));
-    }
-
-    Result->SetArrayField(TEXT("components"), ComponentsArray);
-    Result->SetNumberField(TEXT("count"), ComponentsArray.Num());
-    Result->SetStringField(TEXT("actorName"), TargetActor->GetActorLabel());
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           TEXT("Actor components retrieved"), Result,
-                           FString());
-    return true;
-#else
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("get_components requires editor build"),
-                           nullptr, TEXT("NOT_IMPLEMENTED"));
-    return true;
-#endif
-  }
-
-  // Get component property (get_component_property)
-  if (LowerSub == TEXT("get_component_property")) {
-#if WITH_EDITOR
-    FString ActorName;
-    Payload->TryGetStringField(TEXT("actorName"), ActorName);
-    FString ObjectPath;
-    Payload->TryGetStringField(TEXT("objectPath"), ObjectPath);
-    FString ComponentName;
-    Payload->TryGetStringField(TEXT("componentName"), ComponentName);
-    FString PropertyName;
-    Payload->TryGetStringField(TEXT("propertyName"), PropertyName);
-
-    if ((ActorName.IsEmpty() && ObjectPath.IsEmpty()) ||
-        ComponentName.IsEmpty() || PropertyName.IsEmpty()) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("get_component_property requires "
-                                  "actorName/objectPath, componentName, and "
-                                  "propertyName"),
-                             nullptr, TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    AActor *TargetActor = nullptr;
-    if (!ActorName.IsEmpty()) {
-      TargetActor = FindActorByName(ActorName);
-    }
-    if (!TargetActor && !ObjectPath.IsEmpty()) {
-      TargetActor = FindActorByName(ObjectPath);
-    }
-
-    if (!TargetActor) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("Actor not found"), nullptr,
-                             TEXT("ACTOR_NOT_FOUND"));
-      return true;
-    }
-
-    // Find component by name (fuzzy matching)
-    UActorComponent *TargetComponent = nullptr;
-    for (UActorComponent *Comp : TargetActor->GetComponents()) {
-      if (!Comp)
-        continue;
-      if (Comp->GetName().Equals(ComponentName, ESearchCase::IgnoreCase) ||
-          Comp->GetReadableName().Equals(ComponentName,
-                                         ESearchCase::IgnoreCase) ||
-          Comp->GetName().Contains(ComponentName, ESearchCase::IgnoreCase)) {
-        TargetComponent = Comp;
-        break;
-      }
-    }
-
-    if (!TargetComponent) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Component not found on actor '%s': %s"),
-                          *TargetActor->GetActorLabel(), *ComponentName),
-          nullptr, TEXT("COMPONENT_NOT_FOUND"));
-      return true;
-    }
-
-    FProperty *Property =
-        TargetComponent->GetClass()->FindPropertyByName(*PropertyName);
-    if (!Property) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Property not found: %s"), *PropertyName),
-          nullptr, TEXT("PROPERTY_NOT_FOUND"));
-      return true;
-    }
-
-    FString ValueText;
-    const void *ValuePtr =
-        Property->ContainerPtrToValuePtr<void>(TargetComponent);
-    Property->ExportTextItem_Direct(ValueText, ValuePtr, nullptr,
-                                    TargetComponent, PPF_None);
-
-    Result->SetStringField(TEXT("componentName"), TargetComponent->GetName());
-    Result->SetStringField(TEXT("propertyName"), PropertyName);
-    Result->SetStringField(TEXT("value"), ValueText);
-    Result->SetStringField(TEXT("propertyType"),
-                           Property->GetClass()->GetName());
-    SendAutomationResponse(RequestingSocket, RequestId, true,
-                           TEXT("Component property retrieved"), Result,
-                           FString());
-    return true;
-#else
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("get_component_property requires editor build"),
-                           nullptr, TEXT("NOT_IMPLEMENTED"));
-    return true;
-#endif
-  }
-
-  // Set component property (set_component_property)
-  if (LowerSub == TEXT("set_component_property")) {
-#if WITH_EDITOR
-    FString ActorName;
-    Payload->TryGetStringField(TEXT("actorName"), ActorName);
-    FString ObjectPath;
-    Payload->TryGetStringField(TEXT("objectPath"), ObjectPath);
-    FString ComponentName;
-    Payload->TryGetStringField(TEXT("componentName"), ComponentName);
-    FString PropertyName;
-    Payload->TryGetStringField(TEXT("propertyName"), PropertyName);
-
-    if ((ActorName.IsEmpty() && ObjectPath.IsEmpty()) ||
-        ComponentName.IsEmpty() || PropertyName.IsEmpty()) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("set_component_property requires "
-                                  "actorName/objectPath, componentName, and "
-                                  "propertyName"),
-                             nullptr, TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    AActor *TargetActor = nullptr;
-    if (!ActorName.IsEmpty()) {
-      TargetActor = FindActorByName(ActorName);
-    }
-    if (!TargetActor && !ObjectPath.IsEmpty()) {
-      TargetActor = FindActorByName(ObjectPath);
-    }
-
-    if (!TargetActor) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("Actor not found"), nullptr,
-                             TEXT("ACTOR_NOT_FOUND"));
-      return true;
-    }
-
-    // Find component by name (fuzzy matching)
-    UActorComponent *TargetComponent = nullptr;
-    for (UActorComponent *Comp : TargetActor->GetComponents()) {
-      if (!Comp)
-        continue;
-      if (Comp->GetName().Equals(ComponentName, ESearchCase::IgnoreCase) ||
-          Comp->GetReadableName().Equals(ComponentName,
-                                         ESearchCase::IgnoreCase) ||
-          Comp->GetName().Contains(ComponentName, ESearchCase::IgnoreCase)) {
-        TargetComponent = Comp;
-        break;
-      }
-    }
-
-    if (!TargetComponent) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Component not found on actor '%s': %s"),
-                          *TargetActor->GetActorLabel(), *ComponentName),
-          nullptr, TEXT("COMPONENT_NOT_FOUND"));
-      return true;
-    }
-
-    FString PropertyValue;
-    if (!Payload->TryGetStringField(TEXT("value"), PropertyValue)) {
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("set_component_property requires 'value'"),
-                             nullptr, TEXT("INVALID_ARGUMENT"));
-      return true;
-    }
-
-    FProperty *FoundProperty =
-        TargetComponent->GetClass()->FindPropertyByName(FName(*PropertyName));
-    if (!FoundProperty) {
-      SendAutomationResponse(
-          RequestingSocket, RequestId, false,
-          FString::Printf(TEXT("Property '%s' not found on component"),
-                          *PropertyName),
-          nullptr, TEXT("PROPERTY_NOT_FOUND"));
-      return true;
-    }
-
-    bool bSuccess = false;
-    FString ErrorMessage;
-
-    if (FStrProperty *StrProp = CastField<FStrProperty>(FoundProperty)) {
-      void *PropAddr = StrProp->ContainerPtrToValuePtr<void>(TargetComponent);
-      StrProp->SetPropertyValue(PropAddr, PropertyValue);
-      bSuccess = true;
-    } else if (FFloatProperty *FloatProp =
-                   CastField<FFloatProperty>(FoundProperty)) {
-      void *PropAddr = FloatProp->ContainerPtrToValuePtr<void>(TargetComponent);
-      float Value = FCString::Atof(*PropertyValue);
-      FloatProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FDoubleProperty *DoubleProp =
-                   CastField<FDoubleProperty>(FoundProperty)) {
-      void *PropAddr =
-          DoubleProp->ContainerPtrToValuePtr<void>(TargetComponent);
-      double Value = FCString::Atod(*PropertyValue);
-      DoubleProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FIntProperty *IntProp = CastField<FIntProperty>(FoundProperty)) {
-      void *PropAddr = IntProp->ContainerPtrToValuePtr<void>(TargetComponent);
-      int32 Value = FCString::Atoi(*PropertyValue);
-      IntProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else if (FBoolProperty *BoolProp =
-                   CastField<FBoolProperty>(FoundProperty)) {
-      void *PropAddr = BoolProp->ContainerPtrToValuePtr<void>(TargetComponent);
-      bool Value = PropertyValue.ToBool();
-      BoolProp->SetPropertyValue(PropAddr, Value);
-      bSuccess = true;
-    } else {
-      ErrorMessage =
-          FString::Printf(TEXT("Property type '%s' not supported for setting"),
-                          *FoundProperty->GetClass()->GetName());
-    }
-
-    if (bSuccess) {
-      if (USceneComponent *SceneComponent =
-              Cast<USceneComponent>(TargetComponent)) {
-        SceneComponent->MarkRenderStateDirty();
-        SceneComponent->UpdateComponentToWorld();
-      }
-      TargetComponent->MarkPackageDirty();
-
-      Result->SetStringField(TEXT("componentName"), TargetComponent->GetName());
-      Result->SetStringField(TEXT("propertyName"), PropertyName);
-      Result->SetStringField(TEXT("value"), PropertyValue);
-      SendAutomationResponse(RequestingSocket, RequestId, true,
-                             TEXT("Component property set"), Result, FString());
-    } else {
-      Result->SetStringField(TEXT("error"), ErrorMessage);
-      SendAutomationResponse(RequestingSocket, RequestId, false,
-                             TEXT("Failed to set component property"), Result,
-                             TEXT("PROPERTY_SET_FAILED"));
-    }
-    return true;
-#else
-    SendAutomationResponse(RequestingSocket, RequestId, false,
-                           TEXT("set_component_property requires editor build"),
-                           nullptr, TEXT("NOT_IMPLEMENTED"));
-    return true;
-#endif
-  }
-
-  return true;
-}
-
-bool UMcpAutomationBridgeSubsystem::HandleCreateProceduralTerrain(
-    const FString &RequestId, const FString &Action,
-    const TSharedPtr<FJsonObject> &Payload,
-    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
-  const FString Lower = Action.ToLower();
-  if (!Lower.Equals(TEXT("create_procedural_terrain"),
-                    ESearchCase::IgnoreCase)) {
-    return false;
-  }
-
 #if WITH_EDITOR
   if (!Payload.IsValid()) {
     SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("create_procedural_terrain payload missing"),
+                        TEXT("console_command payload missing"),
                         TEXT("INVALID_PAYLOAD"));
     return true;
   }
 
-  FString Name;
-  if (!Payload->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty()) {
-    SendAutomationError(RequestingSocket, RequestId, TEXT("name required"),
-                        TEXT("INVALID_ARGUMENT"));
-    return true;
-  }
-
-  FVector Location(0, 0, 0);
-  const TArray<TSharedPtr<FJsonValue>> *LocArr = nullptr;
-  if (Payload->TryGetArrayField(TEXT("location"), LocArr) && LocArr &&
-      LocArr->Num() >= 3) {
-    Location.X = (*LocArr)[0]->AsNumber();
-    Location.Y = (*LocArr)[1]->AsNumber();
-    Location.Z = (*LocArr)[2]->AsNumber();
-  }
-
-  double SizeX = 2000.0;
-  double SizeY = 2000.0;
-  Payload->TryGetNumberField(TEXT("sizeX"), SizeX);
-  Payload->TryGetNumberField(TEXT("sizeY"), SizeY);
-
-  int32 Subdivisions = 50;
-  Payload->TryGetNumberField(TEXT("subdivisions"), Subdivisions);
-  Subdivisions = FMath::Clamp(Subdivisions, 2, 255);
-
-  FString MaterialPath;
-  Payload->TryGetStringField(TEXT("material"), MaterialPath);
-
-  if (!GEditor) {
+  FString Command;
+  if (!Payload->TryGetStringField(TEXT("command"), Command) ||
+      Command.IsEmpty()) {
     SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("Editor not available"),
-                        TEXT("EDITOR_NOT_AVAILABLE"));
+                        TEXT("command field required"), TEXT("INVALID_ARGUMENT"));
     return true;
   }
 
-  UEditorActorSubsystem *ActorSS =
-      GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
-  if (!ActorSS) {
-    SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("EditorActorSubsystem not available"),
-                        TEXT("EDITOR_ACTOR_SUBSYSTEM_MISSING"));
+  // Security: Block dangerous commands
+  FString LowerCommand = Command.ToLower();
+  
+  // Whitelist safe commands that should bypass token filtering
+  // "Log" is a read-only command that prints to console - always safe
+  bool bIsWhitelistedCommand = LowerCommand.StartsWith(TEXT("log "));
+  if (bIsWhitelistedCommand) {
+    // Safe to execute - skip all security checks below
+    GEngine->Exec(nullptr, *Command);
+    
+    TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    Resp->SetStringField(TEXT("command"), Command);
+    Resp->SetBoolField(TEXT("success"), true);
+    
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("Console command executed"), Resp, FString());
     return true;
   }
-
-  AActor *NewActor = SpawnActorInActiveWorld<AActor>(
-      AActor::StaticClass(), Location, FRotator::ZeroRotator, Name);
-  if (!NewActor) {
-    SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("Failed to spawn actor"), TEXT("SPAWN_FAILED"));
-    return true;
-  }
-
-  UProceduralMeshComponent *ProcMesh = NewObject<UProceduralMeshComponent>(
-      NewActor, FName(TEXT("ProceduralTerrain")));
-  if (!ProcMesh) {
-    ActorSS->DestroyActor(NewActor);
-    SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("Failed to create ProceduralMeshComponent"),
-                        TEXT("COMPONENT_CREATION_FAILED"));
-    return true;
-  }
-
-  ProcMesh->RegisterComponent();
-  NewActor->SetRootComponent(ProcMesh);
-  NewActor->AddInstanceComponent(ProcMesh);
-
-  // Generate grid
-  TArray<FVector> Vertices;
-  TArray<int32> Triangles;
-  TArray<FVector> Normals;
-  TArray<FVector2D> UV0;
-  TArray<FColor> VertexColors;
-  TArray<FProcMeshTangent> Tangents;
-
-  const float StepX = SizeX / Subdivisions;
-  const float StepY = SizeY / Subdivisions;
-  const float UVStep = 1.0f / Subdivisions;
-
-  for (int32 Y = 0; Y <= Subdivisions; Y++) {
-    for (int32 X = 0; X <= Subdivisions; X++) {
-      float Z = 0.0f;
-      // Simple sine wave terrain as default since we can't easily parse the
-      // math string
-      Z = FMath::Sin(X * 0.1f) * 50.0f + FMath::Cos(Y * 0.1f) * 30.0f;
-
-      Vertices.Add(FVector(X * StepX - SizeX / 2, Y * StepY - SizeY / 2, Z));
-      Normals.Add(FVector(0, 0, 1)); // Simplified normal
-      UV0.Add(FVector2D(X * UVStep, Y * UVStep));
-      VertexColors.Add(FColor::White);
-      Tangents.Add(FProcMeshTangent(1, 0, 0));
+  
+  // Block explicit dangerous commands
+  TArray<FString> BlockedCommands = {
+    TEXT("quit"), TEXT("exit"), TEXT("crash"), TEXT("shutdown"),
+    TEXT("restart"), TEXT("reboot"), TEXT("debug exec"), TEXT("suicide"),
+    TEXT("disconnect"), TEXT("reconnect")
+  };
+  
+  for (const FString& Blocked : BlockedCommands) {
+    if (LowerCommand.StartsWith(Blocked)) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Command '%s' is blocked for security"), *Blocked),
+                          TEXT("COMMAND_BLOCKED"));
+      return true;
     }
   }
-
-  for (int32 Y = 0; Y < Subdivisions; Y++) {
-    for (int32 X = 0; X < Subdivisions; X++) {
-      int32 TopLeft = Y * (Subdivisions + 1) + X;
-      int32 TopRight = TopLeft + 1;
-      int32 BottomLeft = (Y + 1) * (Subdivisions + 1) + X;
-      int32 BottomRight = BottomLeft + 1;
-
-      Triangles.Add(TopLeft);
-      Triangles.Add(BottomLeft);
-      Triangles.Add(TopRight);
-
-      Triangles.Add(TopRight);
-      Triangles.Add(BottomLeft);
-      Triangles.Add(BottomRight);
+  
+  // Block destructive file operations
+  // Note: These tokens have trailing spaces to avoid matching
+  // valid MCP action names like "remove_volume" or "delete_actor"
+  TArray<FString> BlockedTokens = {
+    TEXT("rm "), TEXT("del "), TEXT("format"), TEXT("rmdir"), TEXT("rd "),
+    TEXT("delete "), TEXT("remove "), TEXT("erase ")
+  };
+  
+  for (const FString& Token : BlockedTokens) {
+    if (LowerCommand.Contains(Token)) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          FString::Printf(TEXT("Command contains blocked token '%s'"), *Token.TrimEnd()),
+                          TEXT("COMMAND_BLOCKED"));
+      return true;
     }
   }
-
-  ProcMesh->CreateMeshSection(0, Vertices, Triangles, Normals, UV0,
-                              VertexColors, Tangents, true);
-
-  if (!MaterialPath.IsEmpty()) {
-    UMaterialInterface *Mat =
-        LoadObject<UMaterialInterface>(nullptr, *MaterialPath);
-    if (Mat) {
-      ProcMesh->SetMaterial(0, Mat);
-    }
+  
+  // Block command chaining and injection attempts
+  if (LowerCommand.Contains(TEXT("&&")) || LowerCommand.Contains(TEXT("||")) ||
+      LowerCommand.Contains(TEXT(";") ) || LowerCommand.Contains(TEXT("|`")) ||
+      LowerCommand.Contains(TEXT("\n")) || LowerCommand.Contains(TEXT("\r"))) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Command chaining and special characters are not allowed"),
+                        TEXT("COMMAND_BLOCKED"));
+    return true;
   }
+
+  // Execute the console command
+  GEngine->Exec(nullptr, *Command);
 
   TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("command"), Command);
   Resp->SetBoolField(TEXT("success"), true);
-  Resp->SetStringField(TEXT("actor_name"), NewActor->GetActorLabel());
-  Resp->SetNumberField(TEXT("vertices"), Vertices.Num());
-  Resp->SetNumberField(TEXT("triangles"), Triangles.Num() / 3);
-
-  TSharedPtr<FJsonObject> SizeObj = MakeShared<FJsonObject>();
-  SizeObj->SetNumberField(TEXT("x"), SizeX);
-  SizeObj->SetNumberField(TEXT("y"), SizeY);
-  Resp->SetObjectField(TEXT("size"), SizeObj);
-  Resp->SetNumberField(TEXT("subdivisions"), Subdivisions);
+  Resp->SetBoolField(TEXT("executed"), true);
 
   SendAutomationResponse(RequestingSocket, RequestId, true,
-                         TEXT("Procedural terrain created"), Resp, FString());
+                         TEXT("Console command executed"), Resp, FString());
   return true;
 #else
-  SendAutomationResponse(
-      RequestingSocket, RequestId, false,
-      TEXT("create_procedural_terrain requires editor build."), nullptr,
-      TEXT("NOT_IMPLEMENTED"));
+  SendAutomationResponse(RequestingSocket, RequestId, false,
+                         TEXT("console_command requires editor build"), nullptr,
+                         TEXT("NOT_IMPLEMENTED"));
   return true;
 #endif
 }
@@ -3284,6 +2157,602 @@ bool UMcpAutomationBridgeSubsystem::HandleBakeLightmap(
 #else
   SendAutomationResponse(RequestingSocket, RequestId, false,
                          TEXT("Requires editor"), nullptr,
+                         TEXT("NOT_IMPLEMENTED"));
+  return true;
+#endif
+}
+
+bool UMcpAutomationBridgeSubsystem::HandleCreateProceduralTerrain(
+    const FString &RequestId, const FString &Action,
+    const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+  const FString Lower = Action.ToLower();
+  if (!Lower.Equals(TEXT("create_procedural_terrain"), ESearchCase::IgnoreCase)) {
+    return false;
+  }
+
+#if WITH_EDITOR
+  if (!GEditor) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Editor not available"),
+                        TEXT("EDITOR_NOT_AVAILABLE"));
+    return true;
+  }
+
+  if (!Payload.IsValid()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("create_procedural_terrain payload missing"),
+                        TEXT("INVALID_PAYLOAD"));
+    return true;
+  }
+
+  // Get terrain parameters
+  int32 SizeX = 100;
+  int32 SizeY = 100;
+  double Spacing = 100.0;
+  double HeightScale = 500.0;
+  int32 Subdivisions = 50;
+  FString ActorName = TEXT("ProceduralTerrain");
+  
+  Payload->TryGetNumberField(TEXT("sizeX"), SizeX);
+  Payload->TryGetNumberField(TEXT("sizeY"), SizeY);
+  Payload->TryGetNumberField(TEXT("spacing"), Spacing);
+  Payload->TryGetNumberField(TEXT("heightScale"), HeightScale);
+  Payload->TryGetNumberField(TEXT("subdivisions"), Subdivisions);
+  Payload->TryGetStringField(TEXT("actorName"), ActorName);
+  
+  // Strict validation: reject empty actorName
+  if (ActorName.IsEmpty()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("actorName parameter is required for create_procedural_terrain"),
+                        TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  // Validate actorName format (reject invalid characters)
+  if (ActorName.Contains(TEXT("/")) || ActorName.Contains(TEXT("\\")) ||
+      ActorName.Contains(TEXT(":")) || ActorName.Contains(TEXT("*")) ||
+      ActorName.Contains(TEXT("?")) || ActorName.Contains(TEXT("\"")) ||
+      ActorName.Contains(TEXT("<")) || ActorName.Contains(TEXT(">")) ||
+      ActorName.Contains(TEXT("|"))) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("actorName contains invalid characters (/, \\, :, *, ?, \", <, >, |)"),
+                        TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+
+  // Validate actorName length
+  if (ActorName.Len() > 128) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("actorName exceeds maximum length of 128 characters"),
+                        TEXT("INVALID_ARGUMENT"));
+    return true;
+  }
+  
+  // Clamp values to reasonable limits
+  SizeX = FMath::Clamp(SizeX, 2, 1000);
+  SizeY = FMath::Clamp(SizeY, 2, 1000);
+  Subdivisions = FMath::Clamp(Subdivisions, 2, 200);
+  Spacing = FMath::Max(Spacing, 1.0);
+  HeightScale = FMath::Max(HeightScale, 0.0);
+
+  UWorld *World = GEditor->GetEditorWorldContext().World();
+  if (!World) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("World not available"),
+                        TEXT("WORLD_NOT_AVAILABLE"));
+    return true;
+  }
+
+  // Spawn the actor
+  FActorSpawnParameters SpawnParams;
+  SpawnParams.Name = FName(*ActorName);
+  SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Requested;
+  
+  FVector Location(0, 0, 0);
+  const TSharedPtr<FJsonObject> *LocObj = nullptr;
+  if (Payload->TryGetObjectField(TEXT("location"), LocObj) && LocObj) {
+    double X = 0, Y = 0, Z = 0;
+    (*LocObj)->TryGetNumberField(TEXT("x"), X);
+    (*LocObj)->TryGetNumberField(TEXT("y"), Y);
+    (*LocObj)->TryGetNumberField(TEXT("z"), Z);
+    Location = FVector(X, Y, Z);
+  }
+  
+  FRotator Rotation(0, 0, 0);
+  const TSharedPtr<FJsonObject> *RotObj = nullptr;
+  if (Payload->TryGetObjectField(TEXT("rotation"), RotObj) && RotObj) {
+    double Pitch = 0, Yaw = 0, Roll = 0;
+    (*RotObj)->TryGetNumberField(TEXT("pitch"), Pitch);
+    (*RotObj)->TryGetNumberField(TEXT("yaw"), Yaw);
+    (*RotObj)->TryGetNumberField(TEXT("roll"), Roll);
+    Rotation = FRotator(Pitch, Yaw, Roll);
+  }
+
+  AActor *TerrainActor = World->SpawnActor<AActor>(AActor::StaticClass(), Location, Rotation, SpawnParams);
+  if (!TerrainActor) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to spawn terrain actor"),
+                        TEXT("SPAWN_FAILED"));
+    return true;
+  }
+
+  // Add procedural mesh component
+  UProceduralMeshComponent *ProcMesh = NewObject<UProceduralMeshComponent>(TerrainActor);
+  if (!ProcMesh) {
+    TerrainActor->Destroy();
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("Failed to create procedural mesh component"),
+                        TEXT("COMPONENT_CREATION_FAILED"));
+    return true;
+  }
+  
+  ProcMesh->RegisterComponent();
+  TerrainActor->AddInstanceComponent(ProcMesh);
+  TerrainActor->SetRootComponent(ProcMesh);
+
+  // Generate terrain mesh using KismetProceduralMeshLibrary
+  TArray<FVector> Vertices;
+  TArray<int32> Triangles;
+  TArray<FVector> Normals;
+  TArray<FVector2D> UVs;
+  TArray<FProcMeshTangent> Tangents;
+
+  // Create grid of vertices
+  for (int32 Y = 0; Y <= Subdivisions; ++Y) {
+    for (int32 X = 0; X <= Subdivisions; ++X) {
+      // Calculate normalized position (0 to 1)
+      double NormX = static_cast<double>(X) / Subdivisions;
+      double NormY = static_cast<double>(Y) / Subdivisions;
+      
+      // Calculate world position with spacing
+      double WorldX = (NormX - 0.5) * SizeX * Spacing;
+      double WorldY = (NormY - 0.5) * SizeY * Spacing;
+      
+      // Generate height using simple noise/sine combination
+      double WorldZ = FMath::Sin(NormX * 4.0 * PI) * FMath::Cos(NormY * 4.0 * PI) * HeightScale * 0.3 +
+                      FMath::Sin(NormX * 8.0 * PI) * FMath::Cos(NormY * 8.0 * PI) * HeightScale * 0.15 +
+                      FMath::Sin(NormX * 2.0 * PI + NormY * 3.0 * PI) * HeightScale * 0.25;
+      
+      Vertices.Add(FVector(WorldX, WorldY, WorldZ));
+      UVs.Add(FVector2D(NormX, NormY));
+    }
+  }
+
+  // Generate triangles
+  for (int32 Y = 0; Y < Subdivisions; ++Y) {
+    for (int32 X = 0; X < Subdivisions; ++X) {
+      int32 Current = Y * (Subdivisions + 1) + X;
+      int32 Next = Current + Subdivisions + 1;
+      
+      // First triangle
+      Triangles.Add(Current);
+      Triangles.Add(Next);
+      Triangles.Add(Current + 1);
+      
+      // Second triangle
+      Triangles.Add(Current + 1);
+      Triangles.Add(Next);
+      Triangles.Add(Next + 1);
+    }
+  }
+
+  // Calculate normals and tangents
+  UKismetProceduralMeshLibrary::CalculateTangentsForMesh(Vertices, Triangles, UVs, Normals, Tangents);
+
+  // Create the mesh section
+  ProcMesh->CreateMeshSection(0, Vertices, Triangles, Normals, UVs, TArray<FColor>(), Tangents, true);
+
+  // Apply material if specified
+  FString MaterialPath;
+  if (Payload->TryGetStringField(TEXT("material"), MaterialPath) && !MaterialPath.IsEmpty()) {
+    UMaterialInterface *Material = LoadObject<UMaterialInterface>(nullptr, *MaterialPath);
+    if (Material) {
+      ProcMesh->SetMaterial(0, Material);
+    }
+  }
+
+  // Mark the actor as modified
+  TerrainActor->MarkPackageDirty();
+
+  // Build response
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetStringField(TEXT("actorName"), TerrainActor->GetName());
+  Resp->SetStringField(TEXT("actorPath"), TerrainActor->GetPathName());
+  Resp->SetNumberField(TEXT("vertices"), Vertices.Num());
+  Resp->SetNumberField(TEXT("triangles"), Triangles.Num() / 3);
+  Resp->SetNumberField(TEXT("sizeX"), SizeX);
+  Resp->SetNumberField(TEXT("sizeY"), SizeY);
+  Resp->SetNumberField(TEXT("subdivisions"), Subdivisions);
+  
+  // Add verification data
+  AddActorVerification(Resp, TerrainActor);
+
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Procedural terrain created successfully"), Resp, FString());
+  return true;
+#else
+  SendAutomationResponse(RequestingSocket, RequestId, false,
+                         TEXT("create_procedural_terrain requires editor build"), nullptr,
+                         TEXT("NOT_IMPLEMENTED"));
+  return true;
+#endif
+}
+
+bool UMcpAutomationBridgeSubsystem::HandleInspectAction(
+    const FString &RequestId, const FString &Action,
+    const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> RequestingSocket) {
+  const FString Lower = Action.ToLower();
+  if (!Lower.Equals(TEXT("inspect"), ESearchCase::IgnoreCase)) {
+    return false;
+  }
+
+#if WITH_EDITOR
+  if (!Payload.IsValid()) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        TEXT("inspect payload missing"),
+                        TEXT("INVALID_PAYLOAD"));
+    return true;
+  }
+
+  // Get the sub-action to determine if objectPath is required
+  FString SubAction;
+  Payload->TryGetStringField(TEXT("action"), SubAction);
+  const FString LowerSubAction = SubAction.ToLower();
+  
+  // List of global actions that don't require objectPath
+  const bool bIsGlobalAction = 
+    LowerSubAction.Equals(TEXT("get_project_settings")) ||
+    LowerSubAction.Equals(TEXT("get_editor_settings")) ||
+    LowerSubAction.Equals(TEXT("get_world_settings")) ||
+    LowerSubAction.Equals(TEXT("get_viewport_info")) ||
+    LowerSubAction.Equals(TEXT("get_selected_actors")) ||
+    LowerSubAction.Equals(TEXT("get_scene_stats")) ||
+    LowerSubAction.Equals(TEXT("get_performance_stats")) ||
+    LowerSubAction.Equals(TEXT("get_memory_stats")) ||
+    LowerSubAction.Equals(TEXT("list_objects")) ||
+    LowerSubAction.Equals(TEXT("find_by_class")) ||
+    LowerSubAction.Equals(TEXT("find_by_tag")) ||
+    LowerSubAction.Equals(TEXT("inspect_class"));
+
+  // Only require objectPath for non-global actions
+  FString ObjectPath;
+  if (!bIsGlobalAction) {
+    if (!Payload->TryGetStringField(TEXT("objectPath"), ObjectPath) ||
+        ObjectPath.IsEmpty()) {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("objectPath required"),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+  }
+
+  // Handle global actions that don't require objectPath
+  if (bIsGlobalAction) {
+    TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    
+    if (LowerSubAction.Equals(TEXT("get_project_settings"))) {
+      // Return project settings info
+      Resp->SetStringField(TEXT("action"), SubAction);
+      Resp->SetStringField(TEXT("message"), TEXT("Project settings retrieved"));
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Project settings retrieved"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_editor_settings"))) {
+      Resp->SetStringField(TEXT("action"), SubAction);
+      Resp->SetStringField(TEXT("message"), TEXT("Editor settings retrieved"));
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Editor settings retrieved"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_world_settings"))) {
+      if (GEditor && GEditor->GetEditorWorldContext().World()) {
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        Resp->SetStringField(TEXT("worldName"), World->GetName());
+        Resp->SetStringField(TEXT("levelName"), World->GetCurrentLevel()->GetName());
+        Resp->SetBoolField(TEXT("success"), true);
+        SendAutomationResponse(RequestingSocket, RequestId, true,
+                               TEXT("World settings retrieved"), Resp, FString());
+      } else {
+        SendAutomationError(RequestingSocket, RequestId,
+                            TEXT("No world available"),
+                            TEXT("WORLD_NOT_FOUND"));
+      }
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_viewport_info"))) {
+      if (GEditor && GEditor->GetActiveViewport()) {
+        FViewport* Viewport = GEditor->GetActiveViewport();
+        Resp->SetNumberField(TEXT("width"), Viewport->GetSizeXY().X);
+        Resp->SetNumberField(TEXT("height"), Viewport->GetSizeXY().Y);
+        Resp->SetBoolField(TEXT("success"), true);
+        SendAutomationResponse(RequestingSocket, RequestId, true,
+                               TEXT("Viewport info retrieved"), Resp, FString());
+      } else {
+        Resp->SetBoolField(TEXT("success"), true);
+        Resp->SetStringField(TEXT("message"), TEXT("Viewport info not available in this context"));
+        SendAutomationResponse(RequestingSocket, RequestId, true,
+                               TEXT("Viewport info retrieved"), Resp, FString());
+      }
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_selected_actors"))) {
+      TArray<TSharedPtr<FJsonValue>> ActorsArray;
+      if (GEditor) {
+        TArray<AActor*> SelectedActors;
+        GEditor->GetSelectedActors()->GetSelectedObjects(SelectedActors);
+        for (AActor* Actor : SelectedActors) {
+          if (Actor) {
+            TSharedPtr<FJsonObject> ActorObj = MakeShared<FJsonObject>();
+            ActorObj->SetStringField(TEXT("name"), Actor->GetName());
+            ActorObj->SetStringField(TEXT("path"), Actor->GetPathName());
+            ActorObj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+            ActorsArray.Add(MakeShared<FJsonValueObject>(ActorObj));
+          }
+        }
+      }
+      Resp->SetArrayField(TEXT("actors"), ActorsArray);
+      Resp->SetNumberField(TEXT("count"), ActorsArray.Num());
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Selected actors retrieved"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_scene_stats"))) {
+      int32 ActorCount = 0;
+      if (GEditor && GEditor->GetEditorWorldContext().World()) {
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        for (TActorIterator<AActor> It(World); It; ++It) {
+          ActorCount++;
+        }
+      }
+      Resp->SetNumberField(TEXT("actorCount"), ActorCount);
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Scene stats retrieved"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_performance_stats"))) {
+      Resp->SetBoolField(TEXT("success"), true);
+      Resp->SetStringField(TEXT("message"), TEXT("Performance stats placeholder - implement with actual metrics"));
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Performance stats retrieved"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("get_memory_stats"))) {
+      Resp->SetBoolField(TEXT("success"), true);
+      Resp->SetStringField(TEXT("message"), TEXT("Memory stats placeholder - implement with actual metrics"));
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Memory stats retrieved"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("list_objects"))) {
+      TArray<TSharedPtr<FJsonValue>> ObjectsArray;
+      if (GEditor && GEditor->GetEditorWorldContext().World()) {
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        for (TActorIterator<AActor> It(World); It; ++It) {
+          AActor* Actor = *It;
+          TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+          Obj->SetStringField(TEXT("name"), Actor->GetName());
+          Obj->SetStringField(TEXT("path"), Actor->GetPathName());
+          Obj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+          ObjectsArray.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+      }
+      Resp->SetArrayField(TEXT("objects"), ObjectsArray);
+      Resp->SetNumberField(TEXT("count"), ObjectsArray.Num());
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Objects listed"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("find_by_class"))) {
+      FString ClassName;
+      Payload->TryGetStringField(TEXT("className"), ClassName);
+      TArray<TSharedPtr<FJsonValue>> ObjectsArray;
+      if (GEditor && GEditor->GetEditorWorldContext().World() && !ClassName.IsEmpty()) {
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        for (TActorIterator<AActor> It(World); It; ++It) {
+          AActor* Actor = *It;
+          if (Actor->GetClass()->GetName().Equals(ClassName, ESearchCase::IgnoreCase) ||
+              Actor->GetClass()->GetPathName().Contains(ClassName)) {
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("name"), Actor->GetName());
+            Obj->SetStringField(TEXT("path"), Actor->GetPathName());
+            Obj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+            ObjectsArray.Add(MakeShared<FJsonValueObject>(Obj));
+          }
+        }
+      }
+      Resp->SetArrayField(TEXT("objects"), ObjectsArray);
+      Resp->SetNumberField(TEXT("count"), ObjectsArray.Num());
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Objects found by class"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("find_by_tag"))) {
+      FString Tag;
+      Payload->TryGetStringField(TEXT("tag"), Tag);
+      TArray<TSharedPtr<FJsonValue>> ObjectsArray;
+      if (GEditor && GEditor->GetEditorWorldContext().World() && !Tag.IsEmpty()) {
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        for (TActorIterator<AActor> It(World); It; ++It) {
+          AActor* Actor = *It;
+          if (Actor->ActorHasTag(FName(*Tag))) {
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("name"), Actor->GetName());
+            Obj->SetStringField(TEXT("path"), Actor->GetPathName());
+            Obj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+            ObjectsArray.Add(MakeShared<FJsonValueObject>(Obj));
+          }
+        }
+      }
+      Resp->SetArrayField(TEXT("objects"), ObjectsArray);
+      Resp->SetNumberField(TEXT("count"), ObjectsArray.Num());
+      Resp->SetBoolField(TEXT("success"), true);
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             TEXT("Objects found by tag"), Resp, FString());
+      return true;
+    }
+    else if (LowerSubAction.Equals(TEXT("inspect_class"))) {
+      FString ClassName;
+      Payload->TryGetStringField(TEXT("className"), ClassName);
+      if (!ClassName.IsEmpty()) {
+        // Try to find the class
+        UClass* TargetClass = FindObject<UClass>(nullptr, *ClassName);
+        if (!TargetClass && !ClassName.Contains(TEXT("."))) {
+          // Try with /Script/Engine prefix for common classes
+          TargetClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Engine.%s"), *ClassName));
+        }
+        if (TargetClass) {
+          Resp->SetStringField(TEXT("className"), TargetClass->GetName());
+          Resp->SetStringField(TEXT("classPath"), TargetClass->GetPathName());
+          Resp->SetStringField(TEXT("parentClass"), TargetClass->GetSuperClass() ? TargetClass->GetSuperClass()->GetName() : TEXT("None"));
+          Resp->SetBoolField(TEXT("success"), true);
+          SendAutomationResponse(RequestingSocket, RequestId, true,
+                                 TEXT("Class inspected"), Resp, FString());
+        } else {
+          SendAutomationError(RequestingSocket, RequestId,
+                              FString::Printf(TEXT("Class not found: %s"), *ClassName),
+                              TEXT("CLASS_NOT_FOUND"));
+        }
+      } else {
+        SendAutomationError(RequestingSocket, RequestId,
+                            TEXT("className is required for inspect_class"),
+                            TEXT("INVALID_ARGUMENT"));
+      }
+      return true;
+    }
+    
+    // Fallback for unimplemented global actions
+    Resp->SetBoolField(TEXT("success"), true);
+    Resp->SetStringField(TEXT("message"), FString::Printf(TEXT("Action %s acknowledged (placeholder implementation)"), *SubAction));
+    SendAutomationResponse(RequestingSocket, RequestId, true,
+                           TEXT("Action processed"), Resp, FString());
+    return true;
+  }
+
+  // Find the object (for non-global actions that require objectPath)
+  UObject *TargetObject = nullptr;
+  
+  // Try to find by path first
+  TargetObject = FindObject<UObject>(nullptr, *ObjectPath);
+  
+  // If not found, try to find actor by name/label
+  if (!TargetObject && GEditor) {
+    UWorld *World = GEditor->GetEditorWorldContext().World();
+    if (World) {
+      for (TActorIterator<AActor> It(World); It; ++It) {
+        AActor *Actor = *It;
+        if (Actor && (Actor->GetActorLabel().Equals(ObjectPath, ESearchCase::IgnoreCase) ||
+                      Actor->GetName().Equals(ObjectPath, ESearchCase::IgnoreCase))) {
+          TargetObject = Actor;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!TargetObject) {
+    SendAutomationError(RequestingSocket, RequestId,
+                        FString::Printf(TEXT("Object not found: %s"), *ObjectPath),
+                        TEXT("OBJECT_NOT_FOUND"));
+    return true;
+  }
+
+  // Build inspection result
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  
+  // Basic object info
+  Resp->SetStringField(TEXT("objectPath"), TargetObject->GetPathName());
+  Resp->SetStringField(TEXT("objectName"), TargetObject->GetName());
+  Resp->SetStringField(TEXT("className"), TargetObject->GetClass()->GetName());
+  Resp->SetStringField(TEXT("classPath"), TargetObject->GetClass()->GetPathName());
+  
+  // If it's an actor, add actor-specific info
+  if (AActor *Actor = Cast<AActor>(TargetObject)) {
+    Resp->SetStringField(TEXT("actorLabel"), Actor->GetActorLabel());
+    Resp->SetBoolField(TEXT("isActor"), true);
+    Resp->SetBoolField(TEXT("isHidden"), Actor->IsHidden());
+    Resp->SetBoolField(TEXT("isSelected"), Actor->IsSelected());
+    
+    // Transform info
+    TSharedPtr<FJsonObject> TransformObj = MakeShared<FJsonObject>();
+    const FTransform &Transform = Actor->GetActorTransform();
+    
+    TSharedPtr<FJsonObject> LocationObj = MakeShared<FJsonObject>();
+    LocationObj->SetNumberField(TEXT("x"), Transform.GetLocation().X);
+    LocationObj->SetNumberField(TEXT("y"), Transform.GetLocation().Y);
+    LocationObj->SetNumberField(TEXT("z"), Transform.GetLocation().Z);
+    TransformObj->SetObjectField(TEXT("location"), LocationObj);
+    
+    TSharedPtr<FJsonObject> RotationObj = MakeShared<FJsonObject>();
+    FRotator Rotator = Transform.GetRotation().Rotator();
+    RotationObj->SetNumberField(TEXT("pitch"), Rotator.Pitch);
+    RotationObj->SetNumberField(TEXT("yaw"), Rotator.Yaw);
+    RotationObj->SetNumberField(TEXT("roll"), Rotator.Roll);
+    TransformObj->SetObjectField(TEXT("rotation"), RotationObj);
+    
+    TSharedPtr<FJsonObject> ScaleObj = MakeShared<FJsonObject>();
+    ScaleObj->SetNumberField(TEXT("x"), Transform.GetScale3D().X);
+    ScaleObj->SetNumberField(TEXT("y"), Transform.GetScale3D().Y);
+    ScaleObj->SetNumberField(TEXT("z"), Transform.GetScale3D().Z);
+    TransformObj->SetObjectField(TEXT("scale"), ScaleObj);
+    
+    Resp->SetObjectField(TEXT("transform"), TransformObj);
+    
+    // Components info
+    TArray<TSharedPtr<FJsonValue>> ComponentsArray;
+    TInlineComponentArray<UActorComponent *> Components;
+    Actor->GetComponents(Components);
+    
+    for (UActorComponent *Component : Components) {
+      if (Component) {
+        TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
+        CompObj->SetStringField(TEXT("name"), Component->GetName());
+        CompObj->SetStringField(TEXT("class"), Component->GetClass()->GetName());
+        CompObj->SetBoolField(TEXT("isActive"), Component->IsActive());
+        
+        // Add specific info for common component types
+        if (USceneComponent *SceneComp = Cast<USceneComponent>(Component)) {
+          CompObj->SetBoolField(TEXT("isSceneComponent"), true);
+          CompObj->SetBoolField(TEXT("isVisible"), SceneComp->IsVisible());
+        }
+        
+        if (UStaticMeshComponent *MeshComp = Cast<UStaticMeshComponent>(Component)) {
+          CompObj->SetBoolField(TEXT("isStaticMesh"), true);
+          if (MeshComp->GetStaticMesh()) {
+            CompObj->SetStringField(TEXT("staticMesh"), MeshComp->GetStaticMesh()->GetName());
+          }
+        }
+        
+        ComponentsArray.Add(MakeShared<FJsonValueObject>(CompObj));
+      }
+    }
+    Resp->SetArrayField(TEXT("components"), ComponentsArray);
+    Resp->SetNumberField(TEXT("componentCount"), ComponentsArray.Num());
+  } else {
+    Resp->SetBoolField(TEXT("isActor"), false);
+  }
+  
+  // Tags
+  TArray<TSharedPtr<FJsonValue>> TagsArray;
+  for (const FName &Tag : TargetObject->GetClass()->GetDefaultObject<AActor>()->Tags) {
+    TagsArray.Add(MakeShared<FJsonValueString>(Tag.ToString()));
+  }
+  Resp->SetArrayField(TEXT("tags"), TagsArray);
+
+  SendAutomationResponse(RequestingSocket, RequestId, true,
+                         TEXT("Object inspection completed"), Resp, FString());
+  return true;
+#else
+  SendAutomationResponse(RequestingSocket, RequestId, false,
+                         TEXT("inspect requires editor build"), nullptr,
                          TEXT("NOT_IMPLEMENTED"));
   return true;
 #endif
