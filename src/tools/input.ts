@@ -122,12 +122,38 @@ export class InputTools {
         return this.automationBridge.sendAutomationRequest('manage_input', payload);
     }
 
-    async removeMapping(contextPath: string, actionPath: string) {
+    /**
+     * Remove a key mapping from an Input Mapping Context.
+     * @param contextPath - Path to the Input Mapping Context asset
+     * @param actionPath - Path to the Input Action asset
+     * @param key - Optional specific key to remove. If not provided, removes ALL mappings for the action.
+     */
+    async removeMapping(contextPath: string, actionPath: string, key?: string) {
         if (!this.automationBridge) throw new Error('Automation bridge not set');
-        return this.automationBridge.sendAutomationRequest('manage_input', {
+
+        const payload: Record<string, unknown> = {
             action: 'remove_mapping',
             contextPath,
             actionPath
+        };
+
+        if (key && typeof key === 'string' && key.trim().length > 0) {
+            payload.key = key.trim();
+        }
+
+        return this.automationBridge.sendAutomationRequest('manage_input', payload);
+    }
+
+    /**
+     * List all mappings in an Input Mapping Context.
+     * @param contextPath - Path to the Input Mapping Context asset
+     * @returns Object with mappings array containing action names, keys, modifiers, and triggers
+     */
+    async listMappings(contextPath: string) {
+        if (!this.automationBridge) throw new Error('Automation bridge not set');
+        return this.automationBridge.sendAutomationRequest('manage_input', {
+            action: 'list_mappings',
+            contextPath
         });
     }
 
@@ -223,6 +249,8 @@ Use it when you need to:
 - create Input Actions (IA_*)
 - create Input Mapping Contexts (IMC_*)
 - bind keys to actions in a mapping context with optional modifiers
+- list all mappings in a context to see existing bindings
+- remove specific key mappings or all mappings for an action
 - inject input values directly into the Enhanced Input subsystem (for testing/automation)
 - clear injected inputs to prevent "stuck key" issues
 
@@ -230,10 +258,15 @@ Supported actions:
 - create_input_action: Create a UInputAction asset.
 - create_input_mapping_context: Create a UInputMappingContext asset.
 - add_mapping: Add a key mapping to a context with optional modifiers (Negate, Scalar, DeadZone, Swizzle).
-- remove_mapping: Remove a mapping from a context.
+- list_mappings: List all mappings in a context (returns action names, keys, modifiers, triggers).
+- remove_mapping: Remove a mapping from a context. Pass optional "key" param to remove only that specific binding.
 - inject_input_for_action: Inject input values directly into the Enhanced Input subsystem using UE5's InjectInputForAction API. This bypasses Slate events and avoids "stuck key" issues.
 - clear_injected_inputs: Clear all or specific injected inputs by setting them to zero.
 - get_injected_input_status: Get the current status of injected inputs.
+
+Example - List all mappings in a context:
+  action: "list_mappings"
+  contextPath: "/Game/Input/IMC_Default"
 
 Example - Adding S key with Negate modifier for backward movement:
   action: "add_mapping"
@@ -241,6 +274,12 @@ Example - Adding S key with Negate modifier for backward movement:
   actionPath: "/Game/Input/Actions/IA_MoveForward"
   key: "S"
   modifiers: ["Negate"]
+
+Example - Remove only the W key binding (keep others):
+  action: "remove_mapping"
+  contextPath: "/Game/Input/IMC_Default"
+  actionPath: "/Game/Input/Actions/IA_MoveForward"
+  key: "W"
 
 Example - Injecting movement input directly (avoids stuck key issues):
   action: "inject_input_for_action"
@@ -259,6 +298,7 @@ Example - Clearing injected inputs:
                     'create_input_action',
                     'create_input_mapping_context',
                     'add_mapping',
+                    'list_mappings',
                     'remove_mapping',
                     'inject_input_for_action',
                     'clear_injected_inputs',
@@ -341,7 +381,28 @@ Example - Clearing injected inputs:
                 items: { type: 'string' },
                 description: 'List of currently injected action paths (for get_injected_input_status)'
             },
-            clearedCount: { type: 'number', description: 'Number of actions cleared (for clear_injected_inputs)' }
+            clearedCount: { type: 'number', description: 'Number of actions cleared (for clear_injected_inputs)' },
+            mappingCount: { type: 'number', description: 'Number of mappings in the context (for list_mappings)' },
+            mappings: {
+                type: 'array',
+                description: 'Array of mappings (for list_mappings)',
+                items: {
+                    type: 'object',
+                    properties: {
+                        actionName: { type: 'string' },
+                        actionPath: { type: 'string' },
+                        key: { type: 'string' },
+                        modifiers: { type: 'array', items: { type: 'object' } },
+                        triggers: { type: 'array', items: { type: 'object' } }
+                    }
+                }
+            },
+            removedCount: { type: 'number', description: 'Number of mappings removed (for remove_mapping)' },
+            removedKeys: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Keys that were removed (for remove_mapping)'
+            }
         }
     }
 };

@@ -453,6 +453,45 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         });
         return ResponseFactory.success(res, 'LODs generated successfully');
       }
+      case 'dump_asset': {
+        // Serialize UObject/DataAsset properties to JSON by having Unreal reflect UPROPERTYs
+        // This allows agents to "read" .uasset files without parsing binary data
+        const params = normalizeArgs(args, [
+          { key: 'assetPath', required: true },
+          { key: 'maxDepth', default: 6 },
+          { key: 'maxArrayElements', default: 200 },
+          { key: 'maxMapEntries', default: 200 },
+          { key: 'includeNulls', default: false },
+          { key: 'includeTransient', default: false },
+          { key: 'propertyAllowlist' }
+        ]);
+        const assetPath = extractString(params, 'assetPath');
+        const maxDepth = extractOptionalNumber(params, 'maxDepth') ?? 6;
+        const maxArrayElements = extractOptionalNumber(params, 'maxArrayElements') ?? 200;
+        const maxMapEntries = extractOptionalNumber(params, 'maxMapEntries') ?? 200;
+        const includeNulls = extractOptionalBoolean(params, 'includeNulls') ?? false;
+        const includeTransient = extractOptionalBoolean(params, 'includeTransient') ?? false;
+        const propertyAllowlist = extractOptionalArray<string>(params, 'propertyAllowlist');
+
+        const res = await tools.assetTools.dumpAsset({
+          assetPath,
+          maxDepth,
+          maxArrayElements,
+          maxMapEntries,
+          includeNulls,
+          includeTransient,
+          propertyAllowlist
+        });
+
+        if (res && res.success !== false) {
+          // Format a helpful summary message
+          const propCount = (res.propertyCount as number) ?? 0;
+          const summary = res.summary as Record<string, unknown> | undefined;
+          const className = summary?.class ? String(summary.class).split('/').pop() : 'UObject';
+          return ResponseFactory.success(res, `Dumped ${className} with ${propCount} properties`);
+        }
+        return ResponseFactory.error(res?.error as string || 'Failed to dump asset', 'DUMP_FAILED');
+      }
       case 'create_thumbnail': {
         const params = normalizeArgs(args, [
           { key: 'assetPath', required: true },

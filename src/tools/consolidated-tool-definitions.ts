@@ -43,9 +43,10 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'get_dependencies', 'get_source_control_state', 'analyze_graph', 'get_asset_graph', 'create_thumbnail', 'set_tags', 'get_metadata', 'set_metadata', 'validate', 'fixup_redirectors', 'find_by_tag', 'generate_report',
             'create_material', 'create_material_instance', 'create_render_target', 'generate_lods', 'add_material_parameter', 'list_instances', 'reset_instance_parameters', 'exists', 'get_material_stats',
             'nanite_rebuild_mesh', 'bulk_rename', 'bulk_delete', 'source_control_checkout', 'source_control_submit',
-            'add_material_node', 'connect_material_pins', 'remove_material_node', 'break_material_connections', 'get_material_node_details', 'rebuild_material'
+            'add_material_node', 'connect_material_pins', 'remove_material_node', 'break_material_connections', 'get_material_node_details', 'rebuild_material',
+            'dump_asset'
           ],
-          description: 'Action to perform'
+          description: 'Action to perform. Use dump_asset to serialize a UObject/DataAsset properties to JSON for inspection.'
         },
         assetPath: commonSchemas.assetPath,
         directory: commonSchemas.directoryPath,
@@ -117,7 +118,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         coordinateIndex: commonSchemas.numberProp,
         parameterType: commonSchemas.stringProp,
         nodes: commonSchemas.arrayOfObjects,
-        tags: commonSchemas.arrayOfStrings
+        tags: commonSchemas.arrayOfStrings,
+        // dump_asset options - serialize UObject/DataAsset properties to JSON
+        maxArrayElements: { type: 'number', description: 'Max array elements to serialize (default: 200)' },
+        maxMapEntries: { type: 'number', description: 'Max map entries to serialize (default: 200)' },
+        includeNulls: { type: 'boolean', description: 'Include null/empty values (default: false)' },
+        includeTransient: { type: 'boolean', description: 'Include transient properties (default: false)' },
+        propertyAllowlist: { type: 'array', items: { type: 'string' }, description: 'Only include these property names' }
       },
       required: ['action']
     },
@@ -944,6 +951,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'create_input_action',
             'create_input_mapping_context',
             'add_mapping',
+            'list_mappings',
             'remove_mapping'
           ],
           description: 'Action to perform'

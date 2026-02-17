@@ -419,4 +419,68 @@ export class AssetTools extends BaseTool implements IAssetTools {
       };
     }
   }
+
+  /**
+   * Dump a UObject/DataAsset to JSON by having Unreal serialize its UPROPERTY fields.
+   * This allows agents to "read" .uasset files by asking Unreal to reflect properties.
+   *
+   * @param params.assetPath - Path to the asset (e.g., "/Game/Data/DA_SegmentPool.DA_SegmentPool")
+   * @param params.maxDepth - Maximum recursion depth for nested objects (default: 6)
+   * @param params.maxArrayElements - Maximum array elements to serialize (default: 200)
+   * @param params.maxMapEntries - Maximum map entries to serialize (default: 200)
+   * @param params.includeNulls - Include null/empty values in output (default: false)
+   * @param params.includeTransient - Include transient properties (default: false)
+   * @param params.propertyAllowlist - If set, only include these property names
+   */
+  async dumpAsset(params: {
+    assetPath: string;
+    maxDepth?: number;
+    maxArrayElements?: number;
+    maxMapEntries?: number;
+    includeNulls?: boolean;
+    includeTransient?: boolean;
+    propertyAllowlist?: string[];
+  }): Promise<StandardActionResponse> {
+    const assetPath = this.normalizeAssetPath(params.assetPath);
+
+    if (!assetPath) {
+      return { success: false, error: 'assetPath is required' };
+    }
+
+    log.info(`Dumping asset: ${assetPath}`);
+
+    try {
+      const response = await this.sendRequest<AssetResponse>('dump_asset', {
+        assetPath,
+        options: {
+          maxDepth: params.maxDepth ?? 6,
+          maxArrayElements: params.maxArrayElements ?? 200,
+          maxMapEntries: params.maxMapEntries ?? 200,
+          includeNulls: params.includeNulls ?? false,
+          includeTransient: params.includeTransient ?? false,
+          propertyAllowlist: params.propertyAllowlist ?? []
+        }
+      }, 'dump_asset', { timeoutMs: EXTENDED_ASSET_OP_TIMEOUT_MS });
+
+      if (response && response.success !== false) {
+        return {
+          success: true,
+          message: response.message || 'Asset dumped successfully',
+          summary: response.summary,
+          properties: response.properties,
+          propertyCount: response.propertyCount
+        };
+      }
+
+      return {
+        success: false,
+        error: response?.error || response?.message || 'Failed to dump asset'
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to dump asset: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+  }
 }

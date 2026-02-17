@@ -87,6 +87,16 @@ export interface IAssetTools {
     generateReport(params: { directory: string; reportType?: string; outputPath?: string }): Promise<StandardActionResponse>;
     validate(params: { assetPath: string }): Promise<StandardActionResponse>;
     generateLODs(params: { assetPath: string; lodCount: number; reductionSettings?: Record<string, unknown> }): Promise<StandardActionResponse>;
+    /** Dump a UObject/DataAsset to JSON by having Unreal serialize its UPROPERTY fields */
+    dumpAsset(params: {
+        assetPath: string;
+        maxDepth?: number;
+        maxArrayElements?: number;
+        maxMapEntries?: number;
+        includeNulls?: boolean;
+        includeTransient?: boolean;
+        propertyAllowlist?: string[];
+    }): Promise<StandardActionResponse>;
 }
 
 export interface ISequenceTools {

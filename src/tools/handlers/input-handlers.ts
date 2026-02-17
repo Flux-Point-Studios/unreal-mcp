@@ -27,8 +27,14 @@ export async function handleInputTools(
                 argsTyped.key ?? '',
                 argsTyped.modifiers as (string | { type: string; value?: number })[] | undefined
             )) as Record<string, unknown>;
+        case 'list_mappings':
+            return cleanObject(await inputTools.listMappings(argsTyped.contextPath ?? '')) as Record<string, unknown>;
         case 'remove_mapping':
-            return cleanObject(await inputTools.removeMapping(argsTyped.contextPath ?? '', argsTyped.actionPath ?? '')) as Record<string, unknown>;
+            return cleanObject(await inputTools.removeMapping(
+                argsTyped.contextPath ?? '',
+                argsTyped.actionPath ?? '',
+                argsTyped.key as string | undefined
+            )) as Record<string, unknown>;
         case 'inject_input_for_action':
             return cleanObject(await inputTools.injectInputForAction(
                 argsTyped.inputActionPath ?? '',
