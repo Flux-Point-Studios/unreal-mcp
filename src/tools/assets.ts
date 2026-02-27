@@ -1,6 +1,5 @@
 import { BaseTool } from './base-tool.js';
 import { IAssetTools, StandardActionResponse, SourceControlState } from '../types/tool-interfaces.js';
-import { wasmIntegration } from '../wasm/index.js';
 import { Logger } from '../utils/logger.js';
 import { AssetResponse } from '../types/automation-responses.js';
 import { sanitizePath } from '../utils/path-security.js';
@@ -102,33 +101,16 @@ export class AssetTools extends BaseTool implements IAssetTools {
     }, 'asset_query', { timeoutMs: DEFAULT_ASSET_OP_TIMEOUT_MS });
   }
 
-  async deleteAssets(params: {
-    paths: string[];
-    fixupRedirectors?: boolean;
-    force?: boolean;  // Skip reference check
-    timeoutMs?: number;
-  }): Promise<StandardActionResponse> {
-    // Filter empty paths AFTER normalization
-    const assetPaths = (Array.isArray(params.paths) ? params.paths : [])
-      .map(p => this.normalizeAssetPath(p))
-      .filter(p => p && p.trim().length > 0);
+  async deleteAssets(params: { paths: string[]; fixupRedirectors?: boolean; timeoutMs?: number }): Promise<StandardActionResponse> {
+    const normalizedPaths = (Array.isArray(params.paths) ? params.paths : [])
+      .map(p => this.normalizeAssetPath(p));
 
-    if (assetPaths.length === 0) {
-      return {
-        success: false,
-        error: 'No valid asset paths after normalization',
-        errorCode: 'INVALID_ARGUMENT',
-        originalPaths: params.paths
-      };
-    }
-
+    // C++ HandleDeleteAssets expects 'paths' array or 'path' string, not 'assetPaths'
+    // Send both for compatibility with different C++ handler versions
     return this.sendRequest<AssetResponse>('manage_asset', {
-      assetPaths,
-      paths: assetPaths,  // Send BOTH for C++ compat
-      fixupRedirectors: params.fixupRedirectors ?? true,  // Default ON
-      force: params.force,
-      subAction: 'delete',
-      action: 'delete',  // Send BOTH for C++ compat
+      paths: normalizedPaths,
+      assetPaths: normalizedPaths,  // Keep for backward compatibility
+      subAction: 'delete'
     }, 'manage_asset', { timeoutMs: params.timeoutMs || EXTENDED_ASSET_OP_TIMEOUT_MS });
   }
 
@@ -286,49 +268,25 @@ export class AssetTools extends BaseTool implements IAssetTools {
         }
       }
 
-      // Use WASM for analysis on the constructed graph
-      const base = await wasmIntegration.resolveDependencies(
-        assetPath,
-        graph,
-        { maxDepth }
-      );
-
-      const depth = await wasmIntegration.calculateDependencyDepth(
-        assetPath,
-        graph,
-        { maxDepth }
-      );
-
-      const circularDependencies = await wasmIntegration.findCircularDependencies(
-        graph,
-        { maxDepth }
-      );
-
-      const topologicalOrder = await wasmIntegration.topologicalSort(graph);
-
-      const baseRecord = base as Record<string, unknown>;
-      const dependenciesList = Array.isArray(baseRecord.dependencies)
-        ? baseRecord.dependencies as unknown[]
-        : [];
-
-      const totalDependencyCount =
-        (baseRecord.totalDependencyCount ??
-        baseRecord.total_dependency_count ??
-        dependenciesList.length) as number;
+      // Analyze dependency graph using pure TypeScript
+      const resolvedDeps = this.resolveDependencies(assetPath, graph, maxDepth);
+      const depth = this.calculateDependencyDepth(assetPath, graph, maxDepth);
+      const circularDependencies = this.findCircularDependencies(graph);
+      const topologicalOrder = this.topologicalSort(graph);
 
       const analysis = {
-        asset: (baseRecord.asset ?? assetPath) as string,
-        dependencies: dependenciesList,
-        totalDependencyCount,
+        asset: assetPath,
+        dependencies: resolvedDeps,
+        totalDependencyCount: resolvedDeps.length,
         requestedMaxDepth: maxDepth,
         maxDepthUsed: depth,
         circularDependencies,
         topologicalOrder,
         stats: {
-          nodeCount: dependenciesList.length,
-          leafCount: dependenciesList.filter((d: unknown) => {
-            const dep = d as Record<string, unknown>;
-            return !dep.dependencies || (Array.isArray(dep.dependencies) && dep.dependencies.length === 0);
+          nodeCount: resolvedDeps.length + 1, // Include root asset
+          leafCount: resolvedDeps.filter(d => {
+            const deps = graph[d];
+            return !deps || deps.length === 0;
           }).length
         }
       };
@@ -420,67 +378,112 @@ export class AssetTools extends BaseTool implements IAssetTools {
     }
   }
 
-  /**
-   * Dump a UObject/DataAsset to JSON by having Unreal serialize its UPROPERTY fields.
-   * This allows agents to "read" .uasset files by asking Unreal to reflect properties.
-   *
-   * @param params.assetPath - Path to the asset (e.g., "/Game/Data/DA_SegmentPool.DA_SegmentPool")
-   * @param params.maxDepth - Maximum recursion depth for nested objects (default: 6)
-   * @param params.maxArrayElements - Maximum array elements to serialize (default: 200)
-   * @param params.maxMapEntries - Maximum map entries to serialize (default: 200)
-   * @param params.includeNulls - Include null/empty values in output (default: false)
-   * @param params.includeTransient - Include transient properties (default: false)
-   * @param params.propertyAllowlist - If set, only include these property names
-   */
-  async dumpAsset(params: {
-    assetPath: string;
-    maxDepth?: number;
-    maxArrayElements?: number;
-    maxMapEntries?: number;
-    includeNulls?: boolean;
-    includeTransient?: boolean;
-    propertyAllowlist?: string[];
-  }): Promise<StandardActionResponse> {
-    const assetPath = this.normalizeAssetPath(params.assetPath);
+  // =========================================
+  // Dependency Graph Analysis (Pure TypeScript)
+  // =========================================
 
-    if (!assetPath) {
-      return { success: false, error: 'assetPath is required' };
-    }
+  private resolveDependencies(
+    assetPath: string,
+    graph: Record<string, string[]>,
+    maxDepth: number
+  ): string[] {
+    const visited = new Set<string>();
+    const result: string[] = [];
 
-    log.info(`Dumping asset: ${assetPath}`);
+    const visit = (path: string, depth: number) => {
+      if (visited.has(path) || depth > maxDepth) return;
+      visited.add(path);
+      // Don't include the root asset in dependencies
+      if (path !== assetPath) {
+        result.push(path);
+      }
+      const deps = graph[path] || [];
+      for (const dep of deps) {
+        visit(dep, depth + 1);
+      }
+    };
 
-    try {
-      const response = await this.sendRequest<AssetResponse>('dump_asset', {
-        assetPath,
-        options: {
-          maxDepth: params.maxDepth ?? 6,
-          maxArrayElements: params.maxArrayElements ?? 200,
-          maxMapEntries: params.maxMapEntries ?? 200,
-          includeNulls: params.includeNulls ?? false,
-          includeTransient: params.includeTransient ?? false,
-          propertyAllowlist: params.propertyAllowlist ?? []
+    visit(assetPath, 0);
+    return result;
+  }
+
+  private calculateDependencyDepth(
+    assetPath: string,
+    graph: Record<string, string[]>,
+    maxDepth: number
+  ): number {
+    const visited = new Set<string>();
+
+    const getDepth = (path: string, depth: number): number => {
+      if (visited.has(path)) return depth;
+      if (depth > maxDepth) return maxDepth; // Cap at maxDepth
+      visited.add(path);
+      const deps = graph[path] || [];
+      if (deps.length === 0) return depth;
+      let maxChildDepth = depth;
+      for (const dep of deps) {
+        maxChildDepth = Math.max(maxChildDepth, getDepth(dep, depth + 1));
+      }
+      return Math.min(maxChildDepth, maxDepth); // Ensure we don't exceed maxDepth
+    };
+
+    return getDepth(assetPath, 0);
+  }
+
+  private findCircularDependencies(graph: Record<string, string[]>): string[][] {
+    const cycles: string[][] = [];
+    const visited = new Set<string>();
+    const recursionStack = new Set<string>();
+    const path: string[] = [];
+
+    const dfs = (node: string) => {
+      visited.add(node);
+      recursionStack.add(node);
+      path.push(node);
+
+      const deps = graph[node] || [];
+      for (const dep of deps) {
+        if (!visited.has(dep)) {
+          dfs(dep);
+        } else if (recursionStack.has(dep)) {
+          const cycleStart = path.indexOf(dep);
+          if (cycleStart !== -1) {
+            cycles.push([...path.slice(cycleStart), dep]);
+          }
         }
-      }, 'dump_asset', { timeoutMs: EXTENDED_ASSET_OP_TIMEOUT_MS });
-
-      if (response && response.success !== false) {
-        return {
-          success: true,
-          message: response.message || 'Asset dumped successfully',
-          summary: response.summary,
-          properties: response.properties,
-          propertyCount: response.propertyCount
-        };
       }
 
-      return {
-        success: false,
-        error: response?.error || response?.message || 'Failed to dump asset'
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: `Failed to dump asset: ${error instanceof Error ? error.message : String(error)}`
-      };
+      path.pop();
+      recursionStack.delete(node);
+    };
+
+    for (const node of Object.keys(graph)) {
+      if (!visited.has(node)) {
+        dfs(node);
+      }
     }
+
+    return cycles;
+  }
+
+  private topologicalSort(graph: Record<string, string[]>): string[] {
+    const visited = new Set<string>();
+    const result: string[] = [];
+
+    const visit = (node: string) => {
+      if (visited.has(node)) return;
+      visited.add(node);
+      const deps = graph[node] || [];
+      for (const dep of deps) {
+        visit(dep);
+      }
+      result.push(node);
+    };
+
+    for (const node of Object.keys(graph)) {
+      visit(node);
+    }
+
+    return result;
   }
 }

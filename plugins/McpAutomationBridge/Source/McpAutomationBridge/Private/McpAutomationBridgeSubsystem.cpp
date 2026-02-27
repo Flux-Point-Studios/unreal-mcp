@@ -820,6 +820,54 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                     return HandleAssetAction(R, A, P, S);
                   });
 
+  // CRITICAL: Register asset_query for O(1) dispatch - fixes timeout issues
+  // This handler processes search_assets, find_by_tag, get_source_control_state, etc.
+  RegisterHandler(TEXT("asset_query"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleAssetQueryAction(R, A, P, S);
+                  });
+
+  // Direct action aliases for common asset_query subActions
+  // These allow TS to call executeAutomationRequest('search_assets', {...}) directly
+  RegisterHandler(TEXT("search_assets"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleSearchAssets(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("find_by_tag"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleFindByTag(R, A, P, S);
+                  });
+
+  // Direct action aliases for manage_asset subActions that TS calls directly
+  // These allow O(1) dispatch for GPU-heavy and common operations
+  RegisterHandler(TEXT("generate_lods"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleGenerateLODs(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("create_thumbnail"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleGenerateThumbnail(R, A, P, S);
+                  });
+
+  RegisterHandler(TEXT("get_source_control_state"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+                    return HandleGetSourceControlState(R, A, P, S);
+                  });
+
   RegisterHandler(TEXT("manage_material_authoring"),
                   [this](const FString &R, const FString &A,
                          const TSharedPtr<FJsonObject> &P,
@@ -1079,6 +1127,38 @@ void UMcpAutomationBridgeSubsystem::InitializeHandlers() {
                          TSharedPtr<FMcpBridgeWebSocket> S) {
                     return HandleMiscAction(R, A, P, S);
                   });
+
+  // PIE State Handler - for checking Play-In-Editor state
+  RegisterHandler(TEXT("check_pie_state"),
+                  [this](const FString &R, const FString &A,
+                         const TSharedPtr<FJsonObject> &P,
+                         TSharedPtr<FMcpBridgeWebSocket> S) {
+#if WITH_EDITOR
+                    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                    bool bIsInPIE = false;
+                    FString PieState = TEXT("stopped");
+                    
+                    if (GEditor && GEditor->PlayWorld) {
+                      bIsInPIE = true;
+                      if (GEditor->PlayWorld->IsPaused()) {
+                        PieState = TEXT("paused");
+                      } else {
+                        PieState = TEXT("playing");
+                      }
+                    }
+                    
+                    Result->SetBoolField(TEXT("isInPIE"), bIsInPIE);
+                    Result->SetStringField(TEXT("pieState"), PieState);
+                    
+                    SendAutomationResponse(S, R, true, 
+                        bIsInPIE ? TEXT("PIE is active") : TEXT("PIE is not active"),
+                        Result);
+                    return true;
+#else
+                    SendAutomationError(S, R, TEXT("PIE state check requires editor build"), TEXT("NOT_AVAILABLE"));
+                    return true;
+#endif
+                  });
 }
 
 // Drain and process any automation requests that were enqueued while the
@@ -1191,6 +1271,8 @@ bool UMcpAutomationBridgeSubsystem::ExecuteEditorCommands(
 #else
 #include "ControlRigBlueprint.h"
 #endif
+// Include the generated class header for UControlRigBlueprintGeneratedClass
+#include "ControlRigBlueprintGeneratedClass.h"
 // Note: ControlRigBlueprintFactory header is Public only in UE 5.5+
 // For UE 5.1-5.4 we use a fallback implementation with FKismetEditorUtilities
 #if MCP_HAS_CONTROLRIG_FACTORY && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
@@ -1257,6 +1339,8 @@ UBlueprint *UMcpAutomationBridgeSubsystem::CreateControlRigBlueprint(
 
   // Create the Control Rig Blueprint using FKismetEditorUtilities
   // This works across all UE versions without needing ControlRigBlueprintFactory
+  // Note: Use UControlRigBlueprintGeneratedClass instead of URigVMBlueprintGeneratedClass
+  // to avoid needing to include RigVM module headers
   UControlRigBlueprint *NewBlueprint = Cast<UControlRigBlueprint>(
       FKismetEditorUtilities::CreateBlueprint(
           UControlRig::StaticClass(),  // Parent class
@@ -1264,7 +1348,7 @@ UBlueprint *UMcpAutomationBridgeSubsystem::CreateControlRigBlueprint(
           *AssetName,                   // Name
           BPTYPE_Normal,                // Blueprint type
           UControlRigBlueprint::StaticClass(),  // Blueprint class
-          URigVMBlueprintGeneratedClass::StaticClass(),  // Generated class
+          UControlRigBlueprintGeneratedClass::StaticClass(),  // Generated class
           NAME_None));
 
   if (!NewBlueprint) {

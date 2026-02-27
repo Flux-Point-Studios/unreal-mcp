@@ -211,7 +211,8 @@ export class MessageHandler {
                     'create_effect',
                     'build_environment',
                     'system_control',
-                    'manage_ui'
+                    'manage_ui',
+                    'inspect'
                 ]);
 
                 if (consolidatedToolActions.has(expected) && got !== expected) {

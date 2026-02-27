@@ -8,7 +8,10 @@
 #include "Editor.h"
 #include "LevelEditor.h"
 #include "Subsystems/EditorActorSubsystem.h"
+#include "FileHelpers.h"
+#include "EditorLevelUtils.h"
 #include "WorldPartition/WorldPartition.h"
+#include "EngineUtils.h"  // TActorIterator for WP actor lookup
 
 // Check for WorldPartitionEditorSubsystem (UE 5.0-5.3)
 #if defined(__has_include)
@@ -61,11 +64,16 @@
 #  define MCP_HAS_DATALAYER_EDITOR 0
 #endif
 
-// Note: DataLayerInstance.h, DataLayerManager.h and DataLayerAsset.h were introduced in UE 5.1
+// Note: DataLayerInstance.h and DataLayerAsset.h were introduced in UE 5.1
+// DataLayerManager.h was introduced in UE 5.3
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 #include "WorldPartition/DataLayer/DataLayerInstance.h"
-#include "WorldPartition/DataLayer/DataLayerManager.h"
 #include "WorldPartition/DataLayer/DataLayerAsset.h"
+#include "WorldPartition/DataLayer/DataLayerInstanceWithAsset.h"
+#include "WorldPartition/DataLayer/DataLayerSubsystem.h"
+#endif
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+#include "WorldPartition/DataLayer/DataLayerManager.h"
 #endif
 #endif
 
@@ -83,7 +91,72 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         return true;
     }
 
+    // CRITICAL FIX: Check if levelPath is provided and load it first
+    // World Partition operations require the level to be the active editor world
+    FString LevelPath = GetJsonStringField(Payload, TEXT("levelPath"));
     UWorld* World = GEditor->GetEditorWorldContext().World();
+    
+    if (!LevelPath.IsEmpty())
+    {
+        // Normalize the level path
+        FString NormalizedLevelPath = LevelPath;
+        if (!NormalizedLevelPath.StartsWith(TEXT("/Game/")) && !NormalizedLevelPath.StartsWith(TEXT("/Engine/")))
+        {
+            // Try treating as relative to /Game/
+            NormalizedLevelPath = TEXT("/Game/") + NormalizedLevelPath;
+        }
+        
+        // Check if we need to load a different level
+        if (World)
+        {
+            FString CurrentWorldPath = World->GetOutermost()->GetName();
+            if (!CurrentWorldPath.Equals(NormalizedLevelPath, ESearchCase::IgnoreCase))
+            {
+                // Load the specified level
+                UE_LOG(LogMcpAutomationBridgeSubsystem, Log, TEXT("HandleWorldPartitionAction: Loading level %s (current: %s)"), *NormalizedLevelPath, *CurrentWorldPath);
+                
+                FString Filename;
+                if (FPackageName::TryConvertLongPackageNameToFilename(NormalizedLevelPath, Filename, FPackageName::GetMapPackageExtension()))
+                {
+                    FlushRenderingCommands();
+                    bool bLoaded = McpSafeLoadMap(NormalizedLevelPath);
+                    if (!bLoaded)
+                    {
+                        SendAutomationError(RequestingSocket, RequestId, FString::Printf(TEXT("Failed to load level: %s"), *NormalizedLevelPath), TEXT("LOAD_FAILED"));
+                        return true;
+                    }
+                    World = GEditor->GetEditorWorldContext().World();
+                }
+                else
+                {
+                    SendAutomationError(RequestingSocket, RequestId, FString::Printf(TEXT("Invalid level path: %s"), *NormalizedLevelPath), TEXT("INVALID_PATH"));
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            // No current world - load the specified level
+            FString Filename;
+            if (FPackageName::TryConvertLongPackageNameToFilename(NormalizedLevelPath, Filename, FPackageName::GetMapPackageExtension()))
+            {
+                FlushRenderingCommands();
+                bool bLoaded = McpSafeLoadMap(NormalizedLevelPath);
+                if (!bLoaded)
+                {
+                    SendAutomationError(RequestingSocket, RequestId, FString::Printf(TEXT("Failed to load level: %s"), *NormalizedLevelPath), TEXT("LOAD_FAILED"));
+                    return true;
+                }
+                World = GEditor->GetEditorWorldContext().World();
+            }
+            else
+            {
+                SendAutomationError(RequestingSocket, RequestId, FString::Printf(TEXT("Invalid level path: %s"), *NormalizedLevelPath), TEXT("INVALID_PATH"));
+                return true;
+            }
+        }
+    }
+    
     if (!World)
     {
         SendAutomationError(RequestingSocket, RequestId, TEXT("No active editor world."), TEXT("NO_WORLD"));
@@ -130,7 +203,8 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         {
             WPEditorSubsystem->LoadRegion(Bounds);
             TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-            Result->SetStringField(TEXT("action"), TEXT("load_region"));
+            Result->SetStringField(TEXT("action"), TEXT("manage_world_partition"));
+            Result->SetStringField(TEXT("subAction"), TEXT("load_cells"));
             Result->SetStringField(TEXT("method"), TEXT("EditorSubsystem"));
             Result->SetBoolField(TEXT("requested"), true);
             SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested."), Result);
@@ -146,13 +220,14 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
              UWorldPartitionEditorLoaderAdapter* EditorLoaderAdapter = WorldPartition->CreateEditorLoaderAdapter<FLoaderAdapterShape>(World, Bounds, TEXT("MCP Loaded Region"));
              if (EditorLoaderAdapter && EditorLoaderAdapter->GetLoaderAdapter())
              {
-                 EditorLoaderAdapter->GetLoaderAdapter()->SetUserCreated(true);
-                 EditorLoaderAdapter->GetLoaderAdapter()->Load();
-                 TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-                 Result->SetStringField(TEXT("action"), TEXT("load_region"));
-                 Result->SetStringField(TEXT("method"), TEXT("LoaderAdapter"));
-                 Result->SetBoolField(TEXT("requested"), true);
-                 SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested via LoaderAdapter."), Result);
+                  EditorLoaderAdapter->GetLoaderAdapter()->SetUserCreated(true);
+                  EditorLoaderAdapter->GetLoaderAdapter()->Load();
+                  TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                  Result->SetStringField(TEXT("action"), TEXT("manage_world_partition"));
+                  Result->SetStringField(TEXT("subAction"), TEXT("load_cells"));
+                  Result->SetStringField(TEXT("method"), TEXT("LoaderAdapter"));
+                  Result->SetBoolField(TEXT("requested"), true);
+                  SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Region load requested via LoaderAdapter."), Result);
                  return true;
              }
         }
@@ -180,6 +255,8 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         {
             // Check existence
             bool bExists = false;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+            // UE 5.3+: Use UDataLayerManager
             UWorldPartition* WP = World->GetWorldPartition();
             if (UDataLayerManager* DataLayerManager = WP ? WP->GetDataLayerManager() : nullptr)
             {
@@ -192,6 +269,23 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
                     return true;
                 });
             }
+#else
+            // UE 5.0-5.2: Use UDataLayerSubsystem
+            UDataLayerSubsystem* DataLayerSubsys = World->GetSubsystem<UDataLayerSubsystem>();
+            if (DataLayerSubsys)
+            {
+                // Check via DataLayerEditorSubsystem for editor operations
+                TArray<UDataLayerInstance*> ExistingLayers = DataLayerSubsys->GetActorEditorContextDataLayers();
+                for (UDataLayerInstance* LayerInstance : ExistingLayers)
+                {
+                    if (LayerInstance && (LayerInstance->GetDataLayerShortName() == DataLayerName || LayerInstance->GetDataLayerFullName() == DataLayerName))
+                    {
+                        bExists = true;
+                        break;
+                    }
+                }
+            }
+#endif
 
             if (bExists)
             {
@@ -245,20 +339,23 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         FString DataLayerName = GetJsonStringField(Payload, TEXT("dataLayerName"));
 
 #if MCP_HAS_DATALAYER_EDITOR
-        AActor* Actor = FindObject<AActor>(nullptr, *ActorPath);
-        if (!Actor)
+        // CRITICAL FIX: Use TActorIterator to find actors in World Partition levels
+        // FindObject and GetAllLevelActors don't reliably find actors in WP external packages
+        AActor* Actor = nullptr;
+        
+        // First try FindObject with the path (for full object paths)
+        Actor = FindObject<AActor>(nullptr, *ActorPath);
+        
+        // If not found, use TActorIterator to search by label/name in the current world
+        if (!Actor && World)
         {
-            // Fallback: Try to find by Actor Label
-            if (UEditorActorSubsystem* ActorSS = GEditor->GetEditorSubsystem<UEditorActorSubsystem>())
+            for (TActorIterator<AActor> It(World); It; ++It)
             {
-                TArray<AActor*> AllActors = ActorSS->GetAllLevelActors();
-                for (AActor* A : AllActors)
+                if (It->GetActorLabel().Equals(ActorPath, ESearchCase::IgnoreCase) ||
+                    It->GetName().Equals(ActorPath, ESearchCase::IgnoreCase))
                 {
-                    if (A && A->GetActorLabel().Equals(ActorPath, ESearchCase::IgnoreCase))
-                    {
-                         Actor = A;
-                         break;
-                    }
+                    Actor = *It;
+                    break;
                 }
             }
         }
@@ -274,6 +371,8 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
         {
             UDataLayerInstance* TargetLayer = nullptr;
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+            // UE 5.3+: Use UDataLayerManager
             if (UDataLayerManager* DataLayerManager = WorldPartition->GetDataLayerManager())
             {
                 DataLayerManager->ForEachDataLayerInstance([&](UDataLayerInstance* LayerInstance) {
@@ -285,6 +384,21 @@ bool UMcpAutomationBridgeSubsystem::HandleWorldPartitionAction(const FString& Re
                     return true; // Continue
                 });
             }
+#else
+            // UE 5.0-5.2: Use UDataLayerSubsystem
+            if (UDataLayerSubsystem* DataLayerSubsys = World->GetSubsystem<UDataLayerSubsystem>())
+            {
+                TArray<UDataLayerInstance*> ExistingLayers = DataLayerSubsys->GetActorEditorContextDataLayers();
+                for (UDataLayerInstance* LayerInstance : ExistingLayers)
+                {
+                    if (LayerInstance && (LayerInstance->GetDataLayerShortName() == DataLayerName || LayerInstance->GetDataLayerFullName() == DataLayerName))
+                    {
+                        TargetLayer = LayerInstance;
+                        break;
+                    }
+                }
+            }
+#endif
 
             if (TargetLayer)
             {
@@ -331,6 +445,8 @@ DataLayerSubsystem->AddActorsToDataLayers(Actors, Layers);
              return true;
         }
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+        // UE 5.3+: Use UDataLayerManager
         UDataLayerManager* DataLayerManager = WorldPartition ? WorldPartition->GetDataLayerManager() : nullptr;
         if (!DataLayerManager)
         {
@@ -340,13 +456,34 @@ DataLayerSubsystem->AddActorsToDataLayers(Actors, Layers);
 
         TArray<UDataLayerInstance*> InvalidInstances;
         DataLayerManager->ForEachDataLayerInstance([&](UDataLayerInstance* LayerInstance) {
-            // Use GetAsset() as GetDataLayerAsset() is not a member (UE 5.x change)
             if (LayerInstance && !LayerInstance->GetAsset())
             {
                 InvalidInstances.Add(LayerInstance);
             }
             return true;
         });
+#else
+        // UE 5.0-5.2: Use UDataLayerSubsystem
+        UDataLayerSubsystem* DataLayerSubsys = World ? World->GetSubsystem<UDataLayerSubsystem>() : nullptr;
+        if (!DataLayerSubsys)
+        {
+             SendAutomationError(RequestingSocket, RequestId, TEXT("DataLayerSubsystem not found."), TEXT("SUBSYSTEM_NOT_FOUND"));
+             return true;
+        }
+
+        TArray<UDataLayerInstance*> InvalidInstances;
+        // In UE 5.2, only UDataLayerInstanceWithAsset has GetAsset()
+        TArray<UDataLayerInstance*> ExistingLayers = DataLayerSubsys->GetActorEditorContextDataLayers();
+        for (UDataLayerInstance* LayerInstance : ExistingLayers)
+        {
+            // Check if it's a UDataLayerInstanceWithAsset with valid asset
+            UDataLayerInstanceWithAsset* LayerWithAsset = Cast<UDataLayerInstanceWithAsset>(LayerInstance);
+            if (LayerInstance && !LayerWithAsset)
+            {
+                InvalidInstances.Add(LayerInstance);
+            }
+        }
+#endif
 
         int32 DeletedCount = 0;
         for (UDataLayerInstance* InvalidInstance : InvalidInstances)

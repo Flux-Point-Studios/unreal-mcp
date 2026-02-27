@@ -7,7 +7,6 @@ import { AutomationBridge } from './automation/index.js';
 import { createRequire } from 'node:module';
 import { responseValidator } from './utils/response-validator.js';
 import { z } from 'zod';
-import { initializeWASM } from './wasm/index.js';
 import { consolidatedToolDefinitions } from './tools/consolidated-tool-definitions.js';
 import { HealthMonitor } from './services/health-monitor.js';
 import { ServerSetup } from './server-setup.js';
@@ -30,7 +29,7 @@ const DEFAULT_SERVER_NAME = typeof packageInfo.name === 'string' && packageInfo.
   : 'unreal-engine-mcp';
 const DEFAULT_SERVER_VERSION = typeof packageInfo.version === 'string' && packageInfo.version.trim().length > 0
   ? packageInfo.version
-  : '0.5.16';
+  : '0.5.18';
 
 function routeStdoutLogsToStderr(): void {
   if (!config.MCP_ROUTE_STDOUT_LOGS) {
@@ -113,13 +112,7 @@ export function createServer() {
     log.warn('GraphQL server failed to start:', error);
   });
 
-  // Initialize WebAssembly module for high-performance operations (5-8x faster)
-  log.debug('Initializing WebAssembly integration...');
-  initializeWASM().then(() => {
-    log.info('✅ WebAssembly integration initialized (JSON parsing and math operations)');
-  }).catch((error) => {
-    log.warn('⚠️ WebAssembly initialization failed, using TypeScript fallbacks:', error);
-  });
+
 
   // Initialize response validation with schemas
   log.debug('Initializing response validation...');
