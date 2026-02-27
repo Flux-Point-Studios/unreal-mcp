@@ -1,20 +1,7 @@
 import { AutomationBridge } from '../automation/index.js';
 
-// Import tool class types (using import type to avoid circular dependencies)
-import type { MaterialTools } from '../tools/materials.js';
-import type { NiagaraTools } from '../tools/niagara.js';
-import type { AnimationTools } from '../tools/animation.js';
-import type { PhysicsTools } from '../tools/physics.js';
-import type { LightingTools } from '../tools/lighting.js';
-import type { DebugVisualizationTools } from '../tools/debug.js';
-import type { PerformanceTools } from '../tools/performance.js';
-import type { AudioTools } from '../tools/audio.js';
-import type { UITools } from '../tools/ui.js';
-import type { IntrospectionTools } from '../tools/introspection.js';
-import type { EngineTools } from '../tools/engine.js';
-import type { BehaviorTreeTools } from '../tools/behavior-tree.js';
+// Import tool class types for file I/O operations (using import type to avoid circular dependencies)
 import type { LogTools } from '../tools/logs.js';
-import type { InputTools } from '../tools/input.js';
 
 export interface IBaseTool {
     getAutomationBridge(): AutomationBridge;
@@ -74,7 +61,7 @@ export interface IAssetTools {
     duplicateAsset(params: { sourcePath: string; destinationPath: string; overwrite?: boolean }): Promise<StandardActionResponse>;
     renameAsset(params: { sourcePath: string; destinationPath: string }): Promise<StandardActionResponse>;
     moveAsset(params: { sourcePath: string; destinationPath: string }): Promise<StandardActionResponse>;
-    deleteAssets(params: { paths: string[]; fixupRedirectors?: boolean; force?: boolean; timeoutMs?: number }): Promise<StandardActionResponse>;
+    deleteAssets(params: { paths: string[]; fixupRedirectors?: boolean; timeoutMs?: number }): Promise<StandardActionResponse>;
     searchAssets(params: { classNames?: string[]; packagePaths?: string[]; recursivePaths?: boolean; recursiveClasses?: boolean; limit?: number }): Promise<StandardActionResponse>;
     saveAsset(assetPath: string): Promise<StandardActionResponse>;
     findByTag(params: { tag: string; value?: string }): Promise<StandardActionResponse>;
@@ -87,16 +74,6 @@ export interface IAssetTools {
     generateReport(params: { directory: string; reportType?: string; outputPath?: string }): Promise<StandardActionResponse>;
     validate(params: { assetPath: string }): Promise<StandardActionResponse>;
     generateLODs(params: { assetPath: string; lodCount: number; reductionSettings?: Record<string, unknown> }): Promise<StandardActionResponse>;
-    /** Dump a UObject/DataAsset to JSON by having Unreal serialize its UPROPERTY fields */
-    dumpAsset(params: {
-        assetPath: string;
-        maxDepth?: number;
-        maxArrayElements?: number;
-        maxMapEntries?: number;
-        includeNulls?: boolean;
-        includeTransient?: boolean;
-        propertyAllowlist?: string[];
-    }): Promise<StandardActionResponse>;
 }
 
 export interface ISequenceTools {
@@ -166,7 +143,7 @@ export interface ILevelTools {
     deleteLevels(params: { levelPaths: string[] }): Promise<StandardActionResponse>;
     loadLevel(params: { levelPath: string; streaming?: boolean; position?: [number, number, number] }): Promise<StandardActionResponse>;
     saveLevel(params: { levelName?: string; savePath?: string }): Promise<StandardActionResponse>;
-    createLevel(params: { levelName: string; template?: 'Empty' | 'Default' | 'VR' | 'TimeOfDay'; savePath?: string }): Promise<StandardActionResponse>;
+    createLevel(params: { levelName: string; template?: 'Empty' | 'Default' | 'VR' | 'TimeOfDay'; savePath?: string; useWorldPartition?: boolean }): Promise<StandardActionResponse>;
     addSubLevel(params: { parentLevel?: string; subLevelPath: string; streamingMethod?: 'Blueprint' | 'AlwaysLoaded' }): Promise<StandardActionResponse>;
     streamLevel(params: { levelPath?: string; levelName?: string; shouldBeLoaded: boolean; shouldBeVisible?: boolean; position?: [number, number, number] }): Promise<StandardActionResponse>;
     setupWorldComposition(params: { enableComposition: boolean; tileSize?: number; distanceStreaming?: boolean; streamingDistance?: number }): Promise<StandardActionResponse>;
@@ -254,29 +231,26 @@ export interface ITools {
     foliageTools: IFoliageTools;
     environmentTools: IEnvironmentTools;
 
-    // Tool class types (imported to replace 'any')
-    materialTools: MaterialTools;
-    niagaraTools: NiagaraTools;
-    animationTools: AnimationTools;
-    physicsTools: PhysicsTools;
-    lightingTools: LightingTools;
-    debugTools: DebugVisualizationTools;
-    performanceTools: PerformanceTools;
-    audioTools: AudioTools;
-    uiTools: UITools;
-    introspectionTools: IntrospectionTools;
-    visualTools?: DebugVisualizationTools;
-    engineTools: EngineTools;
+    // File I/O tool classes (kept for local file operations)
+    logTools: LogTools;
+
     systemTools: {
         executeConsoleCommand: (command: string) => Promise<unknown>;
         getProjectSettings: (section?: string) => Promise<Record<string, unknown>>;
     };
-    behaviorTreeTools: BehaviorTreeTools;
-    logTools: LogTools;
-    inputTools?: InputTools;
-    pythonTools?: import('../tools/python.js').PythonTools;
 
+    // Elicitation support - using function types
+    elicit?: unknown;
+    supportsElicitation?: () => boolean;
+    elicitationTimeoutMs?: number;
+    // Resources
+    actorResources?: unknown;
+    levelResources?: unknown;
+
+    // Bridge references
     automationBridge?: AutomationBridge;
+    bridge?: unknown; // UnrealBridge
+
     // Index signature allows additional tool properties
     // Using 'unknown' instead of 'any' for type safety - callers must narrow types when accessing
     [key: string]: unknown;

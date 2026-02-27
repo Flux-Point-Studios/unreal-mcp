@@ -33,6 +33,7 @@ import {
     type LaunchMode
 } from '../utils/editor-launch.js';
 import { automationMessageSchema } from './message-schema.js';
+import { config } from '../config.js';
 
 const require = createRequire(import.meta.url);
 const packageInfo: { name?: string; version?: string } = (() => {
@@ -901,8 +902,9 @@ export class AutomationBridge extends EventEmitter {
         payload: Record<string, unknown>,
         options: { timeoutMs?: number }
     ): Promise<T> {
-        // Default timeout reduced to 30s - timeout extensions via progress updates keep long operations alive
-        const timeoutMs = options.timeoutMs ?? 30000;
+    // Default timeout from config (MCP_REQUEST_TIMEOUT_MS env var), fallback to 30s
+    // Timeout extensions via progress updates keep long operations alive
+    const timeoutMs = options.timeoutMs ?? config.MCP_REQUEST_TIMEOUT_MS;
 
         // Check for coalescing
         const coalesceKey = this.requestTracker.createCoalesceKey(action, payload);

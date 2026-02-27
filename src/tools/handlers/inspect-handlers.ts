@@ -22,7 +22,6 @@ interface InspectResponse {
  */
 const INSPECT_ACTION_ALIASES: Record<string, string> = {
   'get_actor_details': 'inspect_object',
-  'get_component_details': 'get_component_property',
   'get_material_details': 'inspect_object',
   'get_texture_details': 'inspect_object',
   'get_mesh_details': 'inspect_object',
@@ -60,12 +59,34 @@ async function resolveComponentObjectPathFromArgs(args: HandlerArgs, tools: IToo
   );
   if (direct) return direct;
 
-  const actorName = await resolveObjectPath(args, tools, { pathKeys: [], actorKeys: ['actorName', 'name', 'objectPath'] });
+  // Check if objectPath itself is a component path (e.g., "ActorName.ComponentName")
+  const rawObjectPath = typeof argsTyped.objectPath === 'string' ? argsTyped.objectPath.trim() : '';
+  const objectPathLooksLikeComponent = rawObjectPath && 
+    !rawObjectPath.includes('/') && 
+    !rawObjectPath.includes('\\') &&
+    rawObjectPath.includes('.') &&
+    rawObjectPath.split('.').length === 2;
+
+  // Extract actor name from either explicit actorName or from objectPath if it looks like component path
+  let actorName: string | undefined;
+  let effectiveComponentName = componentName;
+
+  if (objectPathLooksLikeComponent && !componentName) {
+    // objectPath is "ActorName.ComponentName" format
+    const parts = rawObjectPath.split('.');
+    actorName = parts[0];
+    effectiveComponentName = parts[1];
+  } else {
+    actorName = await resolveObjectPath(args, tools, { pathKeys: [], actorKeys: ['actorName', 'name', 'objectPath'] });
+  }
+
   if (!actorName) {
     throw new Error('Invalid actorName: required to resolve componentName');
   }
-  if (!componentName) {
-    throw new Error('Invalid componentName: must be a non-empty string');
+
+  // If no component name was provided or extracted, just return the actor path
+  if (!effectiveComponentName) {
+    return actorName;
   }
 
   // Use inspect:get_components to find the exact component path
@@ -85,7 +106,7 @@ async function resolveComponentObjectPathFromArgs(args: HandlerArgs, tools: IToo
     components = Array.isArray(compsRes?.components) ? compsRes.components : [];
   }
 
-  const needle = componentName.toLowerCase();
+  const needle = effectiveComponentName.toLowerCase();
 
   if (components.length > 0) {
     // 1. Exact Name/Path Match
@@ -115,7 +136,7 @@ async function resolveComponentObjectPathFromArgs(args: HandlerArgs, tools: IToo
 
   // Fallback: Construct path manually using original request
   // Use dot notation for subobjects
-  return `${actorName}.${componentName}`;
+  return `${actorName}.${effectiveComponentName}`;
 }
 
 
@@ -137,7 +158,35 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
   
   switch (normalizedAction) {
     case 'inspect_object': {
-      const objectPath = await resolveObjectPath(normalizedArgs, tools);
+      // Check if this is a component path (dot notation like "Actor.Component")
+      // Must NOT be a file path (contains slashes or backslashes)
+      // and componentName must be provided OR objectPath looks like "ActorName.ComponentName"
+      const rawObjectPath = normalizedArgs.objectPath as string | undefined;
+      const hasComponentName = typeof normalizedArgs.componentName === 'string' && 
+        normalizedArgs.componentName.trim().length > 0;
+      
+      // Only treat as component path if:
+      // 1. componentName is explicitly provided, OR
+      // 2. objectPath looks like "ActorName.ComponentName" (no slashes, has exactly one dot with content on both sides)
+      const looksLikeComponentPath = rawObjectPath && 
+        !rawObjectPath.includes('/') && 
+        !rawObjectPath.includes('\\') &&
+        rawObjectPath.includes('.') &&
+        rawObjectPath.split('.').length === 2 &&
+        rawObjectPath.split('.')[0].length > 0 &&
+        rawObjectPath.split('.')[1].length > 0;
+      
+      let objectPath: string;
+      
+      if (hasComponentName || looksLikeComponentPath) {
+        // Use component resolution for dot notation paths
+        // This handles "Actor.Component" syntax by finding the actual component path
+        objectPath = await resolveComponentObjectPathFromArgs(normalizedArgs, tools);
+      } else {
+        // Standard object path resolution for actors, assets, etc.
+        objectPath = await resolveObjectPath(normalizedArgs, tools) ?? '';
+      }
+      
       if (!objectPath) {
         throw new Error('Invalid objectPath: must be a non-empty string');
       }
@@ -181,7 +230,8 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
         throw new Error('Invalid objectPath: must be a non-empty string');
       }
 
-      const res = await tools.introspectionTools.getProperty({
+      const res = await executeAutomationRequest(tools, 'inspect', {
+        action: 'get_property',
         objectPath,
         propertyName
       }) as InspectResponse;
@@ -194,7 +244,8 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
 
           // Strategy 1: Check RootComponent (Most common for transform/mobility)
           try {
-            const rootRes = await tools.introspectionTools.getProperty({
+            const rootRes = await executeAutomationRequest(tools, 'inspect', {
+              action: 'get_property',
               objectPath: actorName,
               propertyName: 'RootComponent'
             }) as InspectResponse;
@@ -207,7 +258,8 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
 
             if (rootRes.success && rootPath && typeof rootPath === 'string' && rootPath.length > 0 && rootPath !== 'None') {
               triedPaths.push(rootPath);
-              const propRes = await tools.introspectionTools.getProperty({
+              const propRes = await executeAutomationRequest(tools, 'inspect', {
+                action: 'get_property',
                 objectPath: rootPath,
                 propertyName
               }) as InspectResponse;
@@ -225,7 +277,11 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
             // Strategy 2: Iterate all components
             // Use ActorTools directly with the input/original name (args.objectPath)
             const shortName = String(argsTyped.objectPath || '').trim();
-            const compsRes = await tools.actorTools.getComponents(shortName) as InspectResponse;
+            const compsRes = await executeAutomationRequest(tools, 'inspect', {
+              action: 'get_components',
+              actorName: shortName,
+              objectPath: shortName
+            }) as InspectResponse;
 
             if (compsRes.success && (Array.isArray(compsRes.components) || Array.isArray(compsRes))) {
               const list: ComponentInfo[] = Array.isArray(compsRes.components) 
@@ -242,7 +298,8 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
                 triedPathsInner.push(compPath);
 
                 // Quick check: Try to get property on component
-                const compRes = await tools.introspectionTools.getProperty({
+                const compRes = await executeAutomationRequest(tools, 'inspect', {
+                  action: 'get_property',
                   objectPath: compPath,
                   propertyName
                 }) as InspectResponse;
@@ -258,13 +315,13 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
               // End of loop - if we're here, nothing found
               return cleanObject({
                 ...res,
-                message: res.message + ` (Smart Lookup failed. Tried: ${triedPathsInner.length} paths. First: ${triedPathsInner[0]}. Components: ${list.map((c) => c.name).join(',')})`,
+                message: (res.message as string) + ` (Smart Lookup failed. Tried: ${triedPathsInner.length} paths. First: ${triedPathsInner[0]}. Components: ${list.map((c) => c.name).join(',')})`,
                 smartLookupTriedPaths: triedPathsInner
               });
             } else {
               return cleanObject({
                 ...res,
-                message: res.message + ' (Smart Lookup failed: get_components returned ' + (compsRes.success ? 'success but no list' : 'failure: ' + compsRes.error) + ' | Name: ' + shortName + ' Path: ' + actorName + ')',
+                message: (res.message as string) + ' (Smart Lookup failed: get_components returned ' + (compsRes.success ? 'success but no list' : 'failure: ' + compsRes.error) + ' | Name: ' + shortName + ' Path: ' + actorName + ')',
                 smartLookupGetComponentsError: compsRes
               });
             }
@@ -272,7 +329,7 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
             const errorMsg = _e instanceof Error ? _e.message : String(_e);
             return cleanObject({
               ...res,
-              message: res.message + ' (Smart Lookup exception: ' + errorMsg + ')',
+              message: (res.message as string) + ' (Smart Lookup exception: ' + errorMsg + ')',
               error: res.error
             });
           }
@@ -293,7 +350,8 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
         throw new Error('Invalid objectPath: must be a non-empty string');
       }
 
-      const res = await tools.introspectionTools.setProperty({
+      const res = await executeAutomationRequest(tools, 'inspect', {
+        action: 'set_property',
         objectPath,
         propertyName,
         value
@@ -338,10 +396,11 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
       ]);
       const propertyName = extractString(params, 'propertyName');
 
-      const res = await tools.introspectionTools.getProperty({
+      const res = await executeAutomationRequest(tools, 'inspect', {
+        action: 'get_property',
         objectPath: componentObjectPath,
         propertyName
-      });
+      }) as Record<string, unknown>;
       return cleanObject(res);
     }
     case 'set_component_property': {
@@ -353,17 +412,38 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
       const propertyName = extractString(params, 'propertyName');
       const value = params.value;
 
-      const res = await tools.introspectionTools.setProperty({
+      const res = await executeAutomationRequest(tools, 'inspect', {
+        action: 'set_property',
         objectPath: componentObjectPath,
         propertyName,
         value
-      });
+      }) as Record<string, unknown>;
+      return cleanObject(res);
+    }
+    case 'get_component_details': {
+      // Get component details by inspecting the component object
+      const componentObjectPath = await resolveComponentObjectPathFromArgs(args, tools);
+      
+      const res = await executeAutomationRequest(
+        tools,
+        'inspect',
+        {
+          action: 'inspect_object',
+          objectPath: componentObjectPath,
+          detailed: true
+        },
+        'Failed to get component details'
+      ) as InspectResponse;
+      
       return cleanObject(res);
     }
     case 'get_metadata': {
       const actorName = await resolveObjectPath(args, tools);
       if (!actorName) throw new Error('Invalid actorName');
-      return cleanObject(await tools.actorTools.getMetadata(actorName));
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'get_metadata',
+        actorName
+      }) as Record<string, unknown>);
     }
     case 'add_tag': {
       const actorName = await resolveObjectPath(args, tools);
@@ -373,35 +453,39 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
       const tag = extractString(params, 'tag');
 
       if (!actorName) throw new Error('Invalid actorName');
-      return cleanObject(await tools.actorTools.addTag({
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'add_tag',
         actorName,
         tag
-      }));
+      }) as Record<string, unknown>);
     }
     case 'find_by_tag': {
       const params = normalizeArgs(args, [{ key: 'tag' }]);
       const tag = extractOptionalString(params, 'tag') ?? '';
-      return cleanObject(await tools.actorTools.findByTag({
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'find_by_tag',
         tag
-      }));
+      }) as Record<string, unknown>);
     }
     case 'create_snapshot': {
       const actorName = await resolveObjectPath(args, tools);
       if (!actorName) throw new Error('actorName is required for create_snapshot');
       const snapshotName = typeof argsTyped.snapshotName === 'string' ? argsTyped.snapshotName : '';
-      return cleanObject(await tools.actorTools.createSnapshot({
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'create_snapshot',
         actorName,
         snapshotName
-      }));
+      }) as Record<string, unknown>);
     }
     case 'restore_snapshot': {
       const actorName = await resolveObjectPath(args, tools);
       if (!actorName) throw new Error('actorName is required for restore_snapshot');
       const snapshotName = typeof argsTyped.snapshotName === 'string' ? argsTyped.snapshotName : '';
-      return cleanObject(await tools.actorTools.restoreSnapshot({
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'restore_snapshot',
         actorName,
         snapshotName
-      }));
+      }) as Record<string, unknown>);
     }
     case 'export': {
       const actorName = await resolveObjectPath(args, tools);
@@ -410,23 +494,49 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
         { key: 'destinationPath', aliases: ['outputPath'] }
       ]);
       const destinationPath = extractOptionalString(params, 'destinationPath');
-      return cleanObject(await tools.actorTools.exportActor({
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'export',
         actorName: actorName || '',
         destinationPath
-      }));
+      }) as Record<string, unknown>);
     }
     case 'delete_object': {
       const actorName = await resolveObjectPath(args, tools);
       try {
         if (!actorName) throw new Error('actorName is required for delete_object');
-        const res = await tools.actorTools.delete({
+        const res = await executeAutomationRequest(tools, 'control_actor', {
+          action: 'delete',
           actorName
-        });
+        }) as InspectResponse;
+        
+        // Handle response-based errors (C++ returns success:false without throwing)
+        if (res && res.success === false) {
+          const msg = String(res.message || res.error || '');
+          const lower = msg.toLowerCase();
+          // Check for both singular "actor not found" and plural "actors not found"
+          if (lower.includes('actor not found') || lower.includes('actors not found') || lower.includes('not found')) {
+            return cleanObject({
+              success: false,
+              error: res.error || 'NOT_FOUND',
+              handled: true,
+              message: msg,
+              deleted: actorName,
+              notFound: true
+            });
+          }
+          // Other errors - return with handled flag
+          return cleanObject({
+            ...res,
+            handled: true,
+            notFound: lower.includes('not found')
+          });
+        }
         return cleanObject(res);
       } catch (err: unknown) {
         const msg = String(err instanceof Error ? err.message : err);
         const lower = msg.toLowerCase();
-        if (lower.includes('actor not found')) {
+        // Check for both singular "actor not found" and plural "actors not found"
+        if (lower.includes('actor not found') || lower.includes('actors not found') || lower.includes('not found')) {
           return cleanObject({
             success: false,
             error: 'NOT_FOUND',
@@ -440,13 +550,19 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
       }
     }
     case 'list_objects':
-      return cleanObject(await tools.actorTools.listActors(args as { filter?: string }));
+      return cleanObject(await executeAutomationRequest(tools, 'control_actor', {
+        action: 'list_actors',
+        ...args
+      }) as Record<string, unknown>);
     case 'find_by_class': {
       const params = normalizeArgs(args, [
         { key: 'className', aliases: ['classPath'], required: true }
       ]);
       const className = extractString(params, 'className');
-      const res = await tools.introspectionTools.findObjectsByClass(className) as InspectResponse;
+      const res = await executeAutomationRequest(tools, 'inspect', {
+        action: 'find_by_class',
+        className
+      }) as InspectResponse;
       if (!res || res.success === false) {
         // Return proper failure state
         return cleanObject({
@@ -464,7 +580,10 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
       const actorName = await resolveObjectPath(args, tools);
       try {
         if (!actorName) throw new Error('actorName is required for get_bounding_box');
-        const res = await tools.actorTools.getBoundingBox(actorName);
+        const res = await executeAutomationRequest(tools, 'control_actor', {
+          action: 'get_bounding_box',
+          actorName
+        }) as Record<string, unknown>;
         return cleanObject(res);
       } catch (err: unknown) {
         const msg = String(err instanceof Error ? err.message : err);
@@ -498,13 +617,19 @@ export async function handleInspectTools(action: string, args: HandlerArgs, tool
         }
       }
 
-      const res = await tools.introspectionTools.getCDO(className) as InspectResponse;
+      const res = await executeAutomationRequest(tools, 'inspect', {
+        action: 'inspect_class',
+        className
+      }) as InspectResponse;
       if (!res || res.success === false) {
         // If first try failed and it looked like a short name, maybe try standard engine path?
         const originalClassName = typeof argsTyped.className === 'string' ? argsTyped.className : '';
         if (originalClassName && !originalClassName.includes('/') && !className.startsWith('/Script/')) {
           const retryName = `/Script/Engine.${originalClassName}`;
-          const resRetry = await tools.introspectionTools.getCDO(retryName) as InspectResponse;
+          const resRetry = await executeAutomationRequest(tools, 'inspect', {
+            action: 'inspect_class',
+            className: retryName
+          }) as InspectResponse;
           if (resRetry && resRetry.success) {
             return cleanObject(resRetry);
           }

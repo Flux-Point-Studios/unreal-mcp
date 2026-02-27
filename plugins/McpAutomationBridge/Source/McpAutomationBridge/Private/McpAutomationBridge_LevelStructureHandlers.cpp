@@ -54,6 +54,8 @@
 #include "AssetToolsModule.h"
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 #include "WorldPartition/WorldPartitionMiniMapVolume.h"
+#endif
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
 #include "WorldPartition/RuntimeHashSet/WorldPartitionRuntimeHashSet.h"
 #endif
 #include "WorldPartition/WorldPartitionRuntimeSpatialHash.h"
@@ -214,8 +216,9 @@ static bool HandleCreateLevel(
         FullPath = TEXT("/Game/") + FullPath;
     }
 
-    // CRITICAL: Check if level already exists to prevent WorldSettings collision crash
-    // This prevents Fatal Error: "Cannot generate unique name for 'WorldSettings'"
+    // IDEMPOTENT: Check if level already exists and return success if so
+    // This makes create_level idempotent - calling it multiple times with the same path succeeds
+    // The level is not recreated if it already exists (prevents WorldSettings collision crash)
     
     // Check 1: Check if package exists IN MEMORY (from previous operations in same session)
     // This catches cases where a level was created but the asset registry hasn't synced yet
@@ -226,9 +229,14 @@ static bool HandleCreateLevel(
         UWorld* ExistingWorld = FindObject<UWorld>(ExistingPackage, *LevelName);
         if (ExistingWorld)
         {
-            Subsystem->SendAutomationResponse(Socket, RequestId, false,
-                FString::Printf(TEXT("Level already exists in memory: %s. Use load_level or provide a different name."), *FullPath),
-                nullptr, TEXT("LEVEL_ALREADY_EXISTS"));
+            // IDEMPOTENT: Level exists in memory - return success with exists flag
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            Result->SetStringField(TEXT("levelPath"), FullPath);
+            Result->SetBoolField(TEXT("exists"), true);
+            Result->SetBoolField(TEXT("alreadyExisted"), true);
+            Subsystem->SendAutomationResponse(Socket, RequestId, true,
+                FString::Printf(TEXT("Level already exists: %s"), *FullPath),
+                Result, FString());
             return true;
         }
     }
@@ -236,9 +244,14 @@ static bool HandleCreateLevel(
     // Check 2: Check if package exists ON DISK (covers previously saved levels)
     if (FPackageName::DoesPackageExist(FullPath))
     {
-        Subsystem->SendAutomationResponse(Socket, RequestId, false,
-            FString::Printf(TEXT("Level already exists: %s. Use load_level or provide a different name."), *FullPath),
-            nullptr, TEXT("LEVEL_ALREADY_EXISTS"));
+        // IDEMPOTENT: Level exists on disk - return success with exists flag
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("levelPath"), FullPath);
+        Result->SetBoolField(TEXT("exists"), true);
+        Result->SetBoolField(TEXT("alreadyExisted"), true);
+        Subsystem->SendAutomationResponse(Socket, RequestId, true,
+            FString::Printf(TEXT("Level already exists: %s"), *FullPath),
+            Result, FString());
         return true;
     }
 
@@ -295,7 +308,7 @@ static bool HandleCreateLevel(
         // exceptions on Intel GPUs due to render thread race conditions.
         // The safe wrapper suspends rendering during save and implements retry logic.
         // Explicitly use 5 retries for Intel GPU resilience (max 7.75s total retry time).
-        bSaveSucceeded = McpSafeLevelSave(NewWorld->PersistentLevel, FullPath, 5);
+        bSaveSucceeded = McpSafeLevelSave(NewWorld->PersistentLevel, FullPath);
 
         if (bSaveSucceeded)
         {
@@ -330,8 +343,15 @@ static bool HandleCreateLevel(
     }
 
     // If save was requested but failed, report error
+    // NOTE: We do NOT clean up the level from memory because:
+    // 1. McpSafeLevelSave now uses FPackageName::DoesPackageExist as fallback verification
+    // 2. The file might actually exist on disk even if file verification timed out
+    // 3. The idempotent check will find it on retry and return success
+    // 4. Cleaning up causes race conditions where the level exists on disk but not in memory
     if (bSave && !bSaveSucceeded)
     {
+        UE_LOG(LogMcpLevelStructureHandlers, Warning, TEXT("Save verification reported failure, but level may exist on disk: %s"), *FullPath);
+        
         Subsystem->SendAutomationResponse(Socket, RequestId, false,
             FString::Printf(TEXT("Level created but save verification failed: %s"), *FullPath),
             ResponseJson, TEXT("SAVE_VERIFICATION_FAILED"));
@@ -866,7 +886,7 @@ static bool HandleConfigureGridSize(
 
     // Check if we're dealing with RuntimeSpatialHash or RuntimeHashSet
     UWorldPartitionRuntimeSpatialHash* SpatialHash = Cast<UWorldPartitionRuntimeSpatialHash>(RuntimeHash);
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
     UWorldPartitionRuntimeHashSet* HashSet = Cast<UWorldPartitionRuntimeHashSet>(RuntimeHash);
 
     if (!SpatialHash && !HashSet)
@@ -877,7 +897,7 @@ static bool HandleConfigureGridSize(
         // Neither supported hash type
         TSharedPtr<FJsonObject> ErrorJson = MakeShareable(new FJsonObject());
         ErrorJson->SetStringField(TEXT("currentHashType"), RuntimeHash->GetClass()->GetName());
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
         ErrorJson->SetStringField(TEXT("supportedHashTypes"), TEXT("WorldPartitionRuntimeSpatialHash, WorldPartitionRuntimeHashSet"));
 #else
         ErrorJson->SetStringField(TEXT("supportedHashTypes"), TEXT("WorldPartitionRuntimeSpatialHash"));
@@ -893,8 +913,8 @@ static bool HandleConfigureGridSize(
     }
 
 #if WITH_EDITORONLY_DATA
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
-    // Handle RuntimeHashSet (UE 5.1+ only)
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+    // Handle RuntimeHashSet (UE 5.3+ only)
     if (HashSet)
     {
         // For HashSet, we use the RuntimePartitions API instead of Grids
@@ -1095,7 +1115,7 @@ static bool HandleConfigureGridSize(
             NewGrid->LoadingRange = LoadingRange;
             NewGrid->bBlockOnSlowStreaming = bBlockOnSlowStreaming;
             NewGrid->Priority = Priority;
-#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
             NewGrid->Origin = FVector2D::ZeroVector;
 #endif
             NewGrid->DebugColor = FLinearColor::MakeRandomColor();
@@ -1310,7 +1330,9 @@ static bool HandleCreateDataLayer(
     FDataLayerCreationParameters CreationParams;
     CreationParams.DataLayerAsset = NewDataLayerAsset;
     CreationParams.WorldDataLayers = World->GetWorldDataLayers();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
     CreationParams.bIsPrivate = bIsPrivate;
+#endif
 
     UDataLayerInstance* NewDataLayerInstance = DataLayerEditorSubsystem->CreateDataLayerInstance(CreationParams);
     if (!NewDataLayerInstance)
@@ -1322,10 +1344,7 @@ static bool HandleCreateDataLayer(
     }
 
     // Configure initial visibility and loaded state
-    // Note: SetDataLayerIsInitiallyVisible was removed in UE 5.5
-    #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 4
-    DataLayerEditorSubsystem->SetDataLayerIsInitiallyVisible(NewDataLayerInstance, bIsInitiallyVisible);
-#endif
+    DataLayerEditorSubsystem->SetDataLayerVisibility(NewDataLayerInstance, bIsInitiallyVisible);
     DataLayerEditorSubsystem->SetDataLayerIsLoadedInEditor(NewDataLayerInstance, bIsInitiallyLoaded, false);
 
     // Mark world dirty

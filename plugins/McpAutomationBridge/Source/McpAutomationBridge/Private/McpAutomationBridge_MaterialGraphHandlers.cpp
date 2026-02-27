@@ -17,17 +17,7 @@
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Engine/Texture.h"
 
-// UE 5.0 vs 5.1+ API compatibility macros
-// UE 5.0: Direct member access (Material->Expressions, Material->BaseColor, etc.)
-// UE 5.1+: Access via GetEditorOnlyData() struct
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
-#define MCP_GET_MATERIAL_EXPRESSIONS(Material) (Material)->GetEditorOnlyData()->ExpressionCollection.Expressions
-#define MCP_GET_MATERIAL_INPUT(Material, InputName) (Material)->GetEditorOnlyData()->InputName
-#else
-#define MCP_GET_MATERIAL_EXPRESSIONS(Material) (Material)->Expressions
-#define MCP_GET_MATERIAL_INPUT(Material, InputName) (Material)->InputName
-#endif
-#endif
+// Material API compatibility macros are defined in McpAutomationBridgeHelpers.h
 
 bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
     const FString &RequestId, const FString &Action,
@@ -68,10 +58,32 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
     return true;
   }
 
-  auto FindExpressionByIdOrName =
-      [&](const FString &IdOrName) -> UMaterialExpression * {
+  // Helper function to find expression by ID, name, or index
+  // Supports: GUID string, node name, object path, parameter name, or numeric index
+  auto FindExpressionByIdOrNameOrIndex =
+      [&](const FString &IdOrName, int32 Index = -1) -> UMaterialExpression * {
+    // First, try index-based lookup if Index is valid
+    if (Index >= 0) {
+      const TArray<UMaterialExpression*> &Expressions = MCP_GET_MATERIAL_EXPRESSIONS(Material);
+      if (Index < Expressions.Num()) {
+        return Expressions[Index];
+      }
+      return nullptr; // Index out of bounds
+    }
+    
+    // If IdOrName is empty, return nullptr
     if (IdOrName.IsEmpty()) {
       return nullptr;
+    }
+
+    // Try to parse as numeric index first (e.g., "0", "1", "2")
+    int32 ParsedIndex = -1;
+    if (IdOrName.IsNumeric()) {
+      ParsedIndex = FCString::Atoi(*IdOrName);
+      const TArray<UMaterialExpression*> &Expressions = MCP_GET_MATERIAL_EXPRESSIONS(Material);
+      if (ParsedIndex >= 0 && ParsedIndex < Expressions.Num()) {
+        return Expressions[ParsedIndex];
+      }
     }
 
     const FString Needle = IdOrName.TrimStartAndEnd();
@@ -98,6 +110,28 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
         }
       }
     }
+    return nullptr;
+  };
+
+  // Wrapper that accepts both string ID and numeric index
+  auto FindExpressionByPayload = [&](const FString &IdField, const FString &IndexField) -> UMaterialExpression* {
+    // Check for numeric index first (e.g., fromExpression: 0)
+    int32 Index = -1;
+    if (Payload->TryGetNumberField(*IndexField, Index) && Index >= 0) {
+      return FindExpressionByIdOrNameOrIndex(FString(), Index);
+    }
+    
+    // Then check for string ID
+    FString IdOrName;
+    if (Payload->TryGetStringField(*IdField, IdOrName) && !IdOrName.IsEmpty()) {
+      return FindExpressionByIdOrNameOrIndex(IdOrName);
+    }
+    
+    // Also check if IdField contains a numeric string
+    if (Payload->TryGetStringField(*IdField, IdOrName) && IdOrName.IsNumeric()) {
+      return FindExpressionByIdOrNameOrIndex(IdOrName);
+    }
+    
     return nullptr;
   };
 
@@ -181,6 +215,36 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
         }
       }
 
+      // FPS FIX: If TextureSample, set Texture from texturePath or parameters.Texture
+      if (UMaterialExpressionTextureSample *TexSample =
+              Cast<UMaterialExpressionTextureSample>(NewExpr)) {
+        FString TexturePath;
+        if (Payload->TryGetStringField(TEXT("texturePath"), TexturePath) && !TexturePath.IsEmpty()) {
+          UTexture *Texture = LoadObject<UTexture>(nullptr, *TexturePath);
+          if (Texture) {
+            TexSample->Texture = Texture;
+          }
+        }
+        const TSharedPtr<FJsonObject> *ParamsObj = nullptr;
+        if (Payload->TryGetObjectField(TEXT("parameters"), ParamsObj) && ParamsObj) {
+          FString TexPath;
+          if ((*ParamsObj)->TryGetStringField(TEXT("Texture"), TexPath) && !TexPath.IsEmpty()) {
+            UTexture *Texture = LoadObject<UTexture>(nullptr, *TexPath);
+            if (Texture) {
+              TexSample->Texture = Texture;
+            }
+          }
+          FString SamplerTypeStr;
+          if ((*ParamsObj)->TryGetStringField(TEXT("SamplerType"), SamplerTypeStr)) {
+            if (SamplerTypeStr.Contains(TEXT("Normal"))) {
+              TexSample->SamplerType = SAMPLERTYPE_Normal;
+            } else if (SamplerTypeStr.Contains(TEXT("Masks")) || SamplerTypeStr.Contains(TEXT("Linear"))) {
+              TexSample->SamplerType = SAMPLERTYPE_LinearColor;
+            }
+          }
+        }
+      }
+
       Material->PostEditChange();
       Material->MarkPackageDirty();
 
@@ -200,14 +264,18 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
   } else if (SubAction == TEXT("remove_node")) {
     FString NodeId;
     Payload->TryGetStringField(TEXT("nodeId"), NodeId);
+    
+    // Also check for expressionIndex (numeric index)
+    int32 ExpressionIndex = -1;
+    Payload->TryGetNumberField(TEXT("expressionIndex"), ExpressionIndex);
 
-    if (NodeId.IsEmpty()) {
-      SendAutomationError(Socket, RequestId, TEXT("Missing 'nodeId'."),
+    if (NodeId.IsEmpty() && ExpressionIndex < 0) {
+      SendAutomationError(Socket, RequestId, TEXT("Missing 'nodeId' or 'expressionIndex'."),
                           TEXT("INVALID_ARGUMENT"));
       return true;
     }
 
-    UMaterialExpression *TargetExpr = FindExpressionByIdOrName(NodeId);
+    UMaterialExpression *TargetExpr = FindExpressionByIdOrNameOrIndex(NodeId, ExpressionIndex);
 
     if (TargetExpr) {
       FString RemovedNodeId = TargetExpr->MaterialExpressionGuid.ToString();
@@ -238,12 +306,31 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
     // Material graph connections are complex because inputs are structs on the
     // expression, not EdGraph pins We need to find the target expression and
     // set its input
+    
+    // Support both string IDs and numeric indices for source/target
+    // fromExpression/sourceNodeId: string ID or numeric index
+    // toExpression/targetNodeId: string ID or numeric index (or empty for main material)
     FString SourceNodeId, TargetNodeId, InputName;
     Payload->TryGetStringField(TEXT("sourceNodeId"), SourceNodeId);
     Payload->TryGetStringField(TEXT("targetNodeId"), TargetNodeId);
     Payload->TryGetStringField(TEXT("inputName"), InputName);
+    
+    // Also check for newer parameter names
+    if (SourceNodeId.IsEmpty()) {
+      Payload->TryGetStringField(TEXT("fromExpression"), SourceNodeId);
+    }
+    if (TargetNodeId.IsEmpty()) {
+      Payload->TryGetStringField(TEXT("toExpression"), TargetNodeId);
+    }
+    
+    // Try numeric indices first
+    int32 SourceIndex = -1, TargetIndex = -1;
+    Payload->TryGetNumberField(TEXT("fromExpression"), SourceIndex);
+    Payload->TryGetNumberField(TEXT("toExpression"), TargetIndex);
 
-    UMaterialExpression *SourceExpr = FindExpressionByIdOrName(SourceNodeId);
+    UMaterialExpression *SourceExpr = (SourceIndex >= 0)
+        ? FindExpressionByIdOrNameOrIndex(FString(), SourceIndex)
+        : FindExpressionByIdOrNameOrIndex(SourceNodeId);
 
     if (!SourceExpr) {
       SendAutomationError(Socket, RequestId, TEXT("Source node not found."),
@@ -251,40 +338,58 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       return true;
     }
 
+    // FPS FIX: Parse fromPin to determine OutputIndex for channel selection
+    // TextureSample outputs: 0=RGB, 1=R, 2=G, 3=B, 4=A, 5=RGBA
+    FString FromPin;
+    Payload->TryGetStringField(TEXT("fromPin"), FromPin);
+    int32 OutputIndex = 0;
+    if (!FromPin.IsEmpty()) {
+      if (FromPin == TEXT("R")) OutputIndex = 1;
+      else if (FromPin == TEXT("G")) OutputIndex = 2;
+      else if (FromPin == TEXT("B")) OutputIndex = 3;
+      else if (FromPin == TEXT("A")) OutputIndex = 4;
+      else if (FromPin == TEXT("RGBA")) OutputIndex = 5;
+    }
+
+    // Helper macro to set both Expression and OutputIndex on a material input
+#define MCP_CONNECT_INPUT(InputField) \
+      MCP_GET_MATERIAL_INPUT(Material, InputField).Expression = SourceExpr; \
+      MCP_GET_MATERIAL_INPUT(Material, InputField).OutputIndex = OutputIndex;
+
     // Target could be another expression OR the main material node (if
-    // TargetNodeId is empty or "Main")
-    if (TargetNodeId.IsEmpty() || TargetNodeId == TEXT("Main")) {
+    // TargetNodeId is empty or "Main" or no target specified)
+    if ((TargetNodeId.IsEmpty() || TargetNodeId == TEXT("Main")) && TargetIndex < 0) {
       bool bFound = false;
 #if WITH_EDITORONLY_DATA
       if (InputName == TEXT("BaseColor")) {
-        MCP_GET_MATERIAL_INPUT(Material, BaseColor).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(BaseColor);
         bFound = true;
       } else if (InputName == TEXT("EmissiveColor")) {
-        MCP_GET_MATERIAL_INPUT(Material, EmissiveColor).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(EmissiveColor);
         bFound = true;
       } else if (InputName == TEXT("Roughness")) {
-        MCP_GET_MATERIAL_INPUT(Material, Roughness).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Roughness);
         bFound = true;
       } else if (InputName == TEXT("Metallic")) {
-        MCP_GET_MATERIAL_INPUT(Material, Metallic).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Metallic);
         bFound = true;
       } else if (InputName == TEXT("Specular")) {
-        MCP_GET_MATERIAL_INPUT(Material, Specular).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Specular);
         bFound = true;
       } else if (InputName == TEXT("Normal")) {
-        MCP_GET_MATERIAL_INPUT(Material, Normal).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Normal);
         bFound = true;
       } else if (InputName == TEXT("Opacity")) {
-        MCP_GET_MATERIAL_INPUT(Material, Opacity).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Opacity);
         bFound = true;
       } else if (InputName == TEXT("OpacityMask")) {
-        MCP_GET_MATERIAL_INPUT(Material, OpacityMask).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(OpacityMask);
         bFound = true;
       } else if (InputName == TEXT("AmbientOcclusion")) {
-        MCP_GET_MATERIAL_INPUT(Material, AmbientOcclusion).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(AmbientOcclusion);
         bFound = true;
       } else if (InputName == TEXT("SubsurfaceColor")) {
-        MCP_GET_MATERIAL_INPUT(Material, SubsurfaceColor).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(SubsurfaceColor);
         bFound = true;
       }
 #endif
@@ -305,7 +410,9 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       }
       return true;
     } else {
-      UMaterialExpression *TargetExpr = FindExpressionByIdOrName(TargetNodeId);
+      UMaterialExpression *TargetExpr = (TargetIndex >= 0)
+          ? FindExpressionByIdOrNameOrIndex(FString(), TargetIndex)
+          : FindExpressionByIdOrNameOrIndex(TargetNodeId);
 
       if (TargetExpr) {
         // We have to iterate properties to find the FExpressionInput
@@ -413,7 +520,13 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       }
     }
 
-    UMaterialExpression *TargetExpr = FindExpressionByIdOrName(NodeId);
+    // Also check for expressionIndex
+    int32 ExpressionIndex = -1;
+    Payload->TryGetNumberField(TEXT("expressionIndex"), ExpressionIndex);
+    
+    UMaterialExpression *TargetExpr = (ExpressionIndex >= 0)
+        ? FindExpressionByIdOrNameOrIndex(FString(), ExpressionIndex)
+        : FindExpressionByIdOrNameOrIndex(NodeId);
 
     if (TargetExpr) {
       // Disconnect all inputs of this node if no specific pin name
@@ -438,6 +551,10 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
   } else if (SubAction == TEXT("get_node_details")) {
     FString NodeId;
     Payload->TryGetStringField(TEXT("nodeId"), NodeId);
+    
+    // Also check for expressionIndex
+    int32 ExpressionIndex = -1;
+    Payload->TryGetNumberField(TEXT("expressionIndex"), ExpressionIndex);
 
     UMaterialExpression *TargetExpr = nullptr;
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
@@ -447,9 +564,11 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
     auto& AllExpressions = Material->Expressions;
 #endif
 
-    // If nodeId provided, try to find that specific node
-    if (!NodeId.IsEmpty()) {
-      TargetExpr = FindExpressionByIdOrName(NodeId);
+    // If nodeId or index provided, try to find that specific node
+    if (ExpressionIndex >= 0) {
+      TargetExpr = FindExpressionByIdOrNameOrIndex(FString(), ExpressionIndex);
+    } else if (!NodeId.IsEmpty()) {
+      TargetExpr = FindExpressionByIdOrNameOrIndex(NodeId);
     }
 
     if (TargetExpr) {
@@ -484,17 +603,21 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       Result->SetArrayField(TEXT("availableNodes"), NodeList);
       Result->SetNumberField(TEXT("nodeCount"), AllExpressions.Num());
 
-      FString Message =
-          NodeId.IsEmpty()
-              ? FString::Printf(
-                    TEXT("No nodeId provided. Material has %d nodes."),
-                    AllExpressions.Num())
-              : FString::Printf(
-                    TEXT("Node '%s' not found. Material has %d nodes."),
-                    *NodeId, AllExpressions.Num());
-
-      SendAutomationResponse(Socket, RequestId, false, Message, Result,
-                             TEXT("NODE_NOT_FOUND"));
+      // If no nodeId was provided, this is a successful "list all nodes" operation
+      // If nodeId was provided but not found, return error
+      if (NodeId.IsEmpty() && ExpressionIndex < 0) {
+        FString Message = FString::Printf(
+            TEXT("Material has %d nodes. Available nodes listed."),
+            AllExpressions.Num());
+        SendAutomationResponse(Socket, RequestId, true, Message, Result);
+      } else {
+        FString Message = FString::Printf(
+            TEXT("Node '%s' not found. Material has %d nodes."),
+            NodeId.IsEmpty() ? *FString::FromInt(ExpressionIndex) : *NodeId, 
+            AllExpressions.Num());
+        SendAutomationResponse(Socket, RequestId, false, Message, Result,
+                               TEXT("NODE_NOT_FOUND"));
+      }
     }
     return true;
   }
@@ -940,3 +1063,6 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateMaterialNodes(
   return true;
 #endif // WITH_EDITOR
 }
+
+
+#endif // WITH_EDITOR

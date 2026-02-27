@@ -1,6 +1,6 @@
 {
   "name": "unreal-engine-mcp-server",
-  "version": "0.5.17",
+  "version": "0.5.18",
   "mcpName": "io.github.ChiR24/unreal-engine-mcp",
   "description": "A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control Unreal Engine via native automation bridge. Built with TypeScript and designed for game development automation.",
   "type": "module",
@@ -18,18 +18,18 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build:core": "tsc -p tsconfig.json",
-    "build": "npm run build:core && (npm run build:wasm || echo \"WASM build failed or wasm-pack missing; continuing with TypeScript-only build. To enable WASM, install wasm-pack and re-run npm run build.\")",
+"build:core": "tsc -p tsconfig.json",
+    "build": "npm run clean && npm run build:core",
     "build:watch": "tsc -p tsconfig.json --watch",
     "start": "node dist/cli.js",
     "dev": "ts-node-esm src/cli.ts",
-    "lint": "echo \"Lint: typescript/javascript, C, C++, C#\" && eslint . --ext .ts",
-    "lint:fix": "eslint . --ext .ts --fix",
+    "lint": "echo \"Lint: typescript/javascript, C, C++, C#\" && eslint .",
+    "lint:fix": "eslint . --fix",
     "lint:cpp": "echo \"Running C/C++ lint (cpplint)\" && (python -m cpplint --recursive plugins || echo 'cpplint not found; skipping C/C++ lint')",
     "lint:c": "echo \"Running C lint (cpplint)\" && (python -m cpplint --recursive plugins || echo 'cpplint not found; skipping C lint')",
     "lint:csharp": "echo \"Running C# lint (dotnet format)\" && (dotnet tool run dotnet-format --verify-no-changes || echo 'dotnet-format not available or formatting required; skipping C# lint')",
     "clean": "rimraf dist",
-    "prepare": "npm run build",
+    "prepare": "node -e \"const fs=require('fs');(fs.existsSync('dist')&&fs.existsSync('dist/cli.js')&&fs.existsSync('dist/index.js'))||require('child_process').execSync('npm run build',{stdio:'inherit'})\"",
     "automation:sync": "node scripts/sync-mcp-plugin.js",
     "clean:tmp": "node scripts/clean-tmp.js",
     "test": "node tests/integration.mjs",
@@ -38,9 +38,7 @@
     "test:unit:coverage": "vitest run --coverage",
     "test:all": "node tests/integration.mjs",
     "test:smoke": "node --loader ts-node/esm scripts/smoke-test.ts",
-    "build:wasm": "echo 'Building WebAssembly module...' && cd wasm && wasm-pack build --target web --out-dir ../src/wasm/pkg && cd .. && node scripts/patch-wasm.js",
-    "type-check": "tsc --noEmit",
-    "prebuild": "npm run lint && npm run clean"
+    "type-check": "tsc --noEmit"
   },
   "engines": {
     "node": ">=18"
@@ -70,12 +68,13 @@
     "zod": "^4.2.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.0",
     "@types/node": "^25.0.2",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.50.0",
     "@typescript-eslint/parser": "^8.49.0",
     "@vitest/coverage-v8": "^4.0.16",
-    "eslint": "^9.39.2",
+    "eslint": "^10.0.2",
     "rimraf": "^6.1.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
