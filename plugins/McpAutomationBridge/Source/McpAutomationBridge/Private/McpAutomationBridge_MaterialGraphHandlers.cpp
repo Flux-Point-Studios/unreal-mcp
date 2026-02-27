@@ -215,6 +215,36 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
         }
       }
 
+      // FPS FIX: If TextureSample, set Texture from texturePath or parameters.Texture
+      if (UMaterialExpressionTextureSample *TexSample =
+              Cast<UMaterialExpressionTextureSample>(NewExpr)) {
+        FString TexturePath;
+        if (Payload->TryGetStringField(TEXT("texturePath"), TexturePath) && !TexturePath.IsEmpty()) {
+          UTexture *Texture = LoadObject<UTexture>(nullptr, *TexturePath);
+          if (Texture) {
+            TexSample->Texture = Texture;
+          }
+        }
+        const TSharedPtr<FJsonObject> *ParamsObj = nullptr;
+        if (Payload->TryGetObjectField(TEXT("parameters"), ParamsObj) && ParamsObj) {
+          FString TexPath;
+          if ((*ParamsObj)->TryGetStringField(TEXT("Texture"), TexPath) && !TexPath.IsEmpty()) {
+            UTexture *Texture = LoadObject<UTexture>(nullptr, *TexPath);
+            if (Texture) {
+              TexSample->Texture = Texture;
+            }
+          }
+          FString SamplerTypeStr;
+          if ((*ParamsObj)->TryGetStringField(TEXT("SamplerType"), SamplerTypeStr)) {
+            if (SamplerTypeStr.Contains(TEXT("Normal"))) {
+              TexSample->SamplerType = SAMPLERTYPE_Normal;
+            } else if (SamplerTypeStr.Contains(TEXT("Masks")) || SamplerTypeStr.Contains(TEXT("Linear"))) {
+              TexSample->SamplerType = SAMPLERTYPE_LinearColor;
+            }
+          }
+        }
+      }
+
       Material->PostEditChange();
       Material->MarkPackageDirty();
 
@@ -298,7 +328,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
     Payload->TryGetNumberField(TEXT("fromExpression"), SourceIndex);
     Payload->TryGetNumberField(TEXT("toExpression"), TargetIndex);
 
-    UMaterialExpression *SourceExpr = (SourceIndex >= 0) 
+    UMaterialExpression *SourceExpr = (SourceIndex >= 0)
         ? FindExpressionByIdOrNameOrIndex(FString(), SourceIndex)
         : FindExpressionByIdOrNameOrIndex(SourceNodeId);
 
@@ -308,40 +338,58 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       return true;
     }
 
+    // FPS FIX: Parse fromPin to determine OutputIndex for channel selection
+    // TextureSample outputs: 0=RGB, 1=R, 2=G, 3=B, 4=A, 5=RGBA
+    FString FromPin;
+    Payload->TryGetStringField(TEXT("fromPin"), FromPin);
+    int32 OutputIndex = 0;
+    if (!FromPin.IsEmpty()) {
+      if (FromPin == TEXT("R")) OutputIndex = 1;
+      else if (FromPin == TEXT("G")) OutputIndex = 2;
+      else if (FromPin == TEXT("B")) OutputIndex = 3;
+      else if (FromPin == TEXT("A")) OutputIndex = 4;
+      else if (FromPin == TEXT("RGBA")) OutputIndex = 5;
+    }
+
+    // Helper macro to set both Expression and OutputIndex on a material input
+#define MCP_CONNECT_INPUT(InputField) \
+      MCP_GET_MATERIAL_INPUT(Material, InputField).Expression = SourceExpr; \
+      MCP_GET_MATERIAL_INPUT(Material, InputField).OutputIndex = OutputIndex;
+
     // Target could be another expression OR the main material node (if
     // TargetNodeId is empty or "Main" or no target specified)
     if ((TargetNodeId.IsEmpty() || TargetNodeId == TEXT("Main")) && TargetIndex < 0) {
       bool bFound = false;
 #if WITH_EDITORONLY_DATA
       if (InputName == TEXT("BaseColor")) {
-        MCP_GET_MATERIAL_INPUT(Material, BaseColor).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(BaseColor);
         bFound = true;
       } else if (InputName == TEXT("EmissiveColor")) {
-        MCP_GET_MATERIAL_INPUT(Material, EmissiveColor).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(EmissiveColor);
         bFound = true;
       } else if (InputName == TEXT("Roughness")) {
-        MCP_GET_MATERIAL_INPUT(Material, Roughness).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Roughness);
         bFound = true;
       } else if (InputName == TEXT("Metallic")) {
-        MCP_GET_MATERIAL_INPUT(Material, Metallic).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Metallic);
         bFound = true;
       } else if (InputName == TEXT("Specular")) {
-        MCP_GET_MATERIAL_INPUT(Material, Specular).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Specular);
         bFound = true;
       } else if (InputName == TEXT("Normal")) {
-        MCP_GET_MATERIAL_INPUT(Material, Normal).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Normal);
         bFound = true;
       } else if (InputName == TEXT("Opacity")) {
-        MCP_GET_MATERIAL_INPUT(Material, Opacity).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(Opacity);
         bFound = true;
       } else if (InputName == TEXT("OpacityMask")) {
-        MCP_GET_MATERIAL_INPUT(Material, OpacityMask).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(OpacityMask);
         bFound = true;
       } else if (InputName == TEXT("AmbientOcclusion")) {
-        MCP_GET_MATERIAL_INPUT(Material, AmbientOcclusion).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(AmbientOcclusion);
         bFound = true;
       } else if (InputName == TEXT("SubsurfaceColor")) {
-        MCP_GET_MATERIAL_INPUT(Material, SubsurfaceColor).Expression = SourceExpr;
+        MCP_CONNECT_INPUT(SubsurfaceColor);
         bFound = true;
       }
 #endif
