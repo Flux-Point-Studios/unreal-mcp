@@ -619,6 +619,12 @@ export interface SystemArgs extends HandlerArgs {
     platform?: string;
     configuration?: string;
     arguments?: string;
+    // Script execution fields
+    script_type?: string;
+    script_content?: string;
+    script_name?: string;
+    timeout_seconds?: number;
+    dry_run?: boolean;
 }
 
 // ============================================================================

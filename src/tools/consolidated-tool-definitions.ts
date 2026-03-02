@@ -806,7 +806,7 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
       idempotentHint: false,
       openWorldHint: true
     },
-    description: 'Run profiling, set quality/CVars, execute console commands, run UBT, and manage widgets.',
+    description: 'Run profiling, set quality/CVars, execute console commands, run UBT, manage widgets, and execute scripts (Python, console batch, editor utility).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -817,7 +817,8 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'run_ubt', 'run_tests', 'subscribe', 'unsubscribe', 'spawn_category', 'start_session', 'lumen_update_scene',
             'play_sound', 'create_widget', 'show_widget', 'add_widget_child',
             'set_cvar', 'get_project_settings', 'validate_assets',
-            'set_project_setting'
+            'set_project_setting',
+            'execute_script', 'get_script_history', 'cleanup_scripts'
           ],
           description: 'Action'
         },
@@ -839,7 +840,28 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         section: commonSchemas.stringProp,
         key: commonSchemas.stringProp,
         value: commonSchemas.stringProp,
-        configName: commonSchemas.stringProp
+        configName: commonSchemas.stringProp,
+        script_type: {
+          type: 'string',
+          enum: ['python', 'console_batch', 'editor_utility'],
+          description: 'Type of script to execute (for execute_script action). python: Execute Python script via editor Python plugin. console_batch: Execute multiple console commands separated by newlines. editor_utility: Run an Editor Utility Blueprint/Widget by asset path.'
+        },
+        script_content: {
+          type: 'string',
+          description: 'The script code to execute, or asset path for editor_utility type (for execute_script action).'
+        },
+        script_name: {
+          type: 'string',
+          description: 'Optional friendly name for the script (for logging/history).'
+        },
+        timeout_seconds: {
+          type: 'number',
+          description: 'Execution timeout in seconds (default: 30, max: 300).'
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'If true, validate the script without executing it (for execute_script action).'
+        }
       },
       required: ['action']
     },

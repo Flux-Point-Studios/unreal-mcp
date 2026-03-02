@@ -20,6 +20,13 @@
 #include "Materials/MaterialInstanceConstant.h"
 #include "Exporters/Exporter.h"
 #include "Misc/FileHelper.h"
+#include "Misc/OutputDeviceRedirector.h"
+
+// Editor Utility classes for execute_script (editor_utility type)
+#include "EditorUtilitySubsystem.h"
+#include "EditorUtilityWidgetBlueprint.h"
+#include "EditorUtilityBlueprint.h"
+#include "EditorUtilityObject.h"
 #endif
 
 bool UMcpAutomationBridgeSubsystem::HandleSystemControlAction(
@@ -39,7 +46,8 @@ bool UMcpAutomationBridgeSubsystem::HandleSystemControlAction(
       !Lower.StartsWith(TEXT("run_tests")) &&
       !Lower.StartsWith(TEXT("test_progress")) &&
       !Lower.StartsWith(TEXT("test_stale")) &&
-      Lower != TEXT("export_asset")) {
+      Lower != TEXT("export_asset") &&
+      Lower != TEXT("execute_script")) {
     return false; // Not handled by this function
   }
 
@@ -322,6 +330,270 @@ bool UMcpAutomationBridgeSubsystem::HandleSystemControlAction(
     
     SendAutomationResponse(RequestingSocket, RequestId, true,
                            TEXT("Stale progress test completed"), Result);
+    return true;
+  } else if (Lower == TEXT("execute_script")) {
+    // Execute a script inside the editor context
+    FString ScriptType;
+    Payload->TryGetStringField(TEXT("script_type"), ScriptType);
+
+    FString ScriptContent;
+    Payload->TryGetStringField(TEXT("script_content"), ScriptContent);
+
+    FString ScriptName;
+    Payload->TryGetStringField(TEXT("script_name"), ScriptName);
+
+    double TimeoutSeconds = 30.0;
+    Payload->TryGetNumberField(TEXT("timeout_seconds"), TimeoutSeconds);
+    TimeoutSeconds = FMath::Clamp(TimeoutSeconds, 1.0, 300.0);
+
+    if (ScriptType.IsEmpty())
+    {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("script_type is required (python, console_batch, or editor_utility)"),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    if (ScriptContent.IsEmpty())
+    {
+      SendAutomationError(RequestingSocket, RequestId,
+                          TEXT("script_content is required"),
+                          TEXT("INVALID_ARGUMENT"));
+      return true;
+    }
+
+    const FString ScriptTypeLower = ScriptType.ToLower();
+    const double StartTime = FPlatformTime::Seconds();
+
+    // ---- Capture output log during script execution ----
+    // We use a custom FOutputDevice to capture log messages
+    class FMcpScriptOutputDevice : public FOutputDevice
+    {
+    public:
+      FString CapturedOutput;
+
+      virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
+      {
+        if (CapturedOutput.Len() < 65536)  // Cap output size
+        {
+          CapturedOutput += V;
+          CapturedOutput += TEXT("\n");
+        }
+      }
+    };
+
+    FMcpScriptOutputDevice OutputCapture;
+    GLog->AddOutputDevice(&OutputCapture);
+
+    bool bSuccess = false;
+    FString ErrorMessage;
+
+    if (ScriptTypeLower == TEXT("python"))
+    {
+      // Execute Python script via the Python plugin
+      // Check if Python scripting plugin is available
+      IModuleInterface* PythonModule = FModuleManager::Get().GetModule(TEXT("PythonScriptPlugin"));
+      if (!PythonModule)
+      {
+        // Try alternative module name
+        PythonModule = FModuleManager::Get().GetModule(TEXT("PythonEditor"));
+      }
+
+      if (PythonModule)
+      {
+        // Use the IPythonScriptPlugin interface to execute Python
+        // The Python plugin provides ExecPythonCommand via the console
+        // We route through GEngine->Exec which the Python plugin hooks into
+        if (GEngine && GEditor && GEditor->GetEditorWorldContext().World())
+        {
+          // Build the Python command - the Python plugin intercepts "py" console commands
+          FString PythonCommand = FString::Printf(TEXT("py %s"), *ScriptContent);
+          GEngine->Exec(GEditor->GetEditorWorldContext().World(), *PythonCommand);
+          bSuccess = true;
+        }
+        else
+        {
+          ErrorMessage = TEXT("Editor world context not available for Python execution");
+        }
+      }
+      else
+      {
+        // Fallback: Try direct console command approach
+        // The Python Scripting Plugin registers a console command handler for "py"
+        if (GEngine && GEditor && GEditor->GetEditorWorldContext().World())
+        {
+          FString PythonCommand = FString::Printf(TEXT("py %s"), *ScriptContent);
+          GEngine->Exec(GEditor->GetEditorWorldContext().World(), *PythonCommand);
+          bSuccess = true;
+        }
+        else
+        {
+          ErrorMessage = TEXT("Python scripting plugin not found and editor world not available. "
+                            "Enable the Python Editor Script Plugin in Edit > Plugins.");
+        }
+      }
+    }
+    else if (ScriptTypeLower == TEXT("console_batch"))
+    {
+      // Execute multiple console commands separated by newlines
+      if (GEngine && GEditor && GEditor->GetEditorWorldContext().World())
+      {
+        TArray<FString> Commands;
+        ScriptContent.ParseIntoArrayLines(Commands);
+
+        int32 ExecutedCount = 0;
+        int32 FailedCount = 0;
+
+        for (const FString& Cmd : Commands)
+        {
+          FString TrimmedCmd = Cmd.TrimStartAndEnd();
+
+          // Skip empty lines and comments
+          if (TrimmedCmd.IsEmpty() || TrimmedCmd.StartsWith(TEXT("//")) || TrimmedCmd.StartsWith(TEXT("#")))
+          {
+            continue;
+          }
+
+          // Check timeout
+          if (FPlatformTime::Seconds() - StartTime > TimeoutSeconds)
+          {
+            ErrorMessage = FString::Printf(TEXT("Timeout after %d/%d commands (%.1fs)"),
+                                           ExecutedCount, Commands.Num(), TimeoutSeconds);
+            break;
+          }
+
+          GEngine->Exec(GEditor->GetEditorWorldContext().World(), *TrimmedCmd);
+          ExecutedCount++;
+        }
+
+        bSuccess = ErrorMessage.IsEmpty();
+        if (bSuccess)
+        {
+          OutputCapture.CapturedOutput += FString::Printf(
+            TEXT("Executed %d console commands successfully.\n"), ExecutedCount);
+        }
+      }
+      else
+      {
+        ErrorMessage = TEXT("Editor world context not available for console command execution");
+      }
+    }
+    else if (ScriptTypeLower == TEXT("editor_utility"))
+    {
+      // Run an Editor Utility Blueprint/Widget by asset path
+      FString UtilityPath = ScriptContent.TrimStartAndEnd();
+
+      // Try to load as Editor Utility Widget Blueprint first
+      UObject* LoadedObject = LoadObject<UObject>(nullptr, *UtilityPath);
+
+      if (!LoadedObject)
+      {
+        // Try with _C suffix for blueprint class
+        FString ClassPath = UtilityPath;
+        if (!ClassPath.EndsWith(TEXT("_C")))
+        {
+          ClassPath += TEXT("_C");
+        }
+        LoadedObject = LoadObject<UObject>(nullptr, *ClassPath);
+      }
+
+      if (LoadedObject)
+      {
+        // Check if it's an Editor Utility Widget Blueprint
+        UBlueprint* Blueprint = Cast<UBlueprint>(LoadedObject);
+        if (Blueprint)
+        {
+          // Use the Editor Utility Subsystem to run it
+          UEditorUtilitySubsystem* UtilitySubsystem = GEditor->GetEditorSubsystem<UEditorUtilitySubsystem>();
+          if (UtilitySubsystem)
+          {
+            // Try to run as Editor Utility Widget
+            UEditorUtilityWidgetBlueprint* WidgetBP = Cast<UEditorUtilityWidgetBlueprint>(Blueprint);
+            if (WidgetBP)
+            {
+              UtilitySubsystem->SpawnAndRegisterTab(WidgetBP);
+              bSuccess = true;
+              OutputCapture.CapturedOutput += FString::Printf(
+                TEXT("Spawned Editor Utility Widget: %s\n"), *UtilityPath);
+            }
+            else
+            {
+              // Try as general Editor Utility Blueprint (action utility)
+              UEditorUtilityBlueprint* ActionBP = Cast<UEditorUtilityBlueprint>(Blueprint);
+              if (ActionBP)
+              {
+                UEditorUtilityObject* DefaultObj = Cast<UEditorUtilityObject>(
+                  ActionBP->GeneratedClass->GetDefaultObject());
+                if (DefaultObj)
+                {
+                  DefaultObj->Run();
+                  bSuccess = true;
+                  OutputCapture.CapturedOutput += FString::Printf(
+                    TEXT("Executed Editor Utility Blueprint: %s\n"), *UtilityPath);
+                }
+                else
+                {
+                  ErrorMessage = FString::Printf(
+                    TEXT("Failed to get default object for Editor Utility: %s"), *UtilityPath);
+                }
+              }
+              else
+              {
+                ErrorMessage = FString::Printf(
+                  TEXT("Blueprint is not an Editor Utility Widget or Action: %s"), *UtilityPath);
+              }
+            }
+          }
+          else
+          {
+            ErrorMessage = TEXT("Editor Utility Subsystem not available");
+          }
+        }
+        else
+        {
+          ErrorMessage = FString::Printf(
+            TEXT("Loaded object is not a Blueprint: %s (type: %s)"),
+            *UtilityPath, *LoadedObject->GetClass()->GetName());
+        }
+      }
+      else
+      {
+        ErrorMessage = FString::Printf(TEXT("Failed to load Editor Utility: %s"), *UtilityPath);
+      }
+    }
+    else
+    {
+      ErrorMessage = FString::Printf(
+        TEXT("Unknown script_type: %s. Expected: python, console_batch, or editor_utility"),
+        *ScriptType);
+    }
+
+    // Remove our output capture device
+    GLog->RemoveOutputDevice(&OutputCapture);
+
+    const double EndTime = FPlatformTime::Seconds();
+    const double DurationMs = (EndTime - StartTime) * 1000.0;
+
+    // Build result JSON
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("scriptType"), ScriptType);
+    Result->SetStringField(TEXT("scriptName"), ScriptName);
+    Result->SetNumberField(TEXT("duration_ms"), DurationMs);
+    Result->SetStringField(TEXT("output"), OutputCapture.CapturedOutput);
+
+    if (bSuccess)
+    {
+      SendAutomationResponse(RequestingSocket, RequestId, true,
+                             FString::Printf(TEXT("Script executed successfully (%.0fms)"), DurationMs),
+                             Result);
+    }
+    else
+    {
+      Result->SetStringField(TEXT("error"), ErrorMessage);
+      SendAutomationResponse(RequestingSocket, RequestId, false,
+                             ErrorMessage.IsEmpty() ? TEXT("Script execution failed") : ErrorMessage,
+                             Result, TEXT("SCRIPT_EXECUTION_FAILED"));
+    }
     return true;
   } else if (Lower == TEXT("export_asset")) {
     // Export asset to FBX/OBJ/other format

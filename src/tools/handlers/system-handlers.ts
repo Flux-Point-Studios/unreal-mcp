@@ -2,6 +2,8 @@ import { cleanObject } from '../../utils/safe-json.js';
 import { ITools } from '../../types/tool-interfaces.js';
 import type { HandlerArgs, SystemArgs } from '../../types/handler-types.js';
 import { executeAutomationRequest } from './common-handlers.js';
+import { validateScript } from '../../utils/script-validator.js';
+import { scriptHistory } from '../../services/script-history.js';
 
 /** Response from various operations */
 interface OperationResponse {
@@ -696,6 +698,207 @@ export async function handleSystemTools(action: string, args: HandlerArgs, tools
         assetPath,
         exportPath
       });
+    }
+    case 'execute_script': {
+      const scriptType = typeof argsTyped.script_type === 'string' ? argsTyped.script_type.trim() : '';
+      const scriptContent = typeof argsTyped.script_content === 'string' ? argsTyped.script_content : '';
+      const scriptName = typeof argsTyped.script_name === 'string' ? argsTyped.script_name.trim() : undefined;
+      const timeoutSeconds = typeof argsTyped.timeout_seconds === 'number'
+        ? Math.max(1, Math.min(300, argsTyped.timeout_seconds))
+        : 30;
+      const dryRun = argsTyped.dry_run === true;
+
+      // Validate required fields
+      if (!scriptType) {
+        return {
+          success: false,
+          error: 'INVALID_ARGUMENT',
+          message: 'script_type is required for execute_script. Must be "python", "console_batch", or "editor_utility".',
+          action: 'execute_script'
+        };
+      }
+
+      if (!scriptContent) {
+        return {
+          success: false,
+          error: 'INVALID_ARGUMENT',
+          message: 'script_content is required for execute_script.',
+          action: 'execute_script'
+        };
+      }
+
+      // Validate the script for dangerous patterns
+      const validation = validateScript(scriptType, scriptContent);
+
+      if (!validation.valid) {
+        // Record the blocked attempt in history
+        scriptHistory.add({
+          scriptType,
+          scriptName,
+          content: scriptContent.substring(0, 500) + (scriptContent.length > 500 ? '...' : ''),
+          executedAt: Date.now(),
+          duration_ms: 0,
+          success: false,
+          error: `Validation failed: ${validation.errors.join('; ')}`,
+          dryRun
+        });
+
+        return {
+          success: false,
+          error: 'SCRIPT_VALIDATION_FAILED',
+          message: `Script validation failed: ${validation.errors.join('; ')}`,
+          action: 'execute_script',
+          validation: {
+            valid: false,
+            errors: validation.errors,
+            warnings: validation.warnings,
+            blockedPatterns: validation.blockedPatterns
+          }
+        };
+      }
+
+      // If dry_run, return validation result without executing
+      if (dryRun) {
+        scriptHistory.add({
+          scriptType,
+          scriptName,
+          content: scriptContent.substring(0, 500) + (scriptContent.length > 500 ? '...' : ''),
+          executedAt: Date.now(),
+          duration_ms: 0,
+          success: true,
+          output: 'Dry run - validation passed, script not executed',
+          dryRun: true
+        });
+
+        return {
+          success: true,
+          message: 'Script validation passed (dry run - not executed)',
+          action: 'execute_script',
+          dryRun: true,
+          validation: {
+            valid: true,
+            errors: [],
+            warnings: validation.warnings,
+            blockedPatterns: []
+          }
+        };
+      }
+
+      // Execute the script via the automation bridge
+      const startTime = Date.now();
+      try {
+        const res = await executeAutomationRequest(
+          tools,
+          'system_control',
+          {
+            action: 'execute_script',
+            script_type: scriptType,
+            script_content: scriptContent,
+            script_name: scriptName || `script_${Date.now()}`,
+            timeout_seconds: timeoutSeconds
+          },
+          'Automation bridge not available for script execution'
+        ) as OperationResponse;
+
+        const durationMs = Date.now() - startTime;
+        const isSuccess = res && res.success !== false;
+
+        // Record in history
+        scriptHistory.add({
+          scriptType,
+          scriptName,
+          content: scriptContent.substring(0, 500) + (scriptContent.length > 500 ? '...' : ''),
+          executedAt: startTime,
+          duration_ms: durationMs,
+          success: isSuccess,
+          output: typeof res?.message === 'string' ? res.message : undefined,
+          error: isSuccess ? undefined : (typeof res?.error === 'string' ? res.error : 'Execution failed')
+        });
+
+        if (isSuccess) {
+          return cleanObject({
+            success: true,
+            message: res?.message || `Script executed successfully (${durationMs}ms)`,
+            action: 'execute_script',
+            scriptType,
+            scriptName,
+            duration_ms: durationMs,
+            output: res?.data || res?.result || res?.message,
+            warnings: validation.warnings.length > 0 ? validation.warnings : undefined,
+            ...res
+          });
+        }
+
+        return cleanObject({
+          success: false,
+          error: res?.error || 'SCRIPT_EXECUTION_FAILED',
+          message: res?.message || 'Script execution failed',
+          action: 'execute_script',
+          scriptType,
+          scriptName,
+          duration_ms: durationMs
+        });
+      } catch (error) {
+        const durationMs = Date.now() - startTime;
+        const msg = error instanceof Error ? error.message : String(error);
+
+        scriptHistory.add({
+          scriptType,
+          scriptName,
+          content: scriptContent.substring(0, 500) + (scriptContent.length > 500 ? '...' : ''),
+          executedAt: startTime,
+          duration_ms: durationMs,
+          success: false,
+          error: msg
+        });
+
+        return {
+          success: false,
+          error: 'SCRIPT_EXECUTION_ERROR',
+          message: `Script execution error: ${msg}`,
+          action: 'execute_script',
+          scriptType,
+          scriptName,
+          duration_ms: durationMs
+        };
+      }
+    }
+    case 'get_script_history': {
+      const limitArg = typeof (argsTyped as Record<string, unknown>).limit === 'number'
+        ? (argsTyped as Record<string, unknown>).limit as number
+        : undefined;
+      const entries = scriptHistory.list(limitArg);
+
+      return {
+        success: true,
+        message: `Retrieved ${entries.length} script history entries`,
+        action: 'get_script_history',
+        count: entries.length,
+        entries: entries.map(e => ({
+          id: e.id,
+          scriptType: e.scriptType,
+          scriptName: e.scriptName,
+          executedAt: e.executedAt,
+          duration_ms: e.duration_ms,
+          success: e.success,
+          output: e.output,
+          error: e.error,
+          dryRun: e.dryRun,
+          // Truncate content for the listing
+          contentPreview: e.content.substring(0, 200) + (e.content.length > 200 ? '...' : '')
+        }))
+      };
+    }
+    case 'cleanup_scripts': {
+      const count = scriptHistory.count;
+      scriptHistory.clear();
+
+      return {
+        success: true,
+        message: `Cleared ${count} script history entries`,
+        action: 'cleanup_scripts',
+        clearedEntries: count
+      };
     }
     default: {
       const res = await executeAutomationRequest(tools, 'system_control', args, 'Automation bridge not available for system control operations');
