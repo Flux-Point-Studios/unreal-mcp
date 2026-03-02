@@ -76,3 +76,4 @@ export { handleSystemTools } from './system-handlers.js';
 export { handleTextureTools } from './texture-handlers.js';
 export { handleVolumeTools } from './volume-handlers.js';
 export { handleWidgetAuthoringTools } from './widget-authoring-handlers.js';
+export { handleAssetPipelineTools } from './asset-pipeline-handlers.js';

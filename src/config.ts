@@ -66,6 +66,10 @@ export const EnvSchema = z.object({
   MCP_HTTP_ENABLED: z.preprocess(stringToBoolean, z.boolean().default(false)),
   MCP_HTTP_PORT: z.preprocess((v) => stringToNumber(v, 3000), z.number().default(3000)),
   MCP_HTTP_HOST: z.string().default('127.0.0.1'),
+
+  // External AI Asset Generation APIs (optional -- see asset_pipeline tool)
+  MESHY_API_KEY: z.string().optional(),
+  TRIPO_API_KEY: z.string().optional(),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

@@ -5150,5 +5150,84 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         error: commonSchemas.stringProp
       }
     }
+  },
+  {
+    name: 'asset_pipeline',
+    description: 'External AI asset generation pipeline. Generate 3D models and textures using AI services (Meshy, Tripo) and import them directly into UE. Requires API keys set via environment variables (MESHY_API_KEY, TRIPO_API_KEY). Actions: list_providers (show configured services), generate_3d_model (text-to-3D), generate_texture (text-to-texture), check_generation_status (poll task progress), download_and_import (fetch generated asset and import into UE).',
+    category: 'utility',
+    annotations: {
+      title: 'AI Asset Pipeline',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list_providers', 'generate_3d_model', 'generate_texture', 'check_generation_status', 'download_and_import'],
+          description: 'The asset pipeline action to execute'
+        },
+        provider: {
+          type: 'string',
+          enum: ['meshy', 'tripo'],
+          description: 'AI service provider (default: meshy)'
+        },
+        prompt: {
+          type: 'string',
+          description: '[generate_3d_model, generate_texture] Text description of the asset to generate'
+        },
+        style: {
+          type: 'string',
+          description: '[generate_3d_model] Art style (realistic, cartoon, low-poly, sculpture, pbr)'
+        },
+        model_url: {
+          type: 'string',
+          description: '[generate_texture] URL of a 3D model to texture'
+        },
+        task_id: {
+          type: 'string',
+          description: '[check_generation_status] Task ID from a generation request'
+        },
+        download_url: {
+          type: 'string',
+          description: '[download_and_import] URL of the generated asset file to download'
+        },
+        import_path: {
+          type: 'string',
+          description: '[download_and_import] UE content path to import to (e.g., /Game/GeneratedAssets/)'
+        },
+        asset_name: {
+          type: 'string',
+          description: '[download_and_import] Name for the imported asset'
+        }
+      },
+      required: ['action']
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        success: commonSchemas.booleanProp,
+        action: commonSchemas.stringProp,
+        provider: commonSchemas.stringProp,
+        taskId: commonSchemas.stringProp,
+        status: commonSchemas.stringProp,
+        progress: commonSchemas.numberProp,
+        message: commonSchemas.stringProp,
+        error: commonSchemas.stringProp,
+        available: { type: 'array', items: { type: 'object' }, description: 'List of configured providers' },
+        unavailable: { type: 'array', items: { type: 'object' }, description: 'List of providers needing API keys' },
+        modelUrls: { type: 'object', description: 'Download URLs for generated model formats' },
+        thumbnailUrl: commonSchemas.stringProp,
+        downloadUrl: commonSchemas.stringProp,
+        importPath: commonSchemas.stringProp,
+        assetName: commonSchemas.stringProp,
+        fileSize: commonSchemas.numberProp,
+        fileType: commonSchemas.stringProp,
+        importResult: { type: 'object', description: 'Result from UE asset import' }
+      }
+    }
   }
 ];

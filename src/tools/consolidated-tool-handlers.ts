@@ -47,6 +47,7 @@ import { handleManageToolsTools } from './handlers/manage-tools-handlers.js';
 import { handleTaskTools } from './handlers/task-handlers.js';
 import { handleWorkflowTools } from './handlers/workflow-handlers.js';
 import { handleTestTools } from './handlers/test-handlers.js';
+import { handleAssetPipelineTools } from './handlers/asset-pipeline-handlers.js';
 // import { getDynamicHandlerForTool } from './dynamic-handler-registry.js';
 // import { consolidatedToolDefinitions } from './consolidated-tool-definitions.js';
 
@@ -472,6 +473,12 @@ function registerDefaultHandlers() {
   toolRegistry.register('manage_tests', async (args, tools) => {
     const action = getAction(args);
     return await handleTestTools(action, args, tools);
+  });
+
+  // 45. EXTERNAL ASSET PIPELINE (AI-powered asset generation)
+  toolRegistry.register('asset_pipeline', async (args, tools) => {
+    const action = getAction(args);
+    return await handleAssetPipelineTools(action, args, tools);
   });
 }
 
