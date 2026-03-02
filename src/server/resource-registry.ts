@@ -1,5 +1,23 @@
+/**
+ * Location: src/server/resource-registry.ts
+ *
+ * Summary:
+ *   Registers MCP resource list handlers and resource subscription
+ *   (subscribe/unsubscribe) request handlers with the MCP Server.
+ *
+ * Usage with other files:
+ *   - src/server-setup.ts: Instantiates this class and calls register().
+ *   - src/services/subscription-manager.ts: Receives the Server reference
+ *     and handles subscribe/unsubscribe bookkeeping.
+ *   - src/handlers/resource-handlers.ts: Handles ReadResource requests.
+ */
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { ListResourcesRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+    ListResourcesRequestSchema,
+    SubscribeRequestSchema,
+    UnsubscribeRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import { UnrealBridge } from '../unreal-bridge.js';
 import { AutomationBridge } from '../automation/index.js';
 import { HealthMonitor } from '../services/health-monitor.js';
@@ -8,6 +26,7 @@ import { AssetResources } from '../resources/assets.js';
 import { ActorResources } from '../resources/actors.js';
 import { LevelResources } from '../resources/levels.js';
 import { getContextCategories } from '../context/index.js';
+import { subscriptionManager } from '../services/subscription-manager.js';
 
 export class ResourceRegistry {
     constructor(
@@ -22,6 +41,22 @@ export class ResourceRegistry {
     ) { }
 
     register() {
+        // Wire the subscription manager to the MCP server so it can send
+        // notifications/resources/updated when subscribed resources change.
+        subscriptionManager.setServer(this.server);
+
+        // Register subscribe/unsubscribe request handlers so clients can
+        // opt in to resource change notifications.
+        this.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+            subscriptionManager.subscribe(request.params.uri);
+            return {};
+        });
+
+        this.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+            subscriptionManager.unsubscribe(request.params.uri);
+            return {};
+        });
+
         // Build the dynamic list of UE5 docs resources from the context system
         const docsResources = getContextCategories().map((cat) => ({
             uri: `ue5-docs://${cat.name}`,

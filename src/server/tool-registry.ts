@@ -10,6 +10,7 @@ import { responseValidator } from '../utils/response-validator.js';
 import { ErrorHandler } from '../utils/error-handler.js';
 import { cleanObject } from '../utils/safe-json.js';
 import { isVisuallyMutating, captureVisualFeedback } from '../utils/visual-feedback.js';
+import { subscriptionManager } from '../services/subscription-manager.js';
 import { createElicitationHelper, PrimitiveSchema } from '../utils/elicitation.js';
 import { createProgressReporter } from '../utils/progress-reporter.js';
 import { AssetResources } from '../resources/assets.js';
@@ -666,6 +667,21 @@ export class ToolRegistry {
                         }
                     } catch {
                         // Visual feedback is strictly best-effort
+                    }
+                }
+
+                // ----------------------------------------------------------
+                // Resource Subscription Notifications
+                // After a successful mutating tool call, notify the
+                // subscription manager so subscribed clients are told
+                // to re-fetch affected resources. Best-effort: failures
+                // never break the actual tool response.
+                // ----------------------------------------------------------
+                if (finalSuccess && typeof args.action === 'string') {
+                    try {
+                        subscriptionManager.notifyForToolAction(name, args.action as string);
+                    } catch {
+                        // Subscription notifications are strictly best-effort
                     }
                 }
 

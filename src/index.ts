@@ -13,6 +13,7 @@ import { ServerSetup } from './server-setup.js';
 import { startMetricsServer } from './services/metrics-server.js';
 import { config } from './config.js';
 import { GraphQLServer } from './graphql/server.js';
+import { subscriptionManager } from './services/subscription-manager.js';
 
 const require = createRequire(import.meta.url);
 const packageInfo: { name?: string; version?: string } = (() => {
@@ -135,7 +136,7 @@ export function createServer() {
     {
       capabilities: {
         tools: { listChanged: true },
-        resources: {},
+        resources: { subscribe: true },
         prompts: {}
       }
     }
@@ -208,6 +209,13 @@ export async function startStdioServer() {
     shuttingDown = true;
     const reason = signal ? ` due to ${signal}` : '';
     log.info(`Shutting down MCP server${reason}`);
+
+    try {
+      subscriptionManager.dispose();
+    } catch (error) {
+      log.warn('Failed to dispose subscription manager cleanly', error);
+    }
+
     try {
       automationBridge.stop();
     } catch (error) {
