@@ -5029,5 +5029,81 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         removedCount: { type: 'number', description: 'Number of tasks removed by cleanup' }
       }
     }
+  },
+  {
+    name: 'workflow',
+    description: 'Composite workflow tool that chains multiple operations into high-level workflows. Actions: level_performance_audit (comprehensive level analysis with scene stats, actor summary, perf capture, lighting status, and recommendations), blueprint_health_check (analyze a blueprint for compilation issues, graph complexity, and general health), scene_populate (fill a bounding box with randomized static mesh actors), quick_test (smoke test the current level: info, actors, PIE, viewport capture).',
+    category: 'utility',
+    annotations: {
+      title: 'Composite Workflows',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['level_performance_audit', 'blueprint_health_check', 'scene_populate', 'quick_test'],
+          description: 'The workflow to execute. level_performance_audit: comprehensive level audit. blueprint_health_check: inspect and compile a blueprint. scene_populate: fill an area with actors. quick_test: smoke test the current level.'
+        },
+        blueprint_name: {
+          type: 'string',
+          description: '[blueprint_health_check] Name of the blueprint to analyze.'
+        },
+        origin: {
+          type: 'array',
+          items: { type: 'number' },
+          minItems: 3,
+          maxItems: 3,
+          description: '[scene_populate] Center point [x, y, z] of the area to populate.'
+        },
+        extent: {
+          type: 'array',
+          items: { type: 'number' },
+          minItems: 3,
+          maxItems: 3,
+          description: '[scene_populate] Half-extents [x, y, z] of the bounding box.'
+        },
+        asset_paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '[scene_populate] Array of static mesh asset paths to use (cycled through).'
+        },
+        count: {
+          type: 'number',
+          description: '[scene_populate] Number of actors to place (default: 10, max: 500).'
+        },
+        random_rotation: {
+          type: 'boolean',
+          description: '[scene_populate] Apply random Y-axis rotation to placed actors (default: true).'
+        },
+        random_scale_range: {
+          type: 'array',
+          items: { type: 'number' },
+          minItems: 2,
+          maxItems: 2,
+          description: '[scene_populate] Uniform scale range [min, max] for random scaling (default: [0.8, 1.2]).'
+        }
+      },
+      required: ['action']
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ...commonSchemas.outputBase,
+        workflow: { type: 'string', description: 'Name of the executed workflow action.' },
+        summary: { type: 'string', description: 'Human-readable summary of the workflow result.' },
+        recommendations: { type: 'array', items: commonSchemas.stringProp, description: 'List of recommendations (level_performance_audit).' },
+        warnings: { type: 'array', items: commonSchemas.stringProp, description: 'List of warnings (blueprint_health_check).' },
+        healthy: { type: 'boolean', description: 'Whether the blueprint is healthy (blueprint_health_check).' },
+        created: { type: 'number', description: 'Number of actors successfully created (scene_populate).' },
+        failed: { type: 'number', description: 'Number of actor creation failures (scene_populate).' },
+        total: { type: 'number', description: 'Total actors attempted (scene_populate).' },
+        errors: { type: 'array', items: commonSchemas.stringProp, description: 'Errors encountered during workflow steps.' }
+      }
+    }
   }
 ];
