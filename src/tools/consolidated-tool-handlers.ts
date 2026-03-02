@@ -46,6 +46,7 @@ import { handlePythonTools } from './handlers/python-handlers.js';
 import { handleManageToolsTools } from './handlers/manage-tools-handlers.js';
 import { handleTaskTools } from './handlers/task-handlers.js';
 import { handleWorkflowTools } from './handlers/workflow-handlers.js';
+import { handleTestTools } from './handlers/test-handlers.js';
 // import { getDynamicHandlerForTool } from './dynamic-handler-registry.js';
 // import { consolidatedToolDefinitions } from './consolidated-tool-definitions.js';
 
@@ -138,10 +139,8 @@ function normalizeToolCall(
     normalizedName = 'system_control';
     action = 'run_ubt';
   }
-  if (normalizedName === 'manage_tests') {
-    normalizedName = 'system_control';
-    action = 'run_tests';
-  }
+  // manage_tests is now handled by its own dedicated handler (test-handlers.ts)
+  // No normalization needed -- it routes directly to the manage_tests registry entry.
 
   return {
     name: normalizedName,
@@ -301,7 +300,7 @@ function registerDefaultHandlers() {
     if (action === 'console_command') return await handleConsoleCommand(args, tools);
     if (action === 'run_ubt') return await handlePipelineTools(action, args, tools);
 
-    if (action === 'run_tests') return cleanObject(await executeAutomationRequest(tools, 'manage_tests', { ...args, subAction: action }, 'Bridge unavailable'));
+    if (action === 'run_tests') return await handleTestTools('run_all_tests', args, tools);
     if (action === 'subscribe' || action === 'unsubscribe') return cleanObject(await executeAutomationRequest(tools, 'manage_logs', { ...args, subAction: action }, 'Bridge unavailable'));
     if (action === 'spawn_category') return cleanObject(await executeAutomationRequest(tools, 'manage_debug', { ...args, subAction: action }, 'Bridge unavailable'));
     if (action === 'start_session') return cleanObject(await executeAutomationRequest(tools, 'manage_insights', { ...args, subAction: action }, 'Bridge unavailable'));
@@ -467,6 +466,12 @@ function registerDefaultHandlers() {
   toolRegistry.register('workflow', async (args, tools) => {
     const action = getAction(args);
     return await handleWorkflowTools(action, args, tools);
+  });
+
+  // 44. TEST AUTOMATION
+  toolRegistry.register('manage_tests', async (args, tools) => {
+    const action = getAction(args);
+    return await handleTestTools(action, args, tools);
   });
 }
 

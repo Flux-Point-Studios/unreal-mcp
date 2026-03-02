@@ -5105,5 +5105,50 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         errors: { type: 'array', items: commonSchemas.stringProp, description: 'Errors encountered during workflow steps.' }
       }
     }
+  },
+  {
+    name: 'manage_tests',
+    description: 'Run and manage UE Automation Tests. Actions: list_tests (discover available tests), run_test (execute a specific test by name), run_all_tests (execute all automation tests), run_tests_by_filter (run tests matching a filter pattern), get_test_results (get the latest test report).',
+    category: 'utility',
+    annotations: {
+      title: 'Test Automation',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list_tests', 'run_test', 'run_all_tests', 'run_tests_by_filter', 'get_test_results'],
+          description: 'The test action to execute'
+        },
+        test_name: {
+          type: 'string',
+          description: '[run_test] Full test name (e.g., Project.Gameplay.Character.Movement)'
+        },
+        filter: {
+          type: 'string',
+          description: '[list_tests, run_tests_by_filter] Filter pattern to match test names'
+        }
+      },
+      required: ['action']
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ...commonSchemas.outputBase,
+        action: commonSchemas.stringProp,
+        testCount: commonSchemas.numberProp,
+        tests: { type: 'array', items: commonSchemas.stringProp, description: 'List of discovered test names.' },
+        testName: commonSchemas.stringProp,
+        filter: commonSchemas.stringProp,
+        executionResult: commonSchemas.objectProp,
+        report: commonSchemas.objectProp,
+        error: commonSchemas.stringProp
+      }
+    }
   }
 ];
