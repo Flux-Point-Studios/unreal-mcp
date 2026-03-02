@@ -4970,5 +4970,42 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         error: commonSchemas.stringProp
       }
     }
+  },
+  {
+    name: 'manage_tasks',
+    description: 'Async task queue for long-running operations. Submit tool calls for background execution, poll status, retrieve results. Use for operations that may take 30+ seconds (landscape sculpting, asset imports, blueprint compilation). Actions: submit (queue a tool call), status (check progress), result (get output), list (show all tasks), cancel (abort task), cleanup (remove old tasks).',
+    category: 'utility',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['submit', 'status', 'result', 'list', 'cancel', 'cleanup'],
+          description: 'submit: queue a tool for async execution. status: check task progress. result: get completed task output. list: show all tasks. cancel: abort a pending/running task. cleanup: remove old completed tasks.'
+        },
+        tool_name: { type: 'string', description: 'Target tool name to execute (for submit action, e.g. build_environment, manage_asset)' },
+        target_action: { type: 'string', description: 'Action to pass to the target tool (for submit action, e.g. sculpt_landscape, import)' },
+        args: { type: 'object', description: 'Arguments object to pass to the target tool (for submit action)' },
+        task_id: { type: 'string', description: 'Task ID to query (for status, result, cancel actions)' },
+        status_filter: { type: 'string', enum: ['pending', 'running', 'completed', 'failed', 'cancelled'], description: 'Filter tasks by status (for list action)' },
+        max_age_seconds: { type: 'number', description: 'Max age in seconds for cleanup (default 300). Tasks older than this are removed (for cleanup action).' }
+      },
+      required: ['action']
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ...commonSchemas.outputBase,
+        taskId: { type: 'string', description: 'Unique task identifier' },
+        status: { type: 'string', description: 'Task status (pending, running, completed, failed, cancelled)' },
+        progress: { type: 'number', description: 'Task progress 0-100' },
+        progressMessage: { type: 'string', description: 'Human-readable progress message' },
+        result: { type: 'object', description: 'Completed task result (original tool output)' },
+        error: commonSchemas.stringProp,
+        tasks: { type: 'array', items: { type: 'object' }, description: 'List of task summaries' },
+        stats: { type: 'object', description: 'Queue statistics (total, pending, running, completed, failed, cancelled)' },
+        removedCount: { type: 'number', description: 'Number of tasks removed by cleanup' }
+      }
+    }
   }
 ];

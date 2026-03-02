@@ -44,6 +44,7 @@ import { handleNavigationTools } from './handlers/navigation-handlers.js';
 import { handleSplineTools } from './handlers/spline-handlers.js';
 import { handlePythonTools } from './handlers/python-handlers.js';
 import { handleManageToolsTools } from './handlers/manage-tools-handlers.js';
+import { handleTaskTools } from './handlers/task-handlers.js';
 // import { getDynamicHandlerForTool } from './dynamic-handler-registry.js';
 // import { consolidatedToolDefinitions } from './consolidated-tool-definitions.js';
 
@@ -457,6 +458,9 @@ function registerDefaultHandlers() {
 
   // 41. PYTHON EXECUTION
   toolRegistry.register('execute_python', async (args, tools) => await handlePythonTools(getAction(args), args, tools));
+
+  // 42. ASYNC TASK QUEUE
+  toolRegistry.register('manage_tasks', async (args, tools) => await handleTaskTools(getAction(args), args, tools));
 }
 
 // Initialize default handlers immediately
