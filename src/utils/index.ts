@@ -107,3 +107,11 @@ export {
   validateAudioParams,
   normalizeName,
 } from './type-coercion.js';
+
+// Visual feedback loop (post-execution viewport capture)
+export type { VisualFeedbackOptions } from './visual-feedback.js';
+export {
+  isVisuallyMutating,
+  isVisualFeedbackEnabled,
+  captureVisualFeedback,
+} from './visual-feedback.js';

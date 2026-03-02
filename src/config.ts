@@ -54,6 +54,13 @@ export const EnvSchema = z.object({
 
   // Tool Categories (comma-separated: core,world,authoring,gameplay,utility,all)
   MCP_DEFAULT_CATEGORIES: z.string().default('core'),
+
+  // Visual Feedback Loop
+  // When enabled (default), a small viewport screenshot is automatically
+  // appended to tool responses that visually mutate the scene, so the AI
+  // can see what it just did and self-correct.
+  // Set to 'false' or '0' to disable.
+  MCP_VISUAL_FEEDBACK: z.string().optional(),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

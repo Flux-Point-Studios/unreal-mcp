@@ -9,6 +9,7 @@ import { handleConsolidatedToolCall } from '../tools/consolidated-tool-handlers.
 import { responseValidator } from '../utils/response-validator.js';
 import { ErrorHandler } from '../utils/error-handler.js';
 import { cleanObject } from '../utils/safe-json.js';
+import { isVisuallyMutating, captureVisualFeedback } from '../utils/visual-feedback.js';
 import { createElicitationHelper, PrimitiveSchema } from '../utils/elicitation.js';
 import { createProgressReporter } from '../utils/progress-reporter.js';
 import { AssetResources } from '../resources/assets.js';
@@ -637,6 +638,35 @@ export class ToolRegistry {
                     this.logger.info(`Tool ${name} completed successfully in ${durationMs}ms`);
                 } else {
                     this.logger.warn(`Tool ${name} completed with errors in ${durationMs}ms`);
+                }
+
+                // ----------------------------------------------------------
+                // Visual Feedback Loop
+                // After a successful visually-mutating tool call, capture a
+                // small viewport screenshot and append it to the response so
+                // the AI can see the result and self-correct if needed.
+                // This is best-effort: failures never break the actual response.
+                // ----------------------------------------------------------
+                if (
+                    finalSuccess &&
+                    isVisuallyMutating(name, (args.action as string | undefined))
+                ) {
+                    try {
+                        const feedbackBlocks = await captureVisualFeedback(
+                            this.automationBridge
+                        );
+                        if (feedbackBlocks.length > 0) {
+                            const wrappedObj = wrappedResult as Record<string, unknown>;
+                            if (Array.isArray(wrappedObj.content)) {
+                                wrappedObj.content.push(...feedbackBlocks);
+                            }
+                            this.logger.debug(
+                                `Visual feedback appended to ${name} response (${feedbackBlocks.length} blocks)`
+                            );
+                        }
+                    } catch {
+                        // Visual feedback is strictly best-effort
+                    }
                 }
 
                 const responsePreview = JSON.stringify(wrappedResult).substring(0, 100);
