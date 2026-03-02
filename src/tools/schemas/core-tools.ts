@@ -14,11 +14,21 @@
 
 import { commonSchemas } from '../tool-definition-utils.js';
 
+/** MCP Tool Annotations - behavioral hints for MCP clients */
+export interface ToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
 /** MCP Tool Definition type for explicit annotation to avoid TS7056 */
 export interface ToolDefinition {
   category?: 'core' | 'world' | 'authoring' | 'gameplay' | 'utility';
   name: string;
   description: string;
+  annotations?: ToolAnnotations;
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   [key: string]: unknown;

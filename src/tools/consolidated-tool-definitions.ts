@@ -1,7 +1,16 @@
+export interface ToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
 export interface ToolDefinition {
   category?: 'core' | 'world' | 'authoring' | 'gameplay' | 'utility';
   name: string;
   description: string;
+  annotations?: ToolAnnotations;
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   [key: string]: unknown;
@@ -12,6 +21,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
     name: 'manage_pipeline',
     description: 'Build automation and pipeline control. Actions: run_ubt (compile targets), list_categories (show tool categories), get_status (bridge status). Routes to system_control internally.',
     category: 'core',
+    annotations: {
+      title: 'Build Pipeline',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -36,6 +52,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
     name: 'manage_tools',
     description: 'Dynamic MCP tool management. Enable/disable tools and categories at runtime. Actions: list_tools, list_categories, enable_tools, disable_tools, enable_category, disable_category, get_status, reset.',
     category: 'core',
+    annotations: {
+      title: 'Tool Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,6 +86,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_asset',
     category: 'core',
+    annotations: {
+      title: 'Asset Management',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create, import, duplicate, rename, delete assets. Edit Material graphs and instances. Analyze dependencies.',
     inputSchema: {
       type: 'object',
@@ -183,6 +213,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_blueprint',
     category: 'authoring',
+    annotations: {
+      title: 'Blueprint Management',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create Blueprints, add SCS components (mesh, collision, camera), and manipulate graph nodes.',
     inputSchema: {
       type: 'object',
@@ -291,6 +328,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'control_actor',
     category: 'core',
+    annotations: {
+      title: 'Actor Control',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Spawn actors, set transforms, enable physics, add components, manage tags, and attach actors.',
     inputSchema: {
       type: 'object',
@@ -365,6 +409,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'control_editor',
     category: 'core',
+    annotations: {
+      title: 'Editor Control',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Start/stop PIE, control viewport camera, run console commands, take screenshots, simulate input.',
     inputSchema: {
       type: 'object',
@@ -435,6 +486,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_level',
     category: 'core',
+    annotations: {
+      title: 'Level Management',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Load/save levels, configure streaming, manage World Partition cells, and build lighting.',
     inputSchema: {
       type: 'object',
@@ -512,6 +570,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'build_environment',
     category: 'world',
+    annotations: {
+      title: 'Environment Building',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create/sculpt landscapes, paint foliage, and generate procedural terrain/biomes.',
     inputSchema: {
       type: 'object',
@@ -618,6 +683,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'animation_physics',
     category: 'gameplay',
+    annotations: {
+      title: 'Animation & Physics',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create animation blueprints, blend spaces, montages, state machines, Control Rig, IK rigs, ragdolls, and vehicle physics.',
     inputSchema: {
       type: 'object',
@@ -723,6 +795,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'system_control',
     category: 'core',
+    annotations: {
+      title: 'System Control',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true
+    },
     description: 'Run profiling, set quality/CVars, execute console commands, run UBT, and manage widgets.',
     inputSchema: {
       type: 'object',
@@ -771,6 +850,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_sequence',
     category: 'utility',
+    annotations: {
+      title: 'Sequence Editor',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Edit Level Sequences: add tracks, bind actors, set keyframes, control playback, and record camera.',
     inputSchema: {
       type: 'object',
@@ -831,6 +917,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_input',
     category: 'utility',
+    annotations: {
+      title: 'Input Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create Input Actions and Mapping Contexts. Add key/gamepad bindings with modifiers and triggers.',
     inputSchema: {
       type: 'object',
@@ -874,6 +967,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'inspect',
     category: 'core',
+    annotations: {
+      title: 'Object Inspector',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     description: 'Inspect any UObject: read/write properties, list components, export snapshots, and query class info.',
     inputSchema: {
       type: 'object',
@@ -922,6 +1022,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_audio',
     category: 'utility',
+    annotations: {
+      title: 'Audio Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Play/stop sounds, add audio components, configure mixes, attenuation, spatial audio, and author Sound Cues/MetaSounds.',
     inputSchema: {
       type: 'object',
@@ -1031,6 +1138,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_behavior_tree',
     category: 'utility',
+    annotations: {
+      title: 'Behavior Tree Editor',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create Behavior Trees, add task/decorator/service nodes, and configure node properties.',
     inputSchema: {
       type: 'object',
@@ -1065,6 +1179,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_lighting',
     category: 'world',
+    annotations: {
+      title: 'Lighting Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Spawn lights (point, spot, rect, sky), configure GI, shadows, volumetric fog, and build lighting.',
     inputSchema: {
       type: 'object',
@@ -1134,6 +1255,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_performance',
     category: 'utility',
+    annotations: {
+      title: 'Performance Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Run profiling/benchmarks, configure scalability, LOD, Nanite, and optimization settings.',
     inputSchema: {
       type: 'object',
@@ -1191,6 +1319,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_geometry',
     category: 'world',
+    annotations: {
+      title: 'Geometry Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create procedural meshes using Geometry Script: booleans, deformers, UVs, collision, and LOD generation.',
     inputSchema: {
       type: 'object',
@@ -1314,6 +1449,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_skeleton',
     category: 'authoring',
+    annotations: {
+      title: 'Skeleton Editor',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Edit skeletal meshes: add sockets, configure physics assets, set skin weights, and create morph targets.',
     inputSchema: {
       type: 'object',
@@ -1419,6 +1561,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_material_authoring',
     category: 'authoring',
+    annotations: {
+      title: 'Material Authoring',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create materials with expressions, parameters, functions, instances, and landscape blend layers.',
     inputSchema: {
       type: 'object',
@@ -1506,6 +1655,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_texture',
     category: 'authoring',
+    annotations: {
+      title: 'Texture Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create procedural textures, process images, bake normal/AO maps, and set compression settings.',
     inputSchema: {
       type: 'object',
@@ -1643,6 +1799,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_effect',
     category: 'gameplay',
+    annotations: {
+      title: 'VFX & Particles',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Niagara particle systems, VFX, debug shapes, and GPU simulations. Create systems, emitters, modules, and control particle effects.',
     inputSchema: {
       type: 'object',
@@ -1808,6 +1971,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_gas',
     category: 'gameplay',
+    annotations: {
+      title: 'Gameplay Ability System',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create Gameplay Abilities, Effects, Attribute Sets, and Gameplay Cues for ability systems.',
     inputSchema: {
       type: 'object',
@@ -2048,6 +2218,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_character',
     category: 'gameplay',
+    annotations: {
+      title: 'Character Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create Character Blueprints with movement, locomotion, and animation state machines.',
     inputSchema: {
       type: 'object',
@@ -2215,6 +2392,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_combat',
     category: 'gameplay',
+    annotations: {
+      title: 'Combat System',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create weapons with hitscan/projectile firing, configure damage types, hitboxes, reload, and melee combat (combos, parry, block).',
     inputSchema: {
       type: 'object',
@@ -2394,6 +2578,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_ai',
     category: 'gameplay',
+    annotations: {
+      title: 'AI System',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create AI Controllers, configure Behavior Trees, Blackboards, EQS queries, and perception systems.',
     inputSchema: {
       type: 'object',
@@ -2656,6 +2847,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_inventory',
     category: 'gameplay',
+    annotations: {
+      title: 'Inventory System',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create item data assets, inventory components, world pickups, loot tables, and crafting recipes.',
     inputSchema: {
       type: 'object',
@@ -2933,6 +3131,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_interaction',
     category: 'gameplay',
+    annotations: {
+      title: 'Interaction System',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create interactive objects: doors, switches, chests, levers. Set up destructible meshes and trigger volumes.',
     inputSchema: {
       type: 'object',
@@ -3110,6 +3315,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_widget_authoring',
     category: 'utility',
+    annotations: {
+      title: 'Widget Authoring',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create UMG widgets: buttons, text, images, sliders. Configure layouts, bindings, animations. Build HUDs and menus.',
     inputSchema: {
       type: 'object',
@@ -3521,6 +3733,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_networking',
     category: 'utility',
+    annotations: {
+      title: 'Networking',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Configure multiplayer: property replication, RPCs (Server/Client/Multicast), authority, relevancy, and network prediction.',
     inputSchema: {
       type: 'object',
@@ -3746,6 +3965,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_game_framework',
     category: 'utility',
+    annotations: {
+      title: 'Game Framework',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create GameMode, GameState, PlayerController, PlayerState Blueprints. Configure match flow, teams, scoring, and spawning.',
     inputSchema: {
       type: 'object',
@@ -3872,6 +4098,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_sessions',
     category: 'utility',
+    annotations: {
+      title: 'Session Management',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    },
     description: 'Configure local multiplayer: split-screen layouts, LAN hosting/joining, voice chat channels, and push-to-talk.',
     inputSchema: {
       type: 'object',
@@ -3981,6 +4214,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_level_structure',
     category: 'world',
+    annotations: {
+      title: 'Level Structure',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create levels and sublevels. Configure World Partition, streaming, data layers, HLOD, and level instances.',
     inputSchema: {
       type: 'object',
@@ -4156,6 +4396,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_volumes',
     category: 'world',
+    annotations: {
+      title: 'Volume Management',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create trigger volumes, blocking volumes, physics volumes, audio volumes, and navigation bounds.',
     inputSchema: {
       type: 'object',
@@ -4302,6 +4549,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_navigation',
     category: 'gameplay',
+    annotations: {
+      title: 'Navigation System',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Configure NavMesh settings, add nav modifiers, create nav links and smart links for pathfinding.',
     inputSchema: {
       type: 'object',
@@ -4441,6 +4695,13 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
   {
     name: 'manage_splines',
     category: 'world',
+    annotations: {
+      title: 'Spline Management',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     description: 'Create spline actors, add/modify points, attach meshes along splines, and query spline data.',
     inputSchema: {
       type: 'object',
