@@ -1,3 +1,17 @@
+/**
+ * Location: src/tools/handlers/performance-handlers.ts
+ *
+ * Handles all performance-related MCP tool actions (profiling, benchmarks,
+ * scalability, LOD, Nanite, etc.).  The `run_benchmark` action optionally
+ * leverages MCP Sampling (see src/services/sampling-client.ts) to ask the
+ * connected AI for performance recommendations after a benchmark completes.
+ *
+ * Related files:
+ *   - src/tools/consolidated-tool-handlers.ts   -- routes actions here
+ *   - src/services/sampling-client.ts           -- optional AI analysis
+ *   - src/utils/action-constants.ts             -- shared action string constants
+ */
+
 import { cleanObject } from '../../utils/safe-json.js';
 import { ITools } from '../../types/tool-interfaces.js';
 import type { HandlerArgs, PerformanceArgs } from '../../types/handler-types.js';
@@ -42,19 +56,44 @@ export async function handlePerformanceTools(action: string, args: HandlerArgs, 
     case 'run_benchmark': {
       // Run benchmark using console commands with timing
       const duration = typeof argsTyped.duration === 'number' ? argsTyped.duration : 60;
-      
+
       // Start recording
       await executeAutomationRequest(tools, TOOL_ACTIONS.CONSOLE_COMMAND, { command: 'stat startfile' });
       await executeAutomationRequest(tools, TOOL_ACTIONS.CONSOLE_COMMAND, { command: 'profilegpu' });
-      
+
       // Wait for duration
       await new Promise(resolve => setTimeout(resolve, duration * 1000));
-      
+
       // Stop recording
       await executeAutomationRequest(tools, TOOL_ACTIONS.CONSOLE_COMMAND, { command: 'stat stopfile' });
       await executeAutomationRequest(tools, TOOL_ACTIONS.CONSOLE_COMMAND, { command: 'stat none' });
-      
-      return { success: true, message: `Benchmark completed for ${duration} seconds` };
+
+      const benchmarkResult: Record<string, unknown> = {
+        success: true,
+        message: `Benchmark completed for ${duration} seconds`,
+        durationSeconds: duration
+      };
+
+      // If MCP Sampling is available, ask the AI to generate recommendations
+      // based on the benchmark parameters.  This is entirely optional and will
+      // not break the workflow when the client does not support sampling.
+      try {
+        const { samplingClient } = await import('../../services/sampling-client.js');
+        if (samplingClient.isAvailable()) {
+          const aiRecommendations = await samplingClient.generateRecommendations({
+            action: 'run_benchmark',
+            durationSeconds: duration,
+            ...benchmarkResult
+          });
+          if (aiRecommendations.length > 0) {
+            benchmarkResult.aiRecommendations = aiRecommendations;
+          }
+        }
+      } catch {
+        // Sampling is optional -- continue without it
+      }
+
+      return benchmarkResult;
     }
     case 'show_fps': {
       const res = await executeAutomationRequest(tools, TOOL_ACTIONS.SHOW_FPS, {

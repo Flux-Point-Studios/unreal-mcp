@@ -14,6 +14,7 @@ import { startMetricsServer } from './services/metrics-server.js';
 import { config } from './config.js';
 import { GraphQLServer } from './graphql/server.js';
 import { subscriptionManager } from './services/subscription-manager.js';
+import { samplingClient } from './services/sampling-client.js';
 
 const require = createRequire(import.meta.url);
 const packageInfo: { name?: string; version?: string } = (() => {
@@ -141,6 +142,9 @@ export function createServer() {
       }
     }
   );
+
+  // Wire the sampling client so handlers can issue server-initiated AI requests
+  samplingClient.setServer(server);
 
   // Setup server using helper class
   const serverSetup = new ServerSetup(server, bridge, automationBridge, log, healthMonitor);
