@@ -161,7 +161,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
   
   switch (normalizedAction) {
     case 'play': {
+      await tools.progressReporter.report(1, 2, 'Starting Play-In-Editor session...');
       const res = await executeAutomationRequest(tools, 'control_editor', { action: 'play' }, undefined, { timeoutMs: args.timeoutMs }) as Record<string, unknown>;
+      await tools.progressReporter.report(2, 2, 'PIE session started');
       return cleanObject(res);
     }
     case 'stop':
@@ -192,7 +194,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       return cleanObject(res);
     }
     case 'screenshot': {
+      await tools.progressReporter.report(1, 2, 'Capturing viewport screenshot...');
       const res = await executeAutomationRequest(tools, 'control_editor', { action: 'screenshot', filename: args.filename, resolution: args.resolution }) as Record<string, unknown>;
+      await tools.progressReporter.report(2, 2, 'Screenshot captured');
       return cleanObject(res);
     }
     case 'console_command': {
@@ -317,7 +321,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       return cleanObject(res);
     }
     case 'save_all': {
+      await tools.progressReporter.report(1, 2, 'Saving all dirty packages...');
       const res = await executeAutomationRequest(tools, 'control_editor', { action: 'save_all' });
+      await tools.progressReporter.report(2, 2, 'All packages saved');
       return cleanObject(res);
     }
     case 'undo': {
@@ -360,7 +366,9 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
     case 'open_level': {
       // Accept 'assetPath' as alias since users commonly think of level paths as asset paths
       const levelPath = requireNonEmptyString(args.levelPath || args.path || args.assetPath, 'levelPath');
+      await tools.progressReporter.report(1, 3, `Loading level '${levelPath}'...`);
       const res = await executeAutomationRequest(tools, 'control_editor', { action: 'open_level', levelPath });
+      await tools.progressReporter.report(3, 3, 'Level loaded');
       return cleanObject(res);
     }
     case 'simulate_input': {

@@ -2,6 +2,7 @@ import { AutomationBridge } from '../automation/index.js';
 
 // Import tool class types for file I/O operations (using import type to avoid circular dependencies)
 import type { LogTools } from '../tools/logs.js';
+import type { ProgressReporter } from '../utils/progress-reporter.js';
 
 export interface IBaseTool {
     getAutomationBridge(): AutomationBridge;
@@ -250,6 +251,10 @@ export interface ITools {
     // Bridge references
     automationBridge?: AutomationBridge;
     bridge?: unknown; // UnrealBridge
+
+    // MCP progress reporting -- always present but may be a no-op when the
+    // client did not supply a progressToken with the request.
+    progressReporter: ProgressReporter;
 
     // Index signature allows additional tool properties
     // Using 'unknown' instead of 'any' for type safety - callers must narrow types when accessing

@@ -10,6 +10,7 @@ import { responseValidator } from '../utils/response-validator.js';
 import { ErrorHandler } from '../utils/error-handler.js';
 import { cleanObject } from '../utils/safe-json.js';
 import { createElicitationHelper, PrimitiveSchema } from '../utils/elicitation.js';
+import { createProgressReporter } from '../utils/progress-reporter.js';
 import { AssetResources } from '../resources/assets.js';
 import { ActorResources } from '../resources/actors.js';
 import { LevelResources } from '../resources/levels.js';
@@ -526,6 +527,10 @@ export class ToolRegistry {
                 }
             }
 
+            // Extract MCP progress token from request metadata (if the client provided one)
+            const progressToken = request.params._meta?.progressToken;
+            const progressReporter = createProgressReporter(this.server, progressToken);
+
             const tools = {
                 actorTools, assetTools, editorTools, blueprintTools, levelTools,
                 landscapeTools, foliageTools, environmentTools, sequenceTools, logTools,
@@ -537,7 +542,8 @@ export class ToolRegistry {
                 actorResources: this.actorResources,
                 levelResources: this.levelResources,
                 bridge: this.bridge,
-                automationBridge: this.automationBridge
+                automationBridge: this.automationBridge,
+                progressReporter
             };
 
             try {

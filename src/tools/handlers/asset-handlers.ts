@@ -159,6 +159,8 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         const overwrite = extractOptionalBoolean(params, 'overwrite') ?? false;
         const save = extractOptionalBoolean(params, 'save') ?? true;
 
+        await tools.progressReporter.report(1, 3, 'Validating import parameters...');
+
         const res = await executeAutomationRequest(tools, 'manage_asset', {
           sourcePath,
           destinationPath,
@@ -166,6 +168,8 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
           save,
           subAction: 'import'
         }) as AssetOperationResponse;
+
+        await tools.progressReporter.report(3, 3, 'Asset import complete');
         return ResponseFactory.success(res, 'Asset imported successfully');
       }
       case 'duplicate_asset':
@@ -288,6 +292,8 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
           return ResponseFactory.error('INVALID_ARGUMENT', 'No paths provided for delete action. Provide assetPath (string) or assetPaths (array).');
         }
 
+        await tools.progressReporter.report(1, 3, `Preparing to delete ${paths.length} asset(s)...`);
+
         // Normalize paths: strip object sub-path suffix (e.g., /Game/Folder/Asset.Asset -> /Game/Folder/Asset)
         // This handles the common pattern where full object paths are provided instead of package paths
         const normalizedPaths = paths.map(p => {
@@ -305,10 +311,14 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
           return normalized;
         });
 
+        await tools.progressReporter.report(2, 3, `Deleting ${normalizedPaths.length} asset(s)...`);
+
         const res = await executeAutomationRequest(tools, 'manage_asset', {
           paths: normalizedPaths,
           subAction: 'delete'
         }) as AssetOperationResponse;
+
+        await tools.progressReporter.report(3, 3, 'Asset deletion complete');
         return ResponseFactory.success(res, 'Assets deleted successfully');
       }
 
@@ -832,11 +842,13 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         const argsTyped = args as AssetArgs;
         const folderPath = argsTyped.folderPath ?? argsTyped.path;
         const assetPaths = argsTyped.assetPaths ?? argsTyped.paths;
-        
+
         if (!folderPath && (!assetPaths || (Array.isArray(assetPaths) && assetPaths.length === 0))) {
           return ResponseFactory.error('INVALID_ARGUMENT', 'Either folderPath or assetPaths is required for bulk_rename');
         }
-        
+
+        await tools.progressReporter.report(1, 3, 'Preparing bulk rename...');
+
         const res = await executeAutomationRequest(tools, 'bulk_rename', {
           folderPath,
           assetPaths,
@@ -845,6 +857,8 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
           prefix: argsTyped.prefix,
           suffix: argsTyped.suffix
         });
+
+        await tools.progressReporter.report(3, 3, 'Bulk rename complete');
         return ResponseFactory.success(res, 'Bulk rename completed');
       }
       case 'bulk_delete': {
@@ -852,16 +866,20 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         const argsTyped = args as AssetArgs;
         const folderPath = argsTyped.folderPath ?? argsTyped.path;
         const assetPaths = argsTyped.assetPaths ?? argsTyped.paths;
-        
+
         if (!folderPath && (!assetPaths || (Array.isArray(assetPaths) && assetPaths.length === 0))) {
           return ResponseFactory.error('INVALID_ARGUMENT', 'Either folderPath or assetPaths is required for bulk_delete');
         }
-        
+
+        await tools.progressReporter.report(1, 3, 'Preparing bulk delete...');
+
         const res = await executeAutomationRequest(tools, 'bulk_delete', {
           ...args,
           folderPath,
           assetPaths
         });
+
+        await tools.progressReporter.report(3, 3, 'Bulk delete complete');
         return ResponseFactory.success(res, 'Bulk delete completed');
       }
       default: {

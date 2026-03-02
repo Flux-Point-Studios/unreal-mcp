@@ -76,6 +76,10 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
         throw new Error('Missing or invalid required parameter: name (must be a non-empty string for create action)');
       }
 
+      await tools.progressReporter.report(1, 4, 'Validating blueprint parameters...');
+
+      await tools.progressReporter.report(2, 4, `Creating blueprint '${name}'...`);
+
       const res = await executeAutomationRequest(tools, 'blueprint_create', {
         name: name,
         blueprintType: argsTyped.blueprintType,
@@ -86,6 +90,8 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
         waitForCompletion: argsRecord.waitForCompletion as boolean | undefined,
         waitForCompletionTimeoutMs: argsRecord.waitForCompletionTimeoutMs as number | undefined
       }) as Record<string, unknown>;
+
+      await tools.progressReporter.report(4, 4, 'Blueprint creation complete');
       return cleanObject(res);
     }
     case 'ensure_exists': {
@@ -256,15 +262,20 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
       return cleanObject(res);
     }
     case 'modify_scs': {
+      const operations = (argsRecord.operations as Array<Record<string, unknown>>) ?? [];
+      await tools.progressReporter.report(1, 3, `Modifying SCS with ${operations.length} operation(s)...`);
+
       const res = await executeAutomationRequest(tools, 'blueprint_modify_scs', {
         blueprintPath: argsTyped.name || argsTyped.blueprintPath || (argsRecord.path as string) || '',
-        operations: (argsRecord.operations as Array<Record<string, unknown>>) ?? [],
+        operations,
         compile: argsRecord.applyAndSave as boolean | undefined,
         save: argsRecord.applyAndSave as boolean | undefined,
         timeoutMs: argsRecord.timeoutMs as number | undefined,
         waitForCompletion: argsRecord.waitForCompletion as boolean | undefined,
         waitForCompletionTimeoutMs: argsRecord.waitForCompletionTimeoutMs as number | undefined
       }) as Record<string, unknown>;
+
+      await tools.progressReporter.report(3, 3, 'SCS modification complete');
       return cleanObject(res);
     }
     case 'set_scs_transform': {
@@ -399,10 +410,15 @@ export async function handleBlueprintTools(action: string, args: HandlerArgs, to
       return cleanObject(res);
     }
     case 'compile': {
+      const bpPath = argsTyped.name || argsTyped.blueprintPath || (argsRecord.path as string) || '';
+      await tools.progressReporter.report(1, 3, `Compiling blueprint '${bpPath}'...`);
+
       const res = await executeAutomationRequest(tools, 'blueprint_compile', {
-        requestedPath: argsTyped.name || argsTyped.blueprintPath || (argsRecord.path as string) || '',
+        requestedPath: bpPath,
         saveAfterCompile: argsRecord.saveAfterCompile as boolean | undefined
       }) as Record<string, unknown>;
+
+      await tools.progressReporter.report(3, 3, 'Blueprint compilation complete');
       return cleanObject(res);
     }
     case 'probe_handle': {
