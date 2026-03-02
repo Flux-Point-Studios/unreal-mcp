@@ -1,10 +1,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-// import { ListPromptsRequestSchema, GetPromptRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ListPromptsRequestSchema, GetPromptRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { UnrealBridge } from './unreal-bridge.js';
 import { AutomationBridge } from './automation/index.js';
 import { Logger } from './utils/logger.js';
 import { HealthMonitor } from './services/health-monitor.js';
-// import { prompts } from './prompts/index.js';
+import { prompts } from './prompts/index.js';
 import { AssetResources } from './resources/assets.js';
 import { ActorResources } from './resources/actors.js';
 import { LevelResources } from './resources/levels.js';
@@ -73,7 +73,7 @@ export class ServerSetup {
     );
     toolRegistry.register();
 
-    // this.registerPrompts();
+    this.registerPrompts();
   }
 
   private validateEnvironment() {
@@ -96,6 +96,47 @@ export class ServerSetup {
         this.logger.info(`UE_ENGINE_PATH validated: ${enginePath}`);
       }
     }
+  }
+
+  /**
+   * Register MCP prompt templates so clients can discover and invoke
+   * guided Unreal Engine workflows (e.g. create-playable-character,
+   * setup-gas-ability). Handles both ListPrompts and GetPrompt requests.
+   */
+  private registerPrompts() {
+    this.server.setRequestHandler(ListPromptsRequestSchema, async () => {
+      return {
+        prompts: prompts.map(p => ({
+          name: p.name,
+          description: p.description,
+          arguments: p.arguments
+        }))
+      };
+    });
+
+    this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+      const prompt = prompts.find(p => p.name === request.params.name);
+      if (!prompt) {
+        throw new Error(`Unknown prompt: ${request.params.name}`);
+      }
+      // Deep-clone messages so template substitution does not mutate the originals.
+      let messages = JSON.parse(JSON.stringify(prompt.messages));
+      if (request.params.arguments) {
+        for (const msg of messages) {
+          if (msg.content.type === 'text') {
+            for (const [key, value] of Object.entries(request.params.arguments)) {
+              msg.content.text = msg.content.text.replace(
+                new RegExp(`\\{\\{${key}\\}\\}`, 'g'),
+                value
+              );
+            }
+          }
+        }
+      }
+      return { messages };
+    });
+
+    this.logger.info(`Registered ${prompts.length} MCP prompt templates`);
   }
 
   private async ensureConnectedOnDemand(): Promise<boolean> {
