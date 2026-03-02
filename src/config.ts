@@ -61,6 +61,11 @@ export const EnvSchema = z.object({
   // can see what it just did and self-correct.
   // Set to 'false' or '0' to disable.
   MCP_VISUAL_FEEDBACK: z.string().optional(),
+
+  // HTTP Transport (opt-in alternative to stdio)
+  MCP_HTTP_ENABLED: z.preprocess(stringToBoolean, z.boolean().default(false)),
+  MCP_HTTP_PORT: z.preprocess((v) => stringToNumber(v, 3000), z.number().default(3000)),
+  MCP_HTTP_HOST: z.string().default('127.0.0.1'),
 });
 
 export type Config = z.infer<typeof EnvSchema>;
