@@ -6,6 +6,7 @@ import { AssetResources } from '../resources/assets.js';
 import { ActorResources } from '../resources/actors.js';
 import { LevelResources } from '../resources/levels.js';
 import { HealthMonitor } from '../services/health-monitor.js';
+import { getContextByCategory } from '../context/index.js';
 
 export class ResourceHandler {
   constructor(
@@ -178,6 +179,23 @@ export class ResourceHandler {
             text: JSON.stringify(info, null, 2)
           }]
         };
+      }
+
+      // Handle UE5 documentation context resources
+      const docsPrefix = 'ue5-docs://';
+      if (uri.startsWith(docsPrefix)) {
+        const category = uri.slice(docsPrefix.length);
+        const ctx = getContextByCategory(category);
+        if (ctx) {
+          return {
+            contents: [{
+              uri,
+              mimeType: 'text/plain',
+              text: ctx.content,
+            }]
+          };
+        }
+        throw new Error(`Unknown UE5 docs category: ${category}`);
       }
 
       throw new Error(`Unknown resource: ${uri}`);

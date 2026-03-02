@@ -7,6 +7,7 @@ import { ResourceHandler } from '../handlers/resource-handlers.js';
 import { AssetResources } from '../resources/assets.js';
 import { ActorResources } from '../resources/actors.js';
 import { LevelResources } from '../resources/levels.js';
+import { getContextCategories } from '../context/index.js';
 
 export class ResourceRegistry {
     constructor(
@@ -21,6 +22,14 @@ export class ResourceRegistry {
     ) { }
 
     register() {
+        // Build the dynamic list of UE5 docs resources from the context system
+        const docsResources = getContextCategories().map((cat) => ({
+            uri: `ue5-docs://${cat.name}`,
+            name: `UE5 Docs: ${cat.name}`,
+            description: cat.description,
+            mimeType: 'text/plain' as const,
+        }));
+
         this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
             return {
                 resources: [
@@ -29,7 +38,8 @@ export class ResourceRegistry {
                     { uri: 'ue://level', name: 'Current Level', description: 'Current level name and path', mimeType: 'application/json' },
                     { uri: 'ue://health', name: 'Health Status', description: 'Server health and performance metrics', mimeType: 'application/json' },
                     { uri: 'ue://automation-bridge', name: 'Automation Bridge', description: 'Automation bridge diagnostics and recent activity', mimeType: 'application/json' },
-                    { uri: 'ue://version', name: 'Engine Version', description: 'Unreal Engine version and compatibility info', mimeType: 'application/json' }
+                    { uri: 'ue://version', name: 'Engine Version', description: 'Unreal Engine version and compatibility info', mimeType: 'application/json' },
+                    ...docsResources,
                 ]
             };
         });
