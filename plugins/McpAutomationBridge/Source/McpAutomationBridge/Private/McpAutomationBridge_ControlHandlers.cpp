@@ -6,6 +6,9 @@
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeSubsystem.h"
 #include "Misc/ScopeExit.h"
+#include "Misc/Base64.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
 
 #if WITH_EDITOR
 #include "EditorAssetLibrary.h"
@@ -2871,6 +2874,8 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorAction(
     return HandleControlEditorSetFixedDeltaTime(RequestId, Payload, RequestingSocket);
   if (LowerSub == TEXT("open_level"))
     return HandleControlEditorOpenLevel(RequestId, Payload, RequestingSocket);
+  if (LowerSub == TEXT("capture_viewport"))
+    return HandleControlEditorCaptureViewport(RequestId, Payload, RequestingSocket);
 
   // --------------------------------------------------------------------------
   // begin_transaction
@@ -4118,6 +4123,183 @@ bool UMcpAutomationBridgeSubsystem::HandleControlEditorOpenLevel(
   return true;
 #else
   return false;
+#endif
+}
+
+bool UMcpAutomationBridgeSubsystem::HandleControlEditorCaptureViewport(
+    const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+    TSharedPtr<FMcpBridgeWebSocket> Socket) {
+#if WITH_EDITOR
+  if (!GEditor) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("EDITOR_NOT_AVAILABLE"),
+                              TEXT("Editor not available"), nullptr);
+    return true;
+  }
+
+  // Parse parameters with defaults
+  int32 RequestedWidth = 1024;
+  int32 RequestedHeight = 576;
+  FString FormatStr = TEXT("jpeg");
+  int32 Quality = 85;
+
+  Payload->TryGetNumberField(TEXT("width"), RequestedWidth);
+  Payload->TryGetNumberField(TEXT("height"), RequestedHeight);
+  Payload->TryGetStringField(TEXT("format"), FormatStr);
+  Payload->TryGetNumberField(TEXT("quality"), Quality);
+
+  // Clamp values to sensible ranges
+  RequestedWidth = FMath::Clamp(RequestedWidth, 64, 4096);
+  RequestedHeight = FMath::Clamp(RequestedHeight, 64, 4096);
+  Quality = FMath::Clamp(Quality, 1, 100);
+  FormatStr = FormatStr.ToLower();
+  const bool bUsePng = (FormatStr == TEXT("png"));
+
+  // Get the active level editor viewport
+  FViewport* Viewport = GEditor->GetActiveViewport();
+  if (!Viewport) {
+    // Fallback: try to find viewport via the LevelEditor module
+#if MCP_HAS_LEVEL_EDITOR_MODULE
+    FLevelEditorModule* LevelEditorModule = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor"));
+    if (LevelEditorModule) {
+      TSharedPtr<IAssetViewport> ActiveViewport = LevelEditorModule->GetFirstActiveViewport();
+      if (ActiveViewport.IsValid()) {
+        Viewport = ActiveViewport->GetActiveViewport();
+      }
+    }
+#endif
+  }
+
+  if (!Viewport) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("VIEWPORT_NOT_AVAILABLE"),
+                              TEXT("No active viewport available"), nullptr);
+    return true;
+  }
+
+  // Capture viewport pixels
+  TArray<FColor> Bitmap;
+  if (!Viewport->ReadPixels(Bitmap)) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("CAPTURE_FAILED"),
+                              TEXT("Failed to read viewport pixels"), nullptr);
+    return true;
+  }
+
+  const int32 SrcWidth = Viewport->GetSizeXY().X;
+  const int32 SrcHeight = Viewport->GetSizeXY().Y;
+
+  if (Bitmap.Num() == 0 || SrcWidth <= 0 || SrcHeight <= 0) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("CAPTURE_FAILED"),
+                              TEXT("Viewport returned empty bitmap"), nullptr);
+    return true;
+  }
+
+  // Resize if necessary
+  TArray<FColor> ResizedBitmap;
+  int32 FinalWidth = SrcWidth;
+  int32 FinalHeight = SrcHeight;
+  const TArray<FColor>* PixelSource = &Bitmap;
+
+  if (RequestedWidth != SrcWidth || RequestedHeight != SrcHeight) {
+    FinalWidth = RequestedWidth;
+    FinalHeight = RequestedHeight;
+    ResizedBitmap.SetNum(FinalWidth * FinalHeight);
+
+    // Bilinear resize
+    for (int32 Y = 0; Y < FinalHeight; ++Y) {
+      for (int32 X = 0; X < FinalWidth; ++X) {
+        const float SrcX = (static_cast<float>(X) + 0.5f) * SrcWidth / FinalWidth - 0.5f;
+        const float SrcY = (static_cast<float>(Y) + 0.5f) * SrcHeight / FinalHeight - 0.5f;
+
+        const int32 X0 = FMath::Clamp(FMath::FloorToInt32(SrcX), 0, SrcWidth - 1);
+        const int32 Y0 = FMath::Clamp(FMath::FloorToInt32(SrcY), 0, SrcHeight - 1);
+        const int32 X1 = FMath::Clamp(X0 + 1, 0, SrcWidth - 1);
+        const int32 Y1 = FMath::Clamp(Y0 + 1, 0, SrcHeight - 1);
+
+        const float XFrac = SrcX - FMath::FloorToFloat(SrcX);
+        const float YFrac = SrcY - FMath::FloorToFloat(SrcY);
+
+        const FColor& C00 = Bitmap[Y0 * SrcWidth + X0];
+        const FColor& C10 = Bitmap[Y0 * SrcWidth + X1];
+        const FColor& C01 = Bitmap[Y1 * SrcWidth + X0];
+        const FColor& C11 = Bitmap[Y1 * SrcWidth + X1];
+
+        const float OneMinusXFrac = 1.0f - XFrac;
+        const float OneMinusYFrac = 1.0f - YFrac;
+
+        ResizedBitmap[Y * FinalWidth + X] = FColor(
+          static_cast<uint8>(FMath::Clamp(
+            C00.R * OneMinusXFrac * OneMinusYFrac + C10.R * XFrac * OneMinusYFrac +
+            C01.R * OneMinusXFrac * YFrac + C11.R * XFrac * YFrac, 0.0f, 255.0f)),
+          static_cast<uint8>(FMath::Clamp(
+            C00.G * OneMinusXFrac * OneMinusYFrac + C10.G * XFrac * OneMinusYFrac +
+            C01.G * OneMinusXFrac * YFrac + C11.G * XFrac * YFrac, 0.0f, 255.0f)),
+          static_cast<uint8>(FMath::Clamp(
+            C00.B * OneMinusXFrac * OneMinusYFrac + C10.B * XFrac * OneMinusYFrac +
+            C01.B * OneMinusXFrac * YFrac + C11.B * XFrac * YFrac, 0.0f, 255.0f)),
+          255
+        );
+      }
+    }
+    PixelSource = &ResizedBitmap;
+  }
+
+  // Convert FColor array to raw RGBA bytes for IImageWrapper
+  TArray<uint8> RawData;
+  RawData.SetNum(FinalWidth * FinalHeight * 4);
+  for (int32 i = 0; i < PixelSource->Num(); ++i) {
+    RawData[i * 4 + 0] = (*PixelSource)[i].R;
+    RawData[i * 4 + 1] = (*PixelSource)[i].G;
+    RawData[i * 4 + 2] = (*PixelSource)[i].B;
+    RawData[i * 4 + 3] = (*PixelSource)[i].A;
+  }
+
+  // Compress using IImageWrapper
+  IImageWrapperModule& ImageWrapperModule =
+      FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+  EImageFormat ImageFormat = bUsePng ? EImageFormat::PNG : EImageFormat::JPEG;
+  TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(ImageFormat);
+
+  if (!ImageWrapper.IsValid()) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("ENCODE_FAILED"),
+                              TEXT("Failed to create image encoder"), nullptr);
+    return true;
+  }
+
+  if (!ImageWrapper->SetRaw(RawData.GetData(), RawData.Num(), FinalWidth, FinalHeight, ERGBFormat::RGBA, 8)) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("ENCODE_FAILED"),
+                              TEXT("Failed to set raw pixel data"), nullptr);
+    return true;
+  }
+
+  TArray<uint8> CompressedData = ImageWrapper->GetCompressed(bUsePng ? 100 : Quality);
+
+  if (CompressedData.Num() == 0) {
+    SendStandardErrorResponse(this, Socket, RequestId, TEXT("ENCODE_FAILED"),
+                              TEXT("Failed to compress image"), nullptr);
+    return true;
+  }
+
+  // Base64 encode
+  FString Base64Data = FBase64::Encode(CompressedData);
+
+  // Build response
+  TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+  Resp->SetBoolField(TEXT("success"), true);
+  Resp->SetStringField(TEXT("imageBase64"), Base64Data);
+  Resp->SetStringField(TEXT("mimeType"), bUsePng ? TEXT("image/png") : TEXT("image/jpeg"));
+  Resp->SetNumberField(TEXT("width"), FinalWidth);
+  Resp->SetNumberField(TEXT("height"), FinalHeight);
+  Resp->SetStringField(TEXT("format"), bUsePng ? TEXT("png") : TEXT("jpeg"));
+  Resp->SetNumberField(TEXT("sizeBytes"), CompressedData.Num());
+  Resp->SetStringField(TEXT("message"),
+      FString::Printf(TEXT("Viewport captured (%dx%d, %s, %d bytes)"),
+          FinalWidth, FinalHeight, bUsePng ? TEXT("png") : TEXT("jpeg"), CompressedData.Num()));
+
+  SendAutomationResponse(Socket, RequestId, true, TEXT("Viewport captured"), Resp, FString());
+  return true;
+#else
+  SendStandardErrorResponse(this, Socket, RequestId, TEXT("NOT_IMPLEMENTED"),
+                              TEXT("Viewport capture requires editor build."), nullptr);
+  return true;
 #endif
 }
 

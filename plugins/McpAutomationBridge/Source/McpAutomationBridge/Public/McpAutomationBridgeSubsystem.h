@@ -1164,6 +1164,9 @@ private:
   bool HandleControlEditorOpenLevel(const FString &RequestId,
                                     const TSharedPtr<FJsonObject> &Payload,
                                     TSharedPtr<FMcpBridgeWebSocket> Socket);
+  bool HandleControlEditorCaptureViewport(const FString &RequestId,
+                                          const TSharedPtr<FJsonObject> &Payload,
+                                          TSharedPtr<FMcpBridgeWebSocket> Socket);
 
   // Asset handlers
   bool HandleImportAsset(const FString &RequestId,

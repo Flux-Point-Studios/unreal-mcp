@@ -436,7 +436,8 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'open_level', 'focus_actor',
             'show_stats', 'hide_stats',
             'set_editor_mode', 'set_immersive_mode', 'set_game_view',
-            'undo', 'redo', 'save_all'
+            'undo', 'redo', 'save_all',
+            'capture_viewport'
           ],
           description: 'Editor action'
         },
@@ -472,7 +473,10 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         value: commonSchemas.value,
         // simulate_input parameters
         inputAction: commonSchemas.stringProp,
-        axis: commonSchemas.stringProp
+        axis: commonSchemas.stringProp,
+        // capture_viewport parameters
+        format: { type: 'string', enum: ['jpeg', 'png'], description: 'Image format for capture_viewport (default: jpeg)' },
+        quality: { type: 'number', minimum: 1, maximum: 100, description: 'JPEG quality for capture_viewport (1-100, default: 85)' }
       },
       required: ['action']
     },

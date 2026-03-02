@@ -247,6 +247,10 @@ export interface EditorArgs extends HandlerArgs {
     category?: string;
     preferences?: Record<string, unknown>;
     timeoutMs?: number;
+    /** Image format for capture_viewport (jpeg or png) */
+    format?: string;
+    /** JPEG quality for capture_viewport (1-100) */
+    quality?: number;
 }
 
 // ============================================================================

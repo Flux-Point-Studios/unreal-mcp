@@ -109,6 +109,7 @@ const ACTION_ALLOWED_PARAMS: Record<string, string[]> = {
   'stop_recording': [],
   'set_viewport_realtime': ['enabled', 'realtime'],
   'simulate_input': ['key', 'action', 'inputAction', 'axis', 'value'],
+  'capture_viewport': ['width', 'height', 'format', 'quality'],
 };
 
 /**
@@ -401,6 +402,57 @@ export async function handleEditorTools(action: string, args: EditorArgs, tools:
       const actorName = requireNonEmptyString(args.actorName || args.name, 'actorName');
       const res = await executeAutomationRequest(tools, 'control_editor', { action: 'focus_actor', actorName });
       return cleanObject(res);
+    }
+    case 'capture_viewport': {
+      const width = typeof args.width === 'number' && args.width > 0 ? args.width : 1024;
+      const height = typeof args.height === 'number' && args.height > 0 ? args.height : 576;
+      const format = (args.format === 'png' ? 'png' : 'jpeg') as string;
+      const quality = typeof args.quality === 'number' && args.quality >= 1 && args.quality <= 100 ? args.quality : 85;
+
+      const res = await executeAutomationRequest(tools, 'control_editor', {
+        action: 'capture_viewport',
+        width,
+        height,
+        format,
+        quality
+      }) as Record<string, unknown>;
+
+      // The C++ handler returns imageBase64 and mimeType in the response
+      const imageBase64 = typeof res.imageBase64 === 'string' ? res.imageBase64 : '';
+      const mimeType = typeof res.mimeType === 'string' ? res.mimeType : `image/${format}`;
+
+      if (!imageBase64) {
+        return {
+          success: false,
+          isError: true,
+          error: 'CAPTURE_FAILED',
+          message: typeof res.message === 'string' ? res.message : 'Failed to capture viewport screenshot',
+          action: 'capture_viewport'
+        };
+      }
+
+      // Return MCP content format with image block so the response is passed through as-is
+      return {
+        content: [
+          {
+            type: 'image' as const,
+            data: imageBase64,
+            mimeType
+          },
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              message: `Viewport captured (${res.width || width}x${res.height || height}, ${format})`,
+              action: 'capture_viewport',
+              width: res.width || width,
+              height: res.height || height,
+              format,
+              sizeBytes: res.sizeBytes
+            })
+          }
+        ]
+      };
     }
     default:
       return await executeAutomationRequest(tools, 'control_editor', args);
