@@ -15,6 +15,7 @@ import { config } from './config.js';
 import { GraphQLServer } from './graphql/server.js';
 import { subscriptionManager } from './services/subscription-manager.js';
 import { samplingClient } from './services/sampling-client.js';
+import { SERVER_INSTRUCTIONS } from './instructions.js';
 
 const require = createRequire(import.meta.url);
 const packageInfo: { name?: string; version?: string } = (() => {
@@ -139,7 +140,8 @@ export function createServer() {
         tools: { listChanged: true },
         resources: { subscribe: true },
         prompts: {}
-      }
+      },
+      instructions: SERVER_INSTRUCTIONS
     }
   );
 
