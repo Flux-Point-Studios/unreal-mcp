@@ -80,6 +80,7 @@ export class ResourceRegistry {
                     { uri: 'ue://recent-changes', name: 'Recent Changes', description: 'Last 15 mutating operations with semantic summaries (from operation journal)', mimeType: 'application/json' },
                     { uri: 'ue://recent-errors', name: 'Recent Errors', description: 'Recent tool failures and warnings with structured diagnostics', mimeType: 'application/json' },
                     { uri: 'ue://acceptance-criteria', name: 'Acceptance Criteria', description: 'Machine-readable design contract: genre, perf budget, naming conventions, platform targets', mimeType: 'application/json' },
+                    { uri: 'ue://runtime-logs', name: 'Runtime Logs', description: 'Recent runtime log summary: error/warning counts, top categories, recent errors', mimeType: 'application/json' },
                     ...docsResources,
                 ]
             };

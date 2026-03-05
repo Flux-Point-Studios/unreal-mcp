@@ -94,6 +94,7 @@ This server controls a live Unreal Editor instance. All 40 tools use an **action
 **Closed-Loop Autonomy** (Sprint 7)
 - \`validate\` — \`assert_blueprint_compiles\`, \`assert_map_clean\`, \`assert_no_missing_references\`, \`assert_naming_conventions\`, \`assert_performance_budget\`, \`run_validation_suite\`, \`get_validation_report\`, \`set_acceptance_criteria\`, \`get_acceptance_criteria\`
 - \`checkpoint\` — \`create_checkpoint\`, \`list_checkpoints\`, \`diff_checkpoint\`, \`restore_checkpoint\`, \`delete_checkpoint\`, \`begin_transaction\`, \`commit_transaction\`, \`rollback_transaction\`
+- \`observe\` — \`query_logs\`, \`get_log_summary\`, \`start_playtest\`, \`capture_snapshot\`, \`stop_playtest\`, \`get_playtest_report\`, \`run_scenario\`, \`get_runtime_state\`
 - \`source_control\` — \`status\`, \`checkpoint\` (commit), \`revert\`, \`changed_since\`, \`lock\`, \`unlock\`, \`change_summary\`
 
 **System & Orchestration**
@@ -116,6 +117,7 @@ This server controls a live Unreal Editor instance. All 40 tools use an **action
 - \`ue://recent-changes\` — last 15 mutating operations with semantic summaries (from operation journal)
 - \`ue://recent-errors\` — recent tool failures and warnings with structured diagnostics
 - \`ue://acceptance-criteria\` — machine-readable design contract (genre, perf budget, naming conventions)
+- \`ue://runtime-logs\` — runtime log summary: error/warning counts, top categories, active playtest status
 - \`ue5-docs://{category}\` — curated UE5 docs (blueprint, animation, actor, materials, niagara, enhanced-input, networking, gas, world-building, sequencer)
 
 **Templates** — parameterized lookups:
@@ -152,6 +154,8 @@ create-playable-character, setup-gas-ability, create-multiplayer-lobby, level-pe
 **After visual or structural changes, run \`validate\` → \`run_validation_suite\`** — this checks blueprint compilation, map cleanliness, missing references, naming conventions, and performance budget in one call. Each assertion returns structured diagnostics with suggested next actions.
 
 **Read \`ue://project-summary\` at the start of a session** — get a grounded understanding of the project (current level, actor counts by class, asset count, acceptance criteria) before making changes. Read \`ue://recent-changes\` to see what was done recently.
+
+**Use \`observe\` → \`run_scenario\` for automated playtesting** — starts PIE, captures viewport screenshots at intervals, ingests runtime logs, stops PIE, and generates a structured report with verdict (clean/warnings_only/errors_found/fatal) and correlated timeline.
 
 **Set acceptance criteria early with \`validate\` → \`set_acceptance_criteria\`** — define genre, camera, platforms, performance budget, naming conventions, and constraints. Assertions will validate against these.
 

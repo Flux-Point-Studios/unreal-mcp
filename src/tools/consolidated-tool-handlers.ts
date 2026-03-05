@@ -51,6 +51,7 @@ import { handleAssetPipelineTools } from './handlers/asset-pipeline-handlers.js'
 import { handleValidateTools } from './handlers/validate-handlers.js';
 import { handleCheckpointTools } from './handlers/checkpoint-handlers.js';
 import { handleSourceControlTools } from './handlers/source-control-handlers.js';
+import { handleObserveTools } from './handlers/observe-handlers.js';
 // import { getDynamicHandlerForTool } from './dynamic-handler-registry.js';
 // import { consolidatedToolDefinitions } from './consolidated-tool-definitions.js';
 
@@ -500,7 +501,13 @@ function registerDefaultHandlers() {
     return await handleCheckpointTools(action, args, tools);
   });
 
-  // 48. SOURCE CONTROL — SCM adapter
+  // 48. OBSERVE — Runtime observability and playtest feedback
+  toolRegistry.register('observe', async (args, tools) => {
+    const action = getAction(args);
+    return await handleObserveTools(action, args, tools);
+  });
+
+  // 49. SOURCE CONTROL — SCM adapter
   toolRegistry.register('source_control', async (args, tools) => {
     const action = getAction(args);
     return await handleSourceControlTools(action, args, tools);

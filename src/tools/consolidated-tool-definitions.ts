@@ -5342,6 +5342,47 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
     }
   },
 
+  // OBSERVE — Runtime observability and playtest feedback
+  {
+    name: 'observe',
+    description: 'Runtime observability and playtest feedback. Start PIE playtests, capture snapshots at intervals, query logs, correlate events, and generate structured reports. Actions: query_logs, get_log_summary, start_playtest, capture_snapshot, stop_playtest, get_playtest_report, run_scenario, get_runtime_state.',
+    category: 'core',
+    annotations: {
+      title: 'Observe & Playtest',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'query_logs', 'get_log_summary',
+            'start_playtest', 'capture_snapshot', 'stop_playtest',
+            'get_playtest_report', 'run_scenario', 'get_runtime_state'
+          ],
+          description: 'run_scenario automates: start PIE → capture snapshots at intervals → stop → report. query_logs reads from disk log and internal buffer.'
+        },
+        // query_logs params
+        count: { type: 'number', description: 'Number of log entries to return (default: 50)' },
+        severity: { type: 'string', enum: ['fatal', 'error', 'warning', 'info', 'verbose'], description: 'Minimum severity filter for logs' },
+        category: { type: 'string', description: 'Log category filter (partial match)' },
+        since: { type: 'string', description: 'ISO timestamp — only return logs after this time' },
+        // playtest params
+        label: { type: 'string', description: 'Label for the playtest session or scenario' },
+        // run_scenario params
+        duration: { type: 'number', description: 'Scenario duration in seconds (default: 10)' },
+        interval: { type: 'number', description: 'Snapshot capture interval in seconds (default: 3)' },
+        // stop_playtest params
+        status: { type: 'string', enum: ['completed', 'failed', 'aborted'], description: 'Final status when stopping playtest' }
+      },
+      required: ['action']
+    }
+  },
+
   // SOURCE_CONTROL — SCM adapter (Git now, Perforce later)
   {
     name: 'source_control',

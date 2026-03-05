@@ -18,6 +18,7 @@ import { HealthMonitor } from '../services/health-monitor.js';
 import { getContextByCategory } from '../context/index.js';
 import { operationJournal } from '../services/operation-journal.js';
 import { acceptanceCriteria } from '../services/acceptance-criteria.js';
+import { runtimeObserver } from '../services/runtime-observer.js';
 
 /** Timeout in milliseconds for automation bridge requests made by resource template handlers. */
 const TEMPLATE_REQUEST_TIMEOUT_MS = 10000;
@@ -336,6 +337,31 @@ export class ResourceHandler {
               })),
               totalJournalErrors: journalErrors.length,
               totalHealthErrors: healthErrors.length,
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (uri === 'ue://runtime-logs') {
+        const summary = runtimeObserver.getLogSummary();
+        const activeSession = runtimeObserver.getActiveSession();
+        const status = runtimeObserver.getStatus();
+
+        return {
+          contents: [{
+            uri,
+            mimeType: 'application/json',
+            text: JSON.stringify({
+              ...summary,
+              activePlaytest: activeSession ? {
+                id: activeSession.id,
+                status: activeSession.status,
+                scenarioLabel: activeSession.scenarioLabel,
+                logCount: activeSession.logs.length,
+                snapshotCount: activeSession.snapshots.length,
+              } : null,
+              bufferSize: status.logBufferSize,
+              eventCount: status.eventCount,
             }, null, 2)
           }]
         };
