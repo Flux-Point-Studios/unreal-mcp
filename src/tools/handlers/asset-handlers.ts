@@ -356,7 +356,7 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
         const includeTransient = extractOptionalBoolean(dumpParams, 'includeTransient') ?? false;
         const propertyAllowlist = extractOptionalArray(dumpParams, 'propertyAllowlist');
 
-        const dumpRes = await executeAutomationRequest(tools, 'dump_asset', {
+        const dumpRes: any = await executeAutomationRequest(tools, 'dump_asset', {
           assetPath: dumpAssetPath,
           options: {
             maxDepth,
@@ -366,7 +366,7 @@ export async function handleAssetTools(action: string, args: HandlerArgs, tools:
             includeTransient,
             propertyAllowlist: propertyAllowlist ?? []
           }
-        });
+        }, 'Automation bridge not available', { timeoutMs: 60000 });
 
         if (dumpRes && dumpRes.success !== false) {
           const propCount = dumpRes.propertyCount ?? 0;

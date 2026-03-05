@@ -122,6 +122,22 @@ This server controls a live Unreal Editor instance. All 40 tools use an **action
 Use \`prompts/get\` with these names for guided step-by-step workflows:
 create-playable-character, setup-gas-ability, create-multiplayer-lobby, level-performance-audit, setup-material-instance, create-ai-npc, blueprint-health-check, setup-niagara-effect, create-ui-widget, setup-enhanced-input, create-save-system, setup-inventory-system
 
+## Troubleshooting
+
+**"Unreal Engine is not connected"** — The editor hasn't connected to the MCP bridge yet. Read \`ue://health\` to check status. Wait for the user to confirm the editor is loaded before retrying. Do NOT retry the same call immediately.
+
+**\`dump_asset\` times out** — This action serializes full UObject properties and can be slow for complex assets (materials, blueprints). Alternatives:
+- Use \`inspect\` → \`get_material_details\` or \`get_mesh_details\` for targeted info (much faster)
+- Use \`manage_asset\` → \`get_material_stats\` for material overview
+- Use \`system_control\` → \`console_command\` with \`obj dump ClassName\` for raw UE output
+- Reduce scope: pass \`maxDepth: 1\` and \`propertyAllowlist\` to limit data
+
+**Action returns unexpected errors** — Try these investigation steps in order:
+1. \`inspect\` → \`get_actor_details\` / \`get_material_details\` / \`get_mesh_details\` (primary investigation tool)
+2. \`control_editor\` → \`capture_viewport\` to see the current visual state
+3. \`system_control\` → \`console_command\` for UE console diagnostics
+4. \`workflow\` → \`quick_test\` for a fast overview of editor state
+
 ## Tips
 - Resource subscriptions are supported — subscribe to \`ue://actors\` etc. for live updates.
 - For AI-generated 3D assets, use \`asset_pipeline\` with a Meshy or Tripo API key.
