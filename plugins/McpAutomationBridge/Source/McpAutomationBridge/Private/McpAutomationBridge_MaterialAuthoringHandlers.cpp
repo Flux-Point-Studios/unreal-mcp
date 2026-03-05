@@ -73,6 +73,7 @@
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "UObject/SavePackage.h"
 #include "EditorAssetLibrary.h"
+#include "MaterialGraph/MaterialGraph.h"
 
 // Landscape layer info (for add_landscape_layer)
 // LandscapeLayerInfoObject is available in UE 5.0+
@@ -86,6 +87,23 @@
 
 // Forward declarations of helper functions
 #if WITH_EDITOR
+
+/**
+ * Properly recompile a material after expression or connection changes.
+ * Syncs the EdGraph so connections persist across save/load.
+ */
+static void McpRecompileMaterialAuthoring(UMaterial* Material)
+{
+    if (!Material) return;
+    Material->PreEditChange(nullptr);
+    Material->PostEditChange();
+    if (Material->MaterialGraph)
+    {
+        Material->MaterialGraph->RebuildGraph();
+    }
+    Material->MarkPackageDirty();
+}
+
 static UMaterialExpression* FindExpressionByIdOrName(UMaterial* Material, const FString& NodeIdOrName);
 #endif
 static bool SaveMaterialAsset(UMaterial *Material);
@@ -339,8 +357,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       NewMaterial->TwoSided = bTwoSided;
     }
 
-    NewMaterial->PostEditChange();
-    NewMaterial->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(NewMaterial);
 
 // Notify asset registry FIRST (required for UE 5.7+ before saving)
     FAssetRegistryModule::AssetCreated(NewMaterial);
@@ -425,8 +442,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       return true;
     }
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     bool bSave = true;
     Payload->TryGetBoolField(TEXT("save"), bSave);
@@ -520,8 +536,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       return true;
     }
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     bool bSave = true;
     Payload->TryGetBoolField(TEXT("save"), bSave);
@@ -600,8 +615,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       return true;
     }
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     bool bSave = true;
     Payload->TryGetBoolField(TEXT("save"), bSave);
@@ -714,8 +728,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(PlainSample);
 #endif
       
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterialAuthoring(Material);
       
       TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
       Result->SetStringField(TEXT("nodeId"), PlainSample->MaterialExpressionGuid.ToString());
@@ -754,8 +767,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(TexSample);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -791,8 +803,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(TexCoord);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -835,8 +846,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(ScalarParam);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -890,8 +900,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(VecParam);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -936,8 +945,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(SwitchParam);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1017,8 +1025,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(MathNode);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1110,8 +1117,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(NewExpr);
 #endif
 
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterialAuthoring(Material);
 
       TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
       Result->SetStringField(TEXT("nodeId"),
@@ -1157,8 +1163,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(NewExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1196,8 +1201,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(MaskExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1224,8 +1228,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(DotExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1252,8 +1255,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(CrossExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1291,8 +1293,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(DesatExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1319,8 +1320,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(AppendExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1376,8 +1376,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(CustomExpr);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -1453,8 +1452,7 @@ MCP_GET_MATERIAL_INPUT(Material, WorldPositionOffset).Expression =
 #endif
 
       if (bFound) {
-        Material->PostEditChange();
-        Material->MarkPackageDirty();
+        McpRecompileMaterialAuthoring(Material);
         SendAutomationResponse(Socket, RequestId, true,
                                TEXT("Connected to main material node."));
       } else {
@@ -1484,8 +1482,7 @@ MCP_GET_MATERIAL_INPUT(Material, WorldPositionOffset).Expression =
             StructProp->ContainerPtrToValuePtr<FExpressionInput>(TargetExpr);
         if (InputPtr) {
           InputPtr->Expression = SourceExpr;
-          Material->PostEditChange();
-          Material->MarkPackageDirty();
+          McpRecompileMaterialAuthoring(Material);
           SendAutomationResponse(Socket, RequestId, true,
                                  TEXT("Nodes connected."));
           return true;
@@ -1549,8 +1546,7 @@ MCP_GET_MATERIAL_INPUT(Material, WorldPositionOffset).Expression =
 #endif
 
         if (bFound) {
-          Material->PostEditChange();
-          Material->MarkPackageDirty();
+          McpRecompileMaterialAuthoring(Material);
           SendAutomationResponse(Socket, RequestId, true,
                                  TEXT("Disconnected from main material pin."));
           return true;
@@ -1847,8 +1843,7 @@ MCP_GET_MATERIAL_INPUT(Material, WorldPositionOffset).Expression =
     MCP_GET_MATERIAL_EXPRESSIONS(Material).Add(FuncCall);
 #endif
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"),
@@ -2387,8 +2382,7 @@ MCP_GET_MATERIAL_INPUT(Material, WorldPositionOffset).Expression =
       NewMaterial->BlendMode = EBlendMode::BLEND_Opaque;
     }
 
-    NewMaterial->PostEditChange();
-    NewMaterial->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(NewMaterial);
 
     bool bSave = true;
     Payload->TryGetBoolField(TEXT("save"), bSave);
@@ -2618,8 +2612,7 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
       CreatedNodeIds.Add(WeightParam->MaterialExpressionGuid.ToString());
     }
     
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
     
     // Save if requested
     bool bSave = true;
@@ -2679,9 +2672,7 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
     }
 
     // Force recompile
-    Material->PreEditChange(nullptr);
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     bool bSave = true;
     Payload->TryGetBoolField(TEXT("save"), bSave);
@@ -2961,8 +2952,7 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
       }
     }
 
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"), NewExpr->MaterialExpressionGuid.ToString());
@@ -3018,8 +3008,7 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
     // In UE 5.1+, expressions are accessed through GetExpressionCollection()
     Material->GetExpressionCollection().RemoveExpression(Expr);
 #endif
-    Material->PostEditChange();
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("nodeId"), NodeId);
@@ -3138,7 +3127,7 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
     bool bTwoSided = GetJsonBoolField(Payload, TEXT("twoSided"), true);
     Material->TwoSided = bTwoSided ? 1 : 0;
-    Material->MarkPackageDirty();
+    McpRecompileMaterialAuthoring(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("assetPath"), AssetPath);

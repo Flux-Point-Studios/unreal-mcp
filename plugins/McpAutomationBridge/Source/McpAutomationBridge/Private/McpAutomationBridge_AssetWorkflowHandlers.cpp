@@ -183,8 +183,25 @@ bool UMcpAutomationBridgeSubsystem::HandleAssetAction(
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "Blueprint/BlueprintSupport.h"
+#include "MaterialGraph/MaterialGraph.h"
 
 #endif
+
+/**
+ * Properly recompile a material after expression or connection changes.
+ * Syncs the EdGraph so connections persist across save/load.
+ */
+static void McpRecompileMaterialAsset(UMaterial* Material)
+{
+    if (!Material) return;
+    Material->PreEditChange(nullptr);
+    Material->PostEditChange();
+    if (Material->MaterialGraph)
+    {
+        Material->MaterialGraph->RebuildGraph();
+    }
+    Material->MarkPackageDirty();
+}
 
 // ============================================================================
 // 1. FIXUP REDIRECTORS
@@ -3830,7 +3847,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAddMaterialNode(
   Material->Expressions.Add(NewExpression);
 #endif
 
-  Material->MarkPackageDirty();
+  McpRecompileMaterialAsset(Material);
 
   // Get the expression index for reference
   int32 ExpressionIndex = -1;
@@ -4046,8 +4063,7 @@ bool UMcpAutomationBridgeSubsystem::HandleConnectMaterialPins(
 #endif
 
     if (bFound) {
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterialAsset(Material);
 
       TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
       AddAssetVerification(Resp, Material);
@@ -4120,8 +4136,7 @@ bool UMcpAutomationBridgeSubsystem::HandleConnectMaterialPins(
 
   // Make the connection
   TargetInput->Expression = FromExpression;
-  Material->PostEditChange();
-  Material->MarkPackageDirty();
+  McpRecompileMaterialAsset(Material);
 
   TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
   AddAssetVerification(Resp, Material);
@@ -4268,8 +4283,7 @@ bool UMcpAutomationBridgeSubsystem::HandleRemoveMaterialNode(
   // Also remove from the material's root node if connected
   Material->RemoveExpressionParameter(ExpressionToRemove);
 
-  Material->PostEditChange();
-  Material->MarkPackageDirty();
+  McpRecompileMaterialAsset(Material);
 
   TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
   AddAssetVerification(Resp, Material);
@@ -4431,8 +4445,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBreakMaterialConnections(
 #endif
 
     if (bFound) {
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterialAsset(Material);
 
       TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
       AddAssetVerification(Resp, Material);
@@ -4498,8 +4511,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBreakMaterialConnections(
     }
   }
 
-  Material->PostEditChange();
-  Material->MarkPackageDirty();
+  McpRecompileMaterialAsset(Material);
 
   TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
   AddAssetVerification(Resp, Material);
@@ -5325,14 +5337,7 @@ bool UMcpAutomationBridgeSubsystem::HandleRebuildMaterial(
   // This forces the material to update its shader maps and expressions
   AsyncTask(ENamedThreads::GameThread, [this, RequestId, Socket, Material, AssetPath]() {
     // Mark the material as needing recompilation
-    Material->MarkPackageDirty();
-    
-    // Force material to recompile its shader
-    Material->PreEditChange(nullptr);
-    Material->PostEditChange();
-    
-    // Save the material
-    McpSafeAssetSave(Material);
+    McpRecompileMaterialAsset(Material);
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     AddAssetVerification(Result, Material);

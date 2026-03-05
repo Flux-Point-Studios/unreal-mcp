@@ -16,8 +16,25 @@
 #include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Engine/Texture.h"
+#include "MaterialGraph/MaterialGraph.h"
 
 // Material API compatibility macros are defined in McpAutomationBridgeHelpers.h
+
+/**
+ * Properly recompile a material after expression or connection changes.
+ * Syncs the EdGraph so connections persist across save/load.
+ */
+static void McpRecompileMaterial(UMaterial* Material)
+{
+    if (!Material) return;
+    Material->PreEditChange(nullptr);
+    Material->PostEditChange();
+    if (Material->MaterialGraph)
+    {
+        Material->MaterialGraph->RebuildGraph();
+    }
+    Material->MarkPackageDirty();
+}
 
 bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
     const FString &RequestId, const FString &Action,
@@ -245,8 +262,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
         }
       }
 
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterial(Material);
 
       TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
       AddAssetVerification(Result, Material);
@@ -289,8 +305,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       Material->Expressions.Remove(TargetExpr);
 #endif
 #endif
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterial(Material);
       TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
       AddAssetVerification(Result, Material);
       Result->SetStringField(TEXT("nodeId"), RemovedNodeId);
@@ -395,8 +410,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
 #endif
 
       if (bFound) {
-        Material->PostEditChange();
-        Material->MarkPackageDirty();
+        McpRecompileMaterial(Material);
         TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
         AddAssetVerification(Result, Material);
         Result->SetStringField(TEXT("inputName"), InputName);
@@ -429,8 +443,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
                       TargetExpr);
               if (InputPtr) {
                 InputPtr->Expression = SourceExpr;
-                Material->PostEditChange();
-                Material->MarkPackageDirty();
+                McpRecompileMaterial(Material);
                 TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
                 AddAssetVerification(Result, Material);
                 Result->SetStringField(TEXT("inputName"), InputName);
@@ -508,8 +521,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
 #endif
 
         if (bFound) {
-          Material->PostEditChange();
-          Material->MarkPackageDirty();
+          McpRecompileMaterial(Material);
           TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
           AddAssetVerification(Result, Material);
           Result->SetStringField(TEXT("pinName"), PinName);
@@ -535,8 +547,7 @@ bool UMcpAutomationBridgeSubsystem::HandleMaterialGraphAction(
       // reflection.
 
       // For now, just acknowledge but warn.
-      Material->PostEditChange();
-      Material->MarkPackageDirty();
+      McpRecompileMaterial(Material);
       TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
       AddAssetVerification(Result, Material);
       SendAutomationResponse(
@@ -717,9 +728,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAddMaterialTextureSample(
 #endif
 #endif
 
-  Material->PreEditChange(nullptr);
-  Material->PostEditChange();
-  McpSafeAssetSave(Material);
+  McpRecompileMaterial(Material);
 
   TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
   AddAssetVerification(Result, Material);
@@ -851,9 +860,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAddMaterialExpression(
 #endif
 #endif
 
-  Material->PreEditChange(nullptr);
-  Material->PostEditChange();
-  McpSafeAssetSave(Material);
+  McpRecompileMaterial(Material);
 
   TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
   AddAssetVerification(Result, Material);
@@ -1041,9 +1048,7 @@ bool UMcpAutomationBridgeSubsystem::HandleCreateMaterialNodes(
     SuccessCount++;
   }
 
-  Material->PreEditChange(nullptr);
-  Material->PostEditChange();
-  McpSafeAssetSave(Material);
+  McpRecompileMaterial(Material);
 
   TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
   AddAssetVerification(Result, Material);
