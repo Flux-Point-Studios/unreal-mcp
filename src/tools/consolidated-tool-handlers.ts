@@ -48,6 +48,9 @@ import { handleTaskTools } from './handlers/task-handlers.js';
 import { handleWorkflowTools } from './handlers/workflow-handlers.js';
 import { handleTestTools } from './handlers/test-handlers.js';
 import { handleAssetPipelineTools } from './handlers/asset-pipeline-handlers.js';
+import { handleValidateTools } from './handlers/validate-handlers.js';
+import { handleCheckpointTools } from './handlers/checkpoint-handlers.js';
+import { handleSourceControlTools } from './handlers/source-control-handlers.js';
 // import { getDynamicHandlerForTool } from './dynamic-handler-registry.js';
 // import { consolidatedToolDefinitions } from './consolidated-tool-definitions.js';
 
@@ -479,6 +482,28 @@ function registerDefaultHandlers() {
   toolRegistry.register('asset_pipeline', async (args, tools) => {
     const action = getAction(args);
     return await handleAssetPipelineTools(action, args, tools);
+  });
+
+  // ========================================================================
+  // Sprint 7: Closed-Loop Autonomy Tools
+  // ========================================================================
+
+  // 46. VALIDATE — Assertion layer
+  toolRegistry.register('validate', async (args, tools) => {
+    const action = getAction(args);
+    return await handleValidateTools(action, args, tools);
+  });
+
+  // 47. CHECKPOINT — Transaction/rollback system
+  toolRegistry.register('checkpoint', async (args, tools) => {
+    const action = getAction(args);
+    return await handleCheckpointTools(action, args, tools);
+  });
+
+  // 48. SOURCE CONTROL — SCM adapter
+  toolRegistry.register('source_control', async (args, tools) => {
+    const action = getAction(args);
+    return await handleSourceControlTools(action, args, tools);
   });
 }
 

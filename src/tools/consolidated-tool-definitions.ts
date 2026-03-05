@@ -5261,5 +5261,115 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
         importResult: { type: 'object', description: 'Result from UE asset import' }
       }
     }
+  },
+
+  // ========================================================================
+  // Sprint 7: Closed-Loop Autonomy Tools
+  // ========================================================================
+
+  // VALIDATE — Assertion layer that defines "done"
+  {
+    name: 'validate',
+    description: 'Assertion and validation tools. Run structured checks that return pass/fail with diagnostics, affected assets, and suggested next actions. Actions: assert_blueprint_compiles, assert_map_clean, assert_no_missing_references, assert_naming_conventions, assert_performance_budget, run_validation_suite, get_validation_report, set_acceptance_criteria, get_acceptance_criteria.',
+    category: 'core',
+    annotations: {
+      title: 'Validate & Assert',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'assert_blueprint_compiles', 'assert_map_clean', 'assert_no_missing_references',
+            'assert_naming_conventions', 'assert_performance_budget',
+            'run_validation_suite', 'get_validation_report',
+            'set_acceptance_criteria', 'get_acceptance_criteria'
+          ],
+          description: 'Assertion to run. run_validation_suite runs all assertions. set_acceptance_criteria defines the project design contract (genre, perf budget, naming rules).'
+        },
+        blueprintPath: { type: 'string', description: 'Blueprint path for assert_blueprint_compiles' },
+        path: { type: 'string', description: 'Asset path to scan (default: /Game)' },
+        targetFps: { type: 'number', description: 'Target FPS for performance budget (default: 60)' },
+        maxMemoryMb: { type: 'number', description: 'Max memory budget in MB' },
+        // Acceptance criteria fields
+        genre: { type: 'string', description: 'Game genre (e.g., top-down-shooter, survival, platformer)' },
+        camera: { type: 'string', description: 'Camera style (e.g., orthographic-top-down, third-person)' },
+        platforms: { type: 'array', items: { type: 'string' }, description: 'Target platforms (Win64, Linux, Mac, etc.)' },
+        performanceBudget: { type: 'object', description: '{ targetFps, maxMemoryMb, maxDrawCalls, maxTriangleCount }' },
+        namingConventions: { type: 'object', description: '{ blueprintPrefix, materialPrefix, texturePrefix, ... }' },
+        constraints: { type: 'array', items: { type: 'string' }, description: 'Hard constraints (e.g., "No marketplace content")' },
+        replace: { type: 'boolean', description: 'If true, replace all acceptance criteria instead of merging' }
+      },
+      required: ['action']
+    }
+  },
+
+  // CHECKPOINT — Transaction/rollback system with semantic snapshots
+  {
+    name: 'checkpoint',
+    description: 'Checkpoint and transaction system. Create semantic snapshots of level state, diff between checkpoints, and rollback changes. Actions: create_checkpoint, list_checkpoints, diff_checkpoint, restore_checkpoint, delete_checkpoint, begin_transaction, commit_transaction, rollback_transaction.',
+    category: 'core',
+    annotations: {
+      title: 'Checkpoint & Transactions',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'create_checkpoint', 'list_checkpoints', 'diff_checkpoint',
+            'restore_checkpoint', 'delete_checkpoint',
+            'begin_transaction', 'commit_transaction', 'rollback_transaction'
+          ],
+          description: 'begin_transaction auto-creates a checkpoint. commit_transaction keeps it as history. rollback_transaction restores to start state.'
+        },
+        label: { type: 'string', description: 'Human-readable label for the checkpoint or transaction' },
+        checkpointId: { type: 'string', description: 'Checkpoint ID (for diff, restore, delete)' },
+        toCheckpointId: { type: 'string', description: 'Second checkpoint ID for diff_checkpoint (omit to diff against live state)' },
+        metadata: { type: 'object', description: 'Custom metadata to attach to the checkpoint' }
+      },
+      required: ['action']
+    }
+  },
+
+  // SOURCE_CONTROL — SCM adapter (Git now, Perforce later)
+  {
+    name: 'source_control',
+    description: 'Source control integration. Git-backed by default, with a provider-agnostic interface for future Perforce support. Actions: status, checkpoint (commit), revert, changed_since, lock, unlock, change_summary.',
+    category: 'core',
+    annotations: {
+      title: 'Source Control',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'checkpoint', 'revert', 'changed_since', 'lock', 'unlock', 'change_summary'],
+          description: 'status: branch/dirty state. checkpoint: commit. revert: undo to ref. changed_since: files changed since ref. lock/unlock: asset locking. change_summary: LLM-readable diff.'
+        },
+        message: { type: 'string', description: 'Commit message for checkpoint action' },
+        ref: { type: 'string', description: 'Git ref / commit hash for revert and changed_since' },
+        path: { type: 'string', description: 'Asset path for lock/unlock' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Specific paths to commit (default: all changes)' },
+        from: { type: 'string', description: 'Start ref for change_summary' },
+        to: { type: 'string', description: 'End ref for change_summary' }
+      },
+      required: ['action']
+    }
   }
 ];

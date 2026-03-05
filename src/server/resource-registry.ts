@@ -76,6 +76,10 @@ export class ResourceRegistry {
                     { uri: 'ue://health', name: 'Health Status', description: 'Server health and performance metrics', mimeType: 'application/json' },
                     { uri: 'ue://automation-bridge', name: 'Automation Bridge', description: 'Automation bridge diagnostics and recent activity', mimeType: 'application/json' },
                     { uri: 'ue://version', name: 'Engine Version', description: 'Unreal Engine version and compatibility info', mimeType: 'application/json' },
+                    { uri: 'ue://project-summary', name: 'Project Summary', description: 'Sharp opinionated summary: game mode, maps, key BPs, actor counts, engine version', mimeType: 'application/json' },
+                    { uri: 'ue://recent-changes', name: 'Recent Changes', description: 'Last 15 mutating operations with semantic summaries (from operation journal)', mimeType: 'application/json' },
+                    { uri: 'ue://recent-errors', name: 'Recent Errors', description: 'Recent tool failures and warnings with structured diagnostics', mimeType: 'application/json' },
+                    { uri: 'ue://acceptance-criteria', name: 'Acceptance Criteria', description: 'Machine-readable design contract: genre, perf budget, naming conventions, platform targets', mimeType: 'application/json' },
                     ...docsResources,
                 ]
             };

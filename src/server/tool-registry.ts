@@ -11,6 +11,7 @@ import { ErrorHandler } from '../utils/error-handler.js';
 import { cleanObject } from '../utils/safe-json.js';
 import { isVisuallyMutating, captureVisualFeedback } from '../utils/visual-feedback.js';
 import { subscriptionManager } from '../services/subscription-manager.js';
+import { operationJournal } from '../services/operation-journal.js';
 import { createElicitationHelper, PrimitiveSchema } from '../utils/elicitation.js';
 import { createProgressReporter } from '../utils/progress-reporter.js';
 import { AssetResources } from '../resources/assets.js';
@@ -682,6 +683,26 @@ export class ToolRegistry {
                         subscriptionManager.notifyForToolAction(name, args.action as string);
                     } catch {
                         // Subscription notifications are strictly best-effort
+                    }
+                }
+
+                // ----------------------------------------------------------
+                // Operation Journal
+                // Record every mutating tool call as a structured breadcrumb
+                // for ue://recent-changes, checkpoint diffs, and recovery.
+                // ----------------------------------------------------------
+                if (typeof args.action === 'string' && operationJournal.shouldRecord(name, args.action)) {
+                    try {
+                        operationJournal.record({
+                            tool: name,
+                            action: args.action,
+                            args,
+                            result: (resultObj ?? {}) as Record<string, unknown>,
+                            durationMs,
+                            checkpointId: undefined,
+                        });
+                    } catch {
+                        // Journal recording is strictly best-effort
                     }
                 }
 
