@@ -1611,13 +1611,45 @@ export const consolidatedToolDefinitions: ToolDefinition[] = [
             'create_material_instance', 'set_scalar_parameter_value', 'set_vector_parameter_value', 'set_texture_parameter_value',
             'create_landscape_material', 'create_decal_material', 'create_post_process_material',
             'add_landscape_layer', 'configure_layer_blend',
-            'compile_material', 'get_material_info'
+            'compile_material', 'get_material_info',
+            'create_complete_material'
           ],
-          description: 'Material authoring action to perform'
+          description: 'Material authoring action to perform. Use create_complete_material to create a full material with expressions and connections in a single call.'
         },
         assetPath: commonSchemas.assetPath,
         name: commonSchemas.name,
         path: commonSchemas.directoryPathForCreation,
+        // create_complete_material composite parameters
+        expressions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Reference name for this expression (used in connections)' },
+              type: { type: 'string', description: 'Expression type: TextureSampleParameter2D, VectorParameter, ScalarParameter, Constant, Constant3Vector, Add, Multiply, etc.' },
+              parameters: { type: 'object', description: 'Type-specific parameters (e.g. {ParameterName, Texture, SamplerType} for texture samples)' },
+              x: { type: 'number', description: 'Graph X position' },
+              y: { type: 'number', description: 'Graph Y position' }
+            }
+          },
+          description: 'Array of expressions to add to the material (for create_complete_material)'
+        },
+        connections: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              from: { type: 'string', description: 'Source expression name (as defined in expressions array) or GUID' },
+              fromPin: { type: 'string', description: 'Output pin name: RGB, R, G, B, A, RGBA (optional)' },
+              to: { type: 'string', description: 'Target input: BaseColor, Normal, Roughness, Metallic, EmissiveColor, Opacity, etc.' }
+            }
+          },
+          description: 'Array of connections between expressions and material inputs (for create_complete_material)'
+        },
+        properties: {
+          type: 'object',
+          description: 'Additional material properties to set via console commands, e.g. {bUsedWithSkeletalMesh: true} (for create_complete_material)'
+        },
         materialDomain: { type: 'string', enum: ['Surface', 'DeferredDecal', 'LightFunction', 'Volume', 'PostProcess', 'UI'], description: 'Material domain type.' },
         blendMode: { type: 'string', enum: ['Opaque', 'Masked', 'Translucent', 'Additive', 'Modulate', 'AlphaComposite', 'AlphaHoldout'], description: 'Blend mode.' },
         shadingModel: { type: 'string', enum: ['DefaultLit', 'Unlit', 'Subsurface', 'SubsurfaceProfile', 'PreintegratedSkin', 'ClearCoat', 'Hair', 'Cloth', 'Eye', 'TwoSidedFoliage', 'ThinTranslucent'], description: 'Shading model.' },

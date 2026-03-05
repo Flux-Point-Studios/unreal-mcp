@@ -47,7 +47,7 @@ This server controls a live Unreal Editor instance. All 40 tools use an **action
 
 **Assets & Materials**
 - \`manage_asset\` — \`list\`, \`import\`, \`delete\`, \`rename\`, \`move\`, \`duplicate\`, \`search_assets\`, \`get_dependencies\`, \`exists\`, \`get_material_stats\`, \`dump_asset\`, \`create_material\`, \`create_material_instance\`, \`validate\`, \`bulk_rename\`, \`bulk_delete\`
-- \`manage_material_authoring\` — \`create_material\`, \`add_texture_sample\`, \`add_scalar_parameter\`, \`add_vector_parameter\`, \`connect_nodes\`, \`create_material_instance\`, \`set_scalar_parameter_value\`, \`set_vector_parameter_value\`, \`set_texture_parameter_value\`, \`compile_material\`, \`set_blend_mode\`, \`set_shading_model\`
+- \`manage_material_authoring\` — \`create_material\`, \`create_complete_material\` (composite: creates material + expressions + connections in one call), \`add_texture_sample\`, \`add_scalar_parameter\`, \`add_vector_parameter\`, \`connect_nodes\`, \`create_material_instance\`, \`set_scalar_parameter_value\`, \`set_vector_parameter_value\`, \`set_texture_parameter_value\`, \`compile_material\`, \`set_blend_mode\`, \`set_shading_model\`
 - \`manage_texture\` — \`create_noise_texture\`, \`resize_texture\`, \`set_compression_settings\`, \`channel_pack\`, \`get_texture_info\`
 - \`asset_pipeline\` — \`list_providers\`, \`generate_3d_model\`, \`generate_texture\`, \`check_generation_status\`, \`download_and_import\` (AI-powered via Meshy/Tripo APIs)
 
@@ -137,6 +137,25 @@ create-playable-character, setup-gas-ability, create-multiplayer-lobby, level-pe
 2. \`control_editor\` → \`capture_viewport\` to see the current visual state
 3. \`system_control\` → \`console_command\` for UE console diagnostics
 4. \`workflow\` → \`quick_test\` for a fast overview of editor state
+
+**NEVER use \`rm\` or filesystem commands on .uasset files while the editor is running** — the editor locks these files. Use \`manage_asset\` → \`delete\` instead, which works through the editor's asset system.
+
+**NEVER force-kill the editor process** — use \`control_editor\` → \`save_all\` first to preserve work, then close gracefully. Force-killing risks data loss.
+
+**Prefer \`create_complete_material\` over sequential calls** — instead of 8+ separate calls (create → add node → connect → add node → connect → rebuild), use \`manage_material_authoring\` → \`create_complete_material\` with \`expressions\` and \`connections\` arrays. Example:
+\`\`\`json
+{ "action": "create_complete_material", "name": "M_MyMat", "path": "/Game/Materials",
+  "shadingModel": "DefaultLit", "properties": { "bUsedWithSkeletalMesh": true },
+  "expressions": [
+    { "name": "BaseColor", "type": "TextureSampleParameter2D", "parameters": { "Texture": "/Game/Textures/T_Base" } },
+    { "name": "Roughness", "type": "Constant", "parameters": { "R": 0.7 } }
+  ],
+  "connections": [
+    { "from": "BaseColor", "fromPin": "RGB", "to": "BaseColor" },
+    { "from": "Roughness", "to": "Roughness" }
+  ]
+}
+\`\`\`
 
 ## Tips
 - Resource subscriptions are supported — subscribe to \`ue://actors\` etc. for live updates.

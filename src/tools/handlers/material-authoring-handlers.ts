@@ -1037,9 +1037,179 @@ export async function handleMaterialAuthoringTools(
         return ResponseFactory.success(res, res.message ?? `Cast shadows set to ${castShadows}`);
       }
 
+      // ===== Composite: Create Complete Material =====
+      case 'create_complete_material': {
+        // Creates a material with expressions and connections in a single call.
+        // Eliminates the need for 8+ sequential MCP calls.
+        const rawArgs = args as Record<string, unknown>;
+        const materialPath = extractOptionalString(rawArgs, 'materialPath') ??
+                            extractOptionalString(rawArgs, 'assetPath');
+
+        let name: string;
+        let path: string;
+
+        if (materialPath) {
+          const parsed = parseMaterialPath(materialPath);
+          if (!parsed) {
+            return ResponseFactory.error('Invalid materialPath format', 'INVALID_ARGUMENT');
+          }
+          name = parsed.name;
+          path = parsed.path;
+        } else {
+          name = extractOptionalString(rawArgs, 'name') ?? '';
+          path = extractOptionalString(rawArgs, 'path') ?? '/Game/Materials';
+          if (!name) {
+            return ResponseFactory.error('name or materialPath is required', 'MISSING_ARGUMENT');
+          }
+        }
+
+        const blendMode = extractOptionalString(rawArgs, 'blendMode') ?? 'Opaque';
+        const shadingModel = extractOptionalString(rawArgs, 'shadingModel') ?? 'DefaultLit';
+        const twoSided = extractOptionalBoolean(rawArgs, 'twoSided') ?? false;
+        const domain = extractOptionalString(rawArgs, 'materialDomain') ?? 'Surface';
+        const expressions = rawArgs.expressions as Array<Record<string, unknown>> | undefined;
+        const connections = rawArgs.connections as Array<Record<string, unknown>> | undefined;
+        const properties = rawArgs.properties as Record<string, unknown> | undefined;
+
+        const errors: string[] = [];
+        const nodeIds: Record<string, string> = {};
+        const steps: string[] = [];
+
+        // Step 1: Create the material
+        let createRes: AutomationResponse;
+        try {
+          createRes = (await executeAutomationRequest(tools, TOOL_ACTIONS.MANAGE_MATERIAL_AUTHORING, {
+            subAction: 'create_material',
+            name,
+            path,
+            materialDomain: domain,
+            blendMode,
+            shadingModel,
+            twoSided,
+            save: false,
+          })) as AutomationResponse;
+
+          if (createRes.success === false) {
+            return ResponseFactory.error(createRes.error ?? 'Failed to create material', createRes.errorCode);
+          }
+          steps.push('Material created');
+        } catch (e) {
+          return ResponseFactory.error(`Failed to create material: ${e instanceof Error ? e.message : String(e)}`, 'CREATE_FAILED');
+        }
+
+        const assetPath = `${path}/${name}`;
+
+        // Step 2: Set additional properties via console commands
+        if (properties && Object.keys(properties).length > 0) {
+          for (const [propName, propValue] of Object.entries(properties)) {
+            try {
+              await executeAutomationRequest(tools, 'system_control', {
+                subAction: 'console_command',
+                command: `obj set ${assetPath}.${name} ${propName} ${propValue}`,
+              });
+              steps.push(`Set ${propName}=${propValue}`);
+            } catch (e) {
+              errors.push(`Failed to set property ${propName}: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+        }
+
+        // Step 3: Add expressions
+        if (expressions && expressions.length > 0) {
+          for (let i = 0; i < expressions.length; i++) {
+            const expr = expressions[i];
+            const exprName = (expr.name as string) ?? `expr_${i}`;
+            const nodeType = (expr.type as string) ?? (expr.nodeType as string) ?? '';
+            if (!nodeType) {
+              errors.push(`Expression ${i} missing type`);
+              continue;
+            }
+
+            try {
+              const addRes = (await executeAutomationRequest(tools, TOOL_ACTIONS.MANAGE_MATERIAL_AUTHORING, {
+                subAction: 'add_material_node',
+                assetPath,
+                nodeType,
+                name: exprName,
+                parameters: expr.parameters ?? {},
+                x: (expr.x as number) ?? (i % 3) * -300,
+                y: (expr.y as number) ?? Math.floor(i / 3) * 200,
+              })) as AutomationResponse & { result?: { nodeGuid?: string; expressionIndex?: number } };
+
+              const nodeGuid = addRes.result?.nodeGuid ??
+                              (addRes as Record<string, unknown>).nodeGuid as string ??
+                              (addRes as Record<string, unknown>).nodeId as string ?? '';
+              if (nodeGuid) {
+                nodeIds[exprName] = nodeGuid;
+              }
+              steps.push(`Added ${nodeType} as "${exprName}"`);
+            } catch (e) {
+              errors.push(`Failed to add expression "${exprName}": ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+        }
+
+        // Step 4: Make connections
+        if (connections && connections.length > 0) {
+          for (let i = 0; i < connections.length; i++) {
+            const conn = connections[i];
+            // Resolve node references - can be a name (lookup in nodeIds) or a direct GUID
+            let fromNodeId = (conn.from as string) ?? (conn.fromNodeId as string) ?? (conn.sourceNodeId as string) ?? '';
+            const toPin = (conn.to as string) ?? (conn.toPin as string) ?? (conn.inputName as string) ?? '';
+            const fromPin = (conn.fromPin as string) ?? '';
+
+            // Resolve named references to GUIDs
+            if (fromNodeId && nodeIds[fromNodeId]) {
+              fromNodeId = nodeIds[fromNodeId];
+            }
+
+            if (!fromNodeId || !toPin) {
+              errors.push(`Connection ${i} missing from or to`);
+              continue;
+            }
+
+            try {
+              await executeAutomationRequest(tools, 'manage_asset', {
+                subAction: 'connect_material_pins',
+                assetPath,
+                sourceNodeId: fromNodeId,
+                inputName: toPin,
+                fromPin: fromPin || undefined,
+              });
+              steps.push(`Connected ${conn.from ?? fromNodeId} → ${toPin}`);
+            } catch (e) {
+              errors.push(`Failed to connect ${conn.from ?? fromNodeId} → ${toPin}: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+        }
+
+        // Step 5: Rebuild/compile the material
+        try {
+          await executeAutomationRequest(tools, 'manage_asset', {
+            subAction: 'rebuild_material',
+            assetPath,
+            save: true,
+          });
+          steps.push('Material compiled and saved');
+        } catch (e) {
+          errors.push(`Failed to compile material: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
+        return {
+          success: errors.length === 0,
+          message: errors.length === 0
+            ? `Material "${name}" created with ${expressions?.length ?? 0} expressions and ${connections?.length ?? 0} connections`
+            : `Material "${name}" created with ${errors.length} error(s)`,
+          assetPath,
+          nodeIds,
+          steps,
+          errors: errors.length > 0 ? errors : undefined,
+        };
+      }
+
       default:
         return ResponseFactory.error(
-          `Unknown material authoring action: ${action}. Available actions: create_material, set_blend_mode, set_shading_model, add_texture_sample, add_scalar_parameter, add_vector_parameter, add_math_node, connect_nodes, create_material_instance, set_scalar_parameter_value, set_vector_parameter_value, set_texture_parameter_value, compile_material, get_material_info`,
+          `Unknown material authoring action: ${action}. Available actions: create_material, create_complete_material, set_blend_mode, set_shading_model, add_texture_sample, add_scalar_parameter, add_vector_parameter, add_math_node, connect_nodes, create_material_instance, set_scalar_parameter_value, set_vector_parameter_value, set_texture_parameter_value, compile_material, get_material_info`,
           'UNKNOWN_ACTION'
         );
     }
